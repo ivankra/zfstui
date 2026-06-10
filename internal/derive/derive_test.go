@@ -1,0 +1,309 @@
+package derive
+
+import (
+	"testing"
+
+	"ivank.me/zfstui/internal/model"
+)
+
+// fixture builders -----------------------------------------------------------
+
+type fx struct {
+	states map[string]*model.HostState
+}
+
+func newFx() *fx { return &fx{states: map[string]*model.HostState{}} }
+
+func (f *fx) host(name string) *model.HostState {
+	if st, ok := f.states[name]; ok {
+		return st
+	}
+	st := &model.HostState{Host: name}
+	f.states[name] = st
+	return st
+}
+
+func (f *fx) ds(host, name string, written int64, origin string) {
+	st := f.host(host)
+	st.Datasets = append(st.Datasets, model.Dataset{
+		Host: host, Name: name, Type: "filesystem", GUID: host + ":" + name,
+		Written: written, Origin: origin,
+	})
+}
+
+// snap adds a snapshot; guid is the cross-host identity, creation orders them.
+func (f *fx) snap(host, dataset, name, guid string, creation int64) {
+	st := f.host(host)
+	st.Snapshots = append(st.Snapshots, model.Snapshot{
+		Host: host, Dataset: dataset, Name: name, GUID: guid, Creation: creation,
+	})
+}
+
+func (f *fx) groups() []*model.Group {
+	var states []model.HostState
+	for _, st := range f.states {
+		states = append(states, *st)
+	}
+	return Groups(states)
+}
+
+func findGroup(t *testing.T, groups []*model.Group, name string) *model.Group {
+	t.Helper()
+	for _, g := range groups {
+		if g.DisplayName == name {
+			return g
+		}
+	}
+	t.Fatalf("group %q not found; have %v", name, names(groups))
+	return nil
+}
+
+func names(groups []*model.Group) []string {
+	var out []string
+	for _, g := range groups {
+		out = append(out, g.DisplayName)
+	}
+	return out
+}
+
+func member(t *testing.T, g *model.Group, host, dataset string) *model.Replica {
+	t.Helper()
+	for _, r := range g.Members {
+		if r.Dataset.Host == host && r.Dataset.Name == dataset {
+			return r
+		}
+	}
+	t.Fatalf("member %s:%s not in group %q", host, dataset, g.DisplayName)
+	return nil
+}
+
+// tests -----------------------------------------------------------------------
+
+// The README's canonical setup: master on dev1:ssd, fresh backup on dev2:ssd,
+// stale backup on dev2:tank. Master has unsnapshotted writes.
+func TestTypicalMasterAndBackups(t *testing.T) {
+	f := newFx()
+	f.ds("dev1", "ssd/srv/git", 4096, "")
+	f.snap("dev1", "ssd/srv/git", "20260501", "g1", 100)
+	f.snap("dev1", "ssd/srv/git", "20260601", "g2", 200)
+	f.ds("dev2", "ssd/bak/git", 0, "")
+	f.snap("dev2", "ssd/bak/git", "20260501", "g1", 100)
+	f.snap("dev2", "ssd/bak/git", "20260601", "g2", 200)
+	f.ds("dev2", "tank/bak/git", 0, "")
+	f.snap("dev2", "tank/bak/git", "20260501", "g1", 100)
+
+	groups := f.groups()
+	if len(groups) != 1 {
+		t.Fatalf("want 1 group, got %v", names(groups))
+	}
+	g := findGroup(t, groups, "git")
+	if g.LatestName != "20260601" {
+		t.Errorf("latest = %q", g.LatestName)
+	}
+	if g.Diverged {
+		t.Error("group should not be diverged")
+	}
+	if g.Hidden {
+		t.Error("group with snapshots must not be hidden")
+	}
+
+	m := member(t, g, "dev1", "ssd/srv/git")
+	if m.State != model.StateAhead || m.CellPrefix != "srv/" {
+		t.Errorf("master: state=%s prefix=%q", m.State, m.CellPrefix)
+	}
+	fresh := member(t, g, "dev2", "ssd/bak/git")
+	if fresh.State != model.StateBehind { // master has unsnapshotted writes
+		t.Errorf("fresh backup: state=%s", fresh.State)
+	}
+	if fresh.CellPrefix != "bak/" {
+		t.Errorf("fresh backup prefix=%q", fresh.CellPrefix)
+	}
+	stale := member(t, g, "dev2", "tank/bak/git")
+	if stale.State != model.StateBehind || stale.Latest.Name != "20260501" {
+		t.Errorf("stale backup: state=%s latest=%v", stale.State, stale.Latest)
+	}
+}
+
+// With no writes and equal snapshots everywhere, everyone is in sync and no
+// replica is "ahead" — master is moot.
+func TestAllInSync(t *testing.T) {
+	f := newFx()
+	f.ds("dev1", "ssd/srv/git", 0, "")
+	f.snap("dev1", "ssd/srv/git", "s", "g1", 100)
+	f.ds("dev2", "ssd/bak/git", 0, "")
+	f.snap("dev2", "ssd/bak/git", "s", "g1", 100)
+
+	g := findGroup(t, f.groups(), "git")
+	for _, r := range g.Members {
+		if r.State != model.StateInSync {
+			t.Errorf("%s:%s state=%s", r.Dataset.Host, r.Dataset.Name, r.State)
+		}
+	}
+}
+
+// Both sides have data past the common base => diverged, both flagged.
+func TestDivergence(t *testing.T) {
+	f := newFx()
+	f.ds("dev1", "ssd/srv/git", 0, "")
+	f.snap("dev1", "ssd/srv/git", "base", "g1", 100)
+	f.snap("dev1", "ssd/srv/git", "mine", "g2", 200)
+	f.ds("dev2", "ssd/bak/git", 0, "")
+	f.snap("dev2", "ssd/bak/git", "base", "g1", 100)
+	f.snap("dev2", "ssd/bak/git", "theirs", "g3", 150)
+
+	g := findGroup(t, f.groups(), "git")
+	if !g.Diverged {
+		t.Fatal("group should be diverged")
+	}
+	for _, r := range g.Members {
+		if r.State != model.StateDiverged {
+			t.Errorf("%s state=%s", r.Dataset.Name, r.State)
+		}
+	}
+}
+
+// written>0 on a non-master replica also means divergence (e.g. atime writes
+// on a mounted backup) once the master is ahead too.
+func TestDivergenceViaWrites(t *testing.T) {
+	f := newFx()
+	f.ds("dev1", "ssd/srv/git", 4096, "")
+	f.snap("dev1", "ssd/srv/git", "base", "g1", 100)
+	f.ds("dev2", "ssd/bak/git", 512, "")
+	f.snap("dev2", "ssd/bak/git", "base", "g1", 100)
+
+	g := findGroup(t, f.groups(), "git")
+	if !g.Diverged {
+		t.Fatal("want divergence when both sides wrote")
+	}
+}
+
+// Same dataset name on two hosts but no shared snapshots: separate groups
+// (the rpool/cache case).
+func TestSameNameUnrelated(t *testing.T) {
+	f := newFx()
+	f.ds("dev1", "rpool/ROOT", 0, "")
+	f.snap("dev1", "rpool/ROOT", "s", "a1", 100)
+	f.ds("dev2", "rpool/ROOT", 0, "")
+	f.snap("dev2", "rpool/ROOT", "s", "b1", 100)
+
+	groups := f.groups()
+	if len(groups) != 2 {
+		t.Fatalf("want 2 groups, got %v", names(groups))
+	}
+}
+
+// Datasets with no snapshots at all are singleton groups.
+func TestNoSnapshots(t *testing.T) {
+	f := newFx()
+	f.ds("dev1", "ssd/scratch", 0, "")
+	groups := f.groups()
+	if len(groups) != 1 || len(groups[0].Members) != 1 {
+		t.Fatalf("want singleton group, got %v", names(groups))
+	}
+	if groups[0].Members[0].State != model.StateInSync {
+		t.Errorf("state=%s", groups[0].Members[0].State)
+	}
+	if !groups[0].Hidden {
+		t.Error("snapshot-less group should be hidden by default")
+	}
+}
+
+// A clone is annotated as such, not counted toward divergence.
+func TestClone(t *testing.T) {
+	f := newFx()
+	f.ds("dev1", "ssd/srv/git", 0, "")
+	f.snap("dev1", "ssd/srv/git", "base", "g1", 100)
+	// A real clone owns no snapshots until snapshotted; it joins the group
+	// via its origin property, not via shared GUIDs.
+	f.ds("dev1", "ssd/srv/git-experiment", 9999, "ssd/srv/git@base")
+	f.ds("dev2", "ssd/bak/git", 0, "")
+	f.snap("dev2", "ssd/bak/git", "base", "g1", 100)
+
+	groups := f.groups()
+	if len(groups) != 1 {
+		t.Fatalf("want 1 group, got %v", names(groups))
+	}
+	g := findGroup(t, groups, "git") // clone name must not pollute the display name
+	c := member(t, g, "dev1", "ssd/srv/git-experiment")
+	if c.State != model.StateClone {
+		t.Errorf("clone state=%s", c.State)
+	}
+	if c.CellPrefix != "srv/git-experiment" {
+		t.Errorf("clone cell prefix=%q", c.CellPrefix)
+	}
+	if g.Diverged {
+		t.Error("clone writes must not mark the group diverged")
+	}
+}
+
+// Replica with an interrupted recv shows resumable.
+func TestResumable(t *testing.T) {
+	f := newFx()
+	f.ds("dev1", "ssd/srv/git", 0, "")
+	f.snap("dev1", "ssd/srv/git", "a", "g1", 100)
+	f.snap("dev1", "ssd/srv/git", "b", "g2", 200)
+	st := f.host("hetzner")
+	st.Datasets = append(st.Datasets, model.Dataset{
+		Host: "hetzner", Name: "tank/bak/git", Type: "filesystem",
+		ResumeToken: "1-abc",
+	})
+	f.snap("hetzner", "tank/bak/git", "a", "g1", 100)
+
+	g := findGroup(t, f.groups(), "git")
+	r := member(t, g, "hetzner", "tank/bak/git")
+	if r.State != model.StateResumable {
+		t.Errorf("state=%s", r.State)
+	}
+}
+
+// Display names: longest common path suffix; hierarchical children are
+// separate groups; the parent dataset is its own group/row.
+func TestHierarchicalAndDisplayNames(t *testing.T) {
+	f := newFx()
+	for _, child := range []string{"blobs", "blobs/01", "blobs/02"} {
+		f.ds("dev2", "tank/srv/"+child, 0, "")
+		f.snap("dev2", "tank/srv/"+child, "s", "g-"+child, 100)
+		f.ds("hetzner", "tank/bak/"+child, 0, "")
+		f.snap("hetzner", "tank/bak/"+child, "s", "g-"+child, 100)
+	}
+	groups := f.groups()
+	if len(groups) != 3 {
+		t.Fatalf("want 3 groups, got %v", names(groups))
+	}
+	// Sorted: blobs, blobs/01, blobs/02 — parent row above children.
+	want := []string{"blobs", "blobs/01", "blobs/02"}
+	for i, w := range want {
+		if groups[i].DisplayName != w {
+			t.Errorf("groups[%d] = %q, want %q", i, groups[i].DisplayName, w)
+		}
+	}
+}
+
+// Transitive chain A-B-C where A and C share nothing directly: still one
+// group; C just shows as behind, not diverged.
+func TestTransitiveChain(t *testing.T) {
+	f := newFx()
+	f.ds("a", "p/srv/d", 0, "")
+	f.snap("a", "p/srv/d", "s2", "g2", 200)
+	f.snap("a", "p/srv/d", "s3", "g3", 300)
+	f.ds("b", "p/bak/d", 0, "")
+	f.snap("b", "p/bak/d", "s1", "g1", 100)
+	f.snap("b", "p/bak/d", "s2", "g2", 200)
+	f.ds("c", "p/bak/d", 0, "")
+	f.snap("c", "p/bak/d", "s1", "g1", 100)
+
+	groups := f.groups()
+	if len(groups) != 1 {
+		t.Fatalf("want 1 group, got %v", names(groups))
+	}
+	g := groups[0]
+	if g.Diverged {
+		t.Error("chain should not be diverged")
+	}
+	if s := member(t, g, "a", "p/srv/d").State; s != model.StateAhead {
+		t.Errorf("a state=%s", s)
+	}
+	if s := member(t, g, "c", "p/bak/d").State; s != model.StateBehind {
+		t.Errorf("c state=%s", s)
+	}
+}

@@ -2,11 +2,22 @@
 
 ## Status (2026-06-10)
 
-Design phase, main decisions settled. Architecture, data model, job protocol,
-TUI sketch, roadmap and decisions log are in [DESIGN.md](DESIGN.md).
-Language: **Go**. Snapshot pruning is in scope (interactive dialog + batch
-command); destructive ops (`recv -F`, rollback, dataset destroy) are banned
-outright. Next step: M1 — refresh/discovery into sqlite + `status` CLI.
+**M1 implemented** (discovery + status): `zfstui refresh` ssh-es to all
+configured hosts in parallel, scrapes `zpool list`/`zfs list -H -p` into the
+sqlite cache; `zfstui status` prints the groups × host:pool matrix with
+per-replica states derived from snapshot GUIDs (`*` ahead, `+` unsnapshotted
+writes, `!` diverged, `~` resumable, `%` clone). Unit tests cover parsers,
+grouping/state derivation (divergence, clones, transitive chains,
+same-name-unrelated), config, store, and an ssh-free end-to-end path.
+
+Try: `go build && ./zfstui -hosts host1,host2 refresh && ./zfstui status`
+(or put hosts in `~/.config/zfstui/config.toml`, see DESIGN.md).
+
+Not yet: TUI, snap/sync/prune/jobs/doctor (M2+ in the
+[DESIGN.md](DESIGN.md) roadmap). Design decisions and rationale live there
+too. Language: **Go**. Snapshot pruning is in scope (interactive dialog +
+batch command); destructive ops (`recv -F`, rollback, dataset destroy) are
+banned outright.
 
 Core ideas:
 - correlate replicas across hosts by **snapshot GUID**, never by name

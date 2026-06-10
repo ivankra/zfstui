@@ -66,6 +66,17 @@ That's honest (the replica really did change) and the usual setups
 (`canmount=off` backups, `atime=off`) avoid it; the diverged-cell detail view
 shows the `written` byte count so a 4K-atime-blip is easy to recognize.
 
+### Hidden groups
+
+Groups where **no member has any snapshot at all** are hidden by default —
+these are almost always system/plumbing datasets (container datasets like a
+bare `bak`/`srv`, pool roots, OS datasets), not replication subjects. `status
+-a` (and a TUI toggle) shows them. The TUI's `h` key hides/unhides the
+selected group manually; manual overrides are persisted in sqlite keyed by
+*dataset* GUID (per replica, so they survive cache rebuilds in practice; an
+"unhide" on any member outweighs the default rule). Hiding is pure display —
+hidden groups still refresh and still count for safety checks.
+
 ### Per-replica freshness (drives table cell rendering)
 
 For each replica in a group, comparing against the group-wide latest snapshot
@@ -289,6 +300,7 @@ Keyboard scheme (mnemonic letters, consistent everywhere):
   the group; incompatible ones greyed out with the reason), engine, recursive,
   dry-run toggle, "run from" (default: source host)
 - `d` prune dialog (destroy snapshots) for the selected group/replica
+- `h` hide/unhide the selected group; `H` toggle showing hidden groups
 - in Jobs pane: `Enter` opens job's log in the Log pane, `x` cancel (kills pid)
 - dialogs: `Enter` confirm, `Esc` cancel
 - function-key aliases for the F-key inclined: `F5`=copy, `F2`=snapshot
@@ -386,5 +398,8 @@ inventory (ansible-ish); with no config file at all it *is* the inventory.
   compatible pairs of a diverged group are allowed; the compatibility gate
   (dest clean at a snapshot the source has, or absent, or resumable) rejects
   exactly the destructive ones.
+- 2026-06-10: **hidden groups** — snapshot-less groups (system/plumbing
+  datasets) are hidden by default in status/TUI; `-a`/`H` reveals, TUI `h`
+  toggles manually (override persisted per dataset GUID). Display-only.
 - Name: `zfstui`. Jobs dir: `~/.local/state/zfstui/jobs` (default; works
   non-root).
