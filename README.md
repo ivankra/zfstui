@@ -1,5 +1,25 @@
 # zfstui
 
+## Status (2026-06-10)
+
+Design phase, main decisions settled. Architecture, data model, job protocol,
+TUI sketch, roadmap and decisions log are in [DESIGN.md](DESIGN.md).
+Language: **Go**. Snapshot pruning is in scope (interactive dialog + batch
+command); destructive ops (`recv -F`, rollback, dataset destroy) are banned
+outright. Next step: M1 — refresh/discovery into sqlite + `status` CLI.
+
+Core ideas:
+- correlate replicas across hosts by **snapshot GUID**, never by name
+- shell out to system `ssh` (user's ssh config/agent/ProxyJump work for free)
+- replication runs as a detached, self-describing **job dir** on the source
+  host (script+status+log+progress files), so transfers survive control-node
+  shutdown and any fresh control node can rediscover them on refresh
+- no master role stored, no pins, no name-prefix conventions: the sync source
+  is *derived* — the replica holding data the others lack; ≥2 such replicas =
+  diverged (flagged red for manual repair); none = in sync, direction moot.
+  Divergence is pairwise: compatible pairs of a diverged group still sync;
+  only destructive receives are rejected
+
 ## Initial wishes
 
 I have a bunch of linux hosts (laptops, desktops, NAS, cloud servers) with ZFS, and many ZFS datasets replicated across them. I want a tool/system to manage these datasets. Currently I run periodically a bunch of manual `sudo zfs send ... | ssh ... zfs recv ...` commands and want something better, less error prone and easier.
