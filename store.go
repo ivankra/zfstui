@@ -1,6 +1,6 @@
 // Package store is the sqlite cache of discovered inventory. It is a pure
 // cache: fully rebuildable from the hosts, no authoritative data lives here.
-package store
+package main
 
 import (
 	"database/sql"
@@ -10,8 +10,6 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
-
-	"ivank.me/zfstui/internal/model"
 )
 
 type Store struct {
@@ -50,7 +48,7 @@ CREATE INDEX IF NOT EXISTS snapshots_guid ON snapshots (guid);
 `
 
 // Open opens (creating if needed) the cache at path; ":memory:" works.
-func Open(path string) (*Store, error) {
+func openStore(path string) (*Store, error) {
 	if path != ":memory:" {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return nil, err
@@ -60,6 +58,9 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One connection: serializes concurrent refresh writers (no SQLITE_BUSY)
+	// and keeps ":memory:" meaning one database rather than one per pool conn.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
@@ -70,7 +71,7 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 // PutHostState replaces all cached inventory for one host atomically.
-func (s *Store) PutHostState(st model.HostState) error {
+func (s *Store) PutHostState(st HostState) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -155,14 +156,14 @@ func (s *Store) Hosts() ([]HostInfo, error) {
 }
 
 // AllHostStates loads the cached inventory for every host.
-func (s *Store) AllHostStates() ([]model.HostState, error) {
-	byHost := map[string]*model.HostState{}
+func (s *Store) AllHostStates() ([]HostState, error) {
+	byHost := map[string]*HostState{}
 	order := []string{}
-	get := func(host string) *model.HostState {
+	get := func(host string) *HostState {
 		if st, ok := byHost[host]; ok {
 			return st
 		}
-		st := &model.HostState{Host: host}
+		st := &HostState{Host: host}
 		byHost[host] = st
 		order = append(order, host)
 		return st
@@ -173,7 +174,7 @@ func (s *Store) AllHostStates() ([]model.HostState, error) {
 		return nil, err
 	}
 	for rows.Next() {
-		var p model.Pool
+		var p Pool
 		if err := rows.Scan(&p.Host, &p.Name, &p.GUID, &p.Size, &p.Alloc, &p.Free, &p.Health); err != nil {
 			rows.Close()
 			return nil, err
@@ -190,7 +191,7 @@ func (s *Store) AllHostStates() ([]model.HostState, error) {
 		return nil, err
 	}
 	for rows.Next() {
-		var d model.Dataset
+		var d Dataset
 		if err := rows.Scan(&d.Host, &d.Name, &d.Type, &d.GUID, &d.Used, &d.Avail, &d.Refer,
 			&d.Creation, &d.CreateTXG, &d.Written, &d.Origin, &d.Encryption, &d.KeyStatus,
 			&d.KeyLocation, &d.Mounted, &d.CanMount, &d.Mountpoint, &d.ReadOnly,
@@ -208,7 +209,7 @@ func (s *Store) AllHostStates() ([]model.HostState, error) {
 		return nil, err
 	}
 	for rows.Next() {
-		var sn model.Snapshot
+		var sn Snapshot
 		if err := rows.Scan(&sn.Host, &sn.Dataset, &sn.Name, &sn.GUID, &sn.Used, &sn.Creation, &sn.CreateTXG); err != nil {
 			rows.Close()
 			return nil, err
@@ -218,7 +219,7 @@ func (s *Store) AllHostStates() ([]model.HostState, error) {
 	}
 	rows.Close()
 
-	var out []model.HostState
+	var out []HostState
 	for _, h := range order {
 		out = append(out, *byHost[h])
 	}

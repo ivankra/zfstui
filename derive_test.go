@@ -1,31 +1,29 @@
-package derive
+package main
 
 import (
 	"testing"
-
-	"ivank.me/zfstui/internal/model"
 )
 
 // fixture builders -----------------------------------------------------------
 
 type fx struct {
-	states map[string]*model.HostState
+	states map[string]*HostState
 }
 
-func newFx() *fx { return &fx{states: map[string]*model.HostState{}} }
+func newFx() *fx { return &fx{states: map[string]*HostState{}} }
 
-func (f *fx) host(name string) *model.HostState {
+func (f *fx) host(name string) *HostState {
 	if st, ok := f.states[name]; ok {
 		return st
 	}
-	st := &model.HostState{Host: name}
+	st := &HostState{Host: name}
 	f.states[name] = st
 	return st
 }
 
 func (f *fx) ds(host, name string, written int64, origin string) {
 	st := f.host(host)
-	st.Datasets = append(st.Datasets, model.Dataset{
+	st.Datasets = append(st.Datasets, Dataset{
 		Host: host, Name: name, Type: "filesystem", GUID: host + ":" + name,
 		Written: written, Origin: origin,
 	})
@@ -34,20 +32,20 @@ func (f *fx) ds(host, name string, written int64, origin string) {
 // snap adds a snapshot; guid is the cross-host identity, creation orders them.
 func (f *fx) snap(host, dataset, name, guid string, creation int64) {
 	st := f.host(host)
-	st.Snapshots = append(st.Snapshots, model.Snapshot{
+	st.Snapshots = append(st.Snapshots, Snapshot{
 		Host: host, Dataset: dataset, Name: name, GUID: guid, Creation: creation,
 	})
 }
 
-func (f *fx) groups() []*model.Group {
-	var states []model.HostState
+func (f *fx) groups() []*Group {
+	var states []HostState
 	for _, st := range f.states {
 		states = append(states, *st)
 	}
 	return Groups(states)
 }
 
-func findGroup(t *testing.T, groups []*model.Group, name string) *model.Group {
+func findGroup(t *testing.T, groups []*Group, name string) *Group {
 	t.Helper()
 	for _, g := range groups {
 		if g.DisplayName == name {
@@ -58,7 +56,7 @@ func findGroup(t *testing.T, groups []*model.Group, name string) *model.Group {
 	return nil
 }
 
-func names(groups []*model.Group) []string {
+func names(groups []*Group) []string {
 	var out []string
 	for _, g := range groups {
 		out = append(out, g.DisplayName)
@@ -66,7 +64,7 @@ func names(groups []*model.Group) []string {
 	return out
 }
 
-func member(t *testing.T, g *model.Group, host, dataset string) *model.Replica {
+func member(t *testing.T, g *Group, host, dataset string) *Replica {
 	t.Helper()
 	for _, r := range g.Members {
 		if r.Dataset.Host == host && r.Dataset.Name == dataset {
@@ -108,18 +106,18 @@ func TestTypicalMasterAndBackups(t *testing.T) {
 	}
 
 	m := member(t, g, "dev1", "ssd/srv/git")
-	if m.State != model.StateAhead || m.CellPrefix != "srv/" {
+	if m.State != StateAhead || m.CellPrefix != "srv/" {
 		t.Errorf("master: state=%s prefix=%q", m.State, m.CellPrefix)
 	}
 	fresh := member(t, g, "dev2", "ssd/bak/git")
-	if fresh.State != model.StateBehind { // master has unsnapshotted writes
+	if fresh.State != StateBehind { // master has unsnapshotted writes
 		t.Errorf("fresh backup: state=%s", fresh.State)
 	}
 	if fresh.CellPrefix != "bak/" {
 		t.Errorf("fresh backup prefix=%q", fresh.CellPrefix)
 	}
 	stale := member(t, g, "dev2", "tank/bak/git")
-	if stale.State != model.StateBehind || stale.Latest.Name != "20260501" {
+	if stale.State != StateBehind || stale.Latest.Name != "20260501" {
 		t.Errorf("stale backup: state=%s latest=%v", stale.State, stale.Latest)
 	}
 }
@@ -135,7 +133,7 @@ func TestAllInSync(t *testing.T) {
 
 	g := findGroup(t, f.groups(), "git")
 	for _, r := range g.Members {
-		if r.State != model.StateInSync {
+		if r.State != StateInSync {
 			t.Errorf("%s:%s state=%s", r.Dataset.Host, r.Dataset.Name, r.State)
 		}
 	}
@@ -156,7 +154,7 @@ func TestDivergence(t *testing.T) {
 		t.Fatal("group should be diverged")
 	}
 	for _, r := range g.Members {
-		if r.State != model.StateDiverged {
+		if r.State != StateDiverged {
 			t.Errorf("%s state=%s", r.Dataset.Name, r.State)
 		}
 	}
@@ -200,7 +198,7 @@ func TestNoSnapshots(t *testing.T) {
 	if len(groups) != 1 || len(groups[0].Members) != 1 {
 		t.Fatalf("want singleton group, got %v", names(groups))
 	}
-	if groups[0].Members[0].State != model.StateInSync {
+	if groups[0].Members[0].State != StateInSync {
 		t.Errorf("state=%s", groups[0].Members[0].State)
 	}
 	if !groups[0].Hidden {
@@ -225,7 +223,7 @@ func TestClone(t *testing.T) {
 	}
 	g := findGroup(t, groups, "git") // clone name must not pollute the display name
 	c := member(t, g, "dev1", "ssd/srv/git-experiment")
-	if c.State != model.StateClone {
+	if c.State != StateClone {
 		t.Errorf("clone state=%s", c.State)
 	}
 	if c.CellPrefix != "srv/git-experiment" {
@@ -243,7 +241,7 @@ func TestResumable(t *testing.T) {
 	f.snap("dev1", "ssd/srv/git", "a", "g1", 100)
 	f.snap("dev1", "ssd/srv/git", "b", "g2", 200)
 	st := f.host("hetzner")
-	st.Datasets = append(st.Datasets, model.Dataset{
+	st.Datasets = append(st.Datasets, Dataset{
 		Host: "hetzner", Name: "tank/bak/git", Type: "filesystem",
 		ResumeToken: "1-abc",
 	})
@@ -251,7 +249,7 @@ func TestResumable(t *testing.T) {
 
 	g := findGroup(t, f.groups(), "git")
 	r := member(t, g, "hetzner", "tank/bak/git")
-	if r.State != model.StateResumable {
+	if r.State != StateResumable {
 		t.Errorf("state=%s", r.State)
 	}
 }
@@ -279,6 +277,52 @@ func TestHierarchicalAndDisplayNames(t *testing.T) {
 	}
 }
 
+// Leading components that are snapshot-less container datasets ("bak/",
+// "srv/") are trimmed from display names — even when every replica shares
+// them — and show up as cell prefixes instead. A parent that has snapshots
+// of its own (replicated "blobs") is not trimmed.
+func TestBoringPrefixTrimming(t *testing.T) {
+	f := newFx()
+	// Containers without snapshots on both hosts.
+	f.ds("ws", "tank/bak", 100, "")
+	f.ds("cml", "root/bak", 100, "")
+	f.ds("ws", "tank/srv", 100, "")
+
+	// Same "bak/" prefix on every replica: previously displayed "bak/anki".
+	f.ds("ws", "tank/bak/anki", 0, "")
+	f.snap("ws", "tank/bak/anki", "s", "g1", 100)
+	f.ds("cml", "root/bak/anki", 0, "")
+	f.snap("cml", "root/bak/anki", "s", "g1", 100)
+
+	// Single replica behind a boring prefix.
+	f.ds("ws", "tank/bak/music", 0, "")
+	f.snap("ws", "tank/bak/music", "s", "g2", 100)
+
+	// Parent with its own snapshots is meaningful: not trimmed.
+	f.ds("ws", "tank/srv/blobs", 0, "")
+	f.snap("ws", "tank/srv/blobs", "s", "g3", 100)
+	f.ds("ws", "tank/srv/blobs/01", 0, "")
+	f.snap("ws", "tank/srv/blobs/01", "s", "g4", 100)
+
+	groups := f.groups()
+	anki := findGroup(t, groups, "anki")
+	if p := member(t, anki, "ws", "tank/bak/anki").CellPrefix; p != "bak/" {
+		t.Errorf("anki ws cell prefix = %q", p)
+	}
+	if p := member(t, anki, "cml", "root/bak/anki").CellPrefix; p != "bak/" {
+		t.Errorf("anki cml cell prefix = %q", p)
+	}
+	music := findGroup(t, groups, "music")
+	if p := member(t, music, "ws", "tank/bak/music").CellPrefix; p != "bak/" {
+		t.Errorf("music cell prefix = %q", p)
+	}
+	blobs01 := findGroup(t, groups, "blobs/01")
+	if p := member(t, blobs01, "ws", "tank/srv/blobs/01").CellPrefix; p != "srv/" {
+		t.Errorf("blobs/01 cell prefix = %q", p)
+	}
+	findGroup(t, groups, "blobs") // the parent row, "srv/" trimmed
+}
+
 // Transitive chain A-B-C where A and C share nothing directly: still one
 // group; C just shows as behind, not diverged.
 func TestTransitiveChain(t *testing.T) {
@@ -300,10 +344,10 @@ func TestTransitiveChain(t *testing.T) {
 	if g.Diverged {
 		t.Error("chain should not be diverged")
 	}
-	if s := member(t, g, "a", "p/srv/d").State; s != model.StateAhead {
+	if s := member(t, g, "a", "p/srv/d").State; s != StateAhead {
 		t.Errorf("a state=%s", s)
 	}
-	if s := member(t, g, "c", "p/bak/d").State; s != model.StateBehind {
+	if s := member(t, g, "c", "p/bak/d").State; s != StateBehind {
 		t.Errorf("c state=%s", s)
 	}
 }

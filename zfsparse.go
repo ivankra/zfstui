@@ -1,13 +1,11 @@
 // Package zfsout parses the machine-readable (-H -p) output of zpool/zfs
 // commands. Hand-rolled on purpose: tab-separated, "-" means absent.
-package zfsout
+package main
 
 import (
 	"fmt"
 	"strconv"
 	"strings"
-
-	"ivank.me/zfstui/internal/model"
 )
 
 // Column lists for the remote commands. Parsers below must stay in lockstep.
@@ -59,8 +57,8 @@ func nonEmptyLines(out string) []string {
 }
 
 // ParsePools parses `zpool list -H -p -o <PoolCols>` output.
-func ParsePools(host, out string) ([]model.Pool, error) {
-	var pools []model.Pool
+func ParsePools(host, out string) ([]Pool, error) {
+	var pools []Pool
 	for _, line := range nonEmptyLines(out) {
 		f, err := fields(line, 6)
 		if err != nil {
@@ -74,7 +72,7 @@ func ParsePools(host, out string) ([]model.Pool, error) {
 				return nil, fmt.Errorf("pool %q: %w", f[0], err)
 			}
 		}
-		pools = append(pools, model.Pool{
+		pools = append(pools, Pool{
 			Host: host, Name: f[0], Size: size, Alloc: alloc, Free: free,
 			Health: f[4], GUID: str(f[5]),
 		})
@@ -83,14 +81,14 @@ func ParsePools(host, out string) ([]model.Pool, error) {
 }
 
 // ParseDatasets parses `zfs list -H -p -t filesystem,volume -o <DatasetCols>`.
-func ParseDatasets(host, out string) ([]model.Dataset, error) {
-	var dss []model.Dataset
+func ParseDatasets(host, out string) ([]Dataset, error) {
+	var dss []Dataset
 	for _, line := range nonEmptyLines(out) {
 		f, err := fields(line, 20)
 		if err != nil {
 			return nil, err
 		}
-		d := model.Dataset{Host: host, Name: f[0], Type: f[1], GUID: str(f[2])}
+		d := Dataset{Host: host, Name: f[0], Type: f[1], GUID: str(f[2])}
 		ints := []struct {
 			dst *int64
 			val string
@@ -120,8 +118,8 @@ func ParseDatasets(host, out string) ([]model.Dataset, error) {
 }
 
 // ParseSnapshots parses `zfs list -H -p -t snapshot -o <SnapshotCols>`.
-func ParseSnapshots(host, out string) ([]model.Snapshot, error) {
-	var snaps []model.Snapshot
+func ParseSnapshots(host, out string) ([]Snapshot, error) {
+	var snaps []Snapshot
 	for _, line := range nonEmptyLines(out) {
 		f, err := fields(line, 5)
 		if err != nil {
@@ -131,7 +129,7 @@ func ParseSnapshots(host, out string) ([]model.Snapshot, error) {
 		if !ok {
 			return nil, fmt.Errorf("snapshot name without '@': %q", f[0])
 		}
-		s := model.Snapshot{Host: host, Dataset: ds, Name: name, GUID: str(f[1])}
+		s := Snapshot{Host: host, Dataset: ds, Name: name, GUID: str(f[1])}
 		var err1, err2, err3 error
 		s.Used, err1 = num(f[2])
 		s.Creation, err2 = num(f[3])
@@ -173,8 +171,8 @@ func DiscoverCommand(sudo bool) string {
 }
 
 // ParseDiscovery splits combined DiscoverCommand output and parses each section.
-func ParseDiscovery(host, out string) (model.HostState, error) {
-	st := model.HostState{Host: host}
+func ParseDiscovery(host, out string) (HostState, error) {
+	st := HostState{Host: host}
 	sections := map[string]*strings.Builder{}
 	var cur *strings.Builder
 	curMark := ""

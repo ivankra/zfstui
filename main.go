@@ -7,26 +7,16 @@ import (
 	"fmt"
 	"os"
 	"time"
-
-	"golang.org/x/sync/errgroup"
-
-	"ivank.me/zfstui/internal/config"
-	"ivank.me/zfstui/internal/derive"
-	"ivank.me/zfstui/internal/model"
-	"ivank.me/zfstui/internal/sshx"
-	"ivank.me/zfstui/internal/store"
-	"ivank.me/zfstui/internal/view"
-	"ivank.me/zfstui/internal/zfsout"
 )
 
-const usage = `usage: zfstui [flags] <command>
+const usage = `usage: zfstui [flags] [command]
 
 commands:
+  (none)    open the TUI
   refresh   ssh to all hosts and update the local inventory cache
   status    print the groups × host:pool replication matrix from the cache
 
-  (snap, sync, prune, jobs, doctor, and the TUI are not implemented yet
-   — see DESIGN.md for the roadmap)
+  (snap, sync, prune, jobs, doctor are not implemented yet — see DESIGN.md)
 
 flags (before the command):
   -config PATH   config file (default ./zfstui.toml while in development)
@@ -47,34 +37,36 @@ func main() {
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
 
-	if flag.NArg() < 1 {
-		flag.Usage()
-		os.Exit(2)
-	}
-	cmd := flag.Arg(0)
-
 	dbp := *dbPath
 	if dbp == "" {
-		dbp = config.DefaultDBPath()
+		dbp = DefaultDBPath()
 	}
-	st, err := store.Open(dbp)
+	st, err := openStore(dbp)
 	if err != nil {
 		fatal(err)
 	}
 	defer st.Close()
 
 	// Only commands that ssh out need an inventory; status reads the cache.
-	loadConfig := func() *config.Config {
-		cfg, err := config.Load(*configPath, splitComma(*hostsFlag))
+	mustConfig := func() *Config {
+		cfg, err := loadConfig(*configPath, splitComma(*hostsFlag))
 		if err != nil {
 			fatal(err)
 		}
 		return cfg
 	}
 
+	cmd := flag.Arg(0)
 	switch cmd {
+	case "":
+		// TUI: config is optional (without it, refresh keys are disabled).
+		cfg, cfgErr := loadConfig(*configPath, splitComma(*hostsFlag))
+		if cfgErr != nil {
+			cfg = nil
+		}
+		err = runTUI(st, cfg)
 	case "refresh":
-		err = cmdRefresh(loadConfig(), st)
+		err = cmdRefresh(mustConfig(), st)
 	case "status":
 		err = cmdStatus(st, *showAll)
 	default:
@@ -106,30 +98,20 @@ func splitComma(s string) []string {
 	return out
 }
 
-func cmdRefresh(cfg *config.Config, st *store.Store) error {
-	runner := sshx.NewSSH()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func cmdRefresh(cfg *Config, st *Store) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	started := time.Now()
-	var eg errgroup.Group
-	eg.SetLimit(8)
-	results := make([]error, len(cfg.Hosts))
-	for i, h := range cfg.Hosts {
-		eg.Go(func() error {
-			results[i] = refreshHost(ctx, runner, st, h)
-			return nil
-		})
-	}
-	eg.Wait()
+	results := Refresh(ctx, NewSSH(), st, cfg.Hosts)
 
 	ok := 0
-	for i, h := range cfg.Hosts {
-		if results[i] == nil {
+	for _, res := range results {
+		if res.Err == nil {
 			ok++
-			fmt.Printf("  %-12s ok\n", h.Name)
+			fmt.Printf("  %-12s ok\n", res.Host)
 		} else {
-			fmt.Printf("  %-12s UNREACHABLE: %v\n", h.Name, results[i])
+			fmt.Printf("  %-12s UNREACHABLE: %v\n", res.Host, res.Err)
 		}
 	}
 	fmt.Printf("refresh: %d/%d hosts in %.1fs\n", ok, len(cfg.Hosts), time.Since(started).Seconds())
@@ -139,32 +121,18 @@ func cmdRefresh(cfg *config.Config, st *store.Store) error {
 	return nil
 }
 
-func refreshHost(ctx context.Context, r sshx.Runner, st *store.Store, h model.Host) error {
-	out, err := r.Run(ctx, h, zfsout.DiscoverCommand(h.Sudo))
-	if err == nil {
-		var hs model.HostState
-		if hs, err = zfsout.ParseDiscovery(h.Name, string(out)); err == nil {
-			return st.PutHostState(hs)
-		}
-	}
-	if dbErr := st.MarkUnreachable(h.Name, err); dbErr != nil {
-		return dbErr
-	}
-	return err
-}
-
-func cmdStatus(st *store.Store, showAll bool) error {
-	states, err := st.AllHostStates()
+func cmdStatus(st *Store, showAll bool) error {
+	data, err := loadData(st)
 	if err != nil {
 		return err
 	}
-	if len(states) == 0 {
+	if len(data.States) == 0 {
 		return fmt.Errorf("cache is empty — run `zfstui refresh` first")
 	}
-	groups := derive.Groups(states)
+	groups := data.Groups
 	hidden := 0
 	if !showAll {
-		var visible []*model.Group
+		var visible []*Group
 		for _, g := range groups {
 			if g.Hidden {
 				hidden++
@@ -174,16 +142,12 @@ func cmdStatus(st *store.Store, showAll bool) error {
 		}
 		groups = visible
 	}
-	fmt.Print(view.Status(groups))
+	fmt.Print(Status(groups))
 	if hidden > 0 {
 		fmt.Printf("(%d snapshot-less groups hidden; -a shows them)\n", hidden)
 	}
 
-	hosts, err := st.Hosts()
-	if err != nil {
-		return err
-	}
-	for _, h := range hosts {
+	for _, h := range data.Hosts {
 		if !h.Reachable {
 			fmt.Printf("note: %s unreachable at last refresh (%s): %s\n",
 				h.Name, h.LastRefresh.Format(time.DateTime), h.LastError)

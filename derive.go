@@ -1,13 +1,11 @@
 // Package derive turns raw per-host inventory into replication groups and
 // per-replica states. Everything here is a pure function of the inventory —
 // see DESIGN.md "Source detection: derived from data, not declared".
-package derive
+package main
 
 import (
 	"sort"
 	"strings"
-
-	"ivank.me/zfstui/internal/model"
 )
 
 // replicaKey identifies a dataset across the whole inventory.
@@ -15,13 +13,13 @@ func replicaKey(host, name string) string { return host + ":" + name }
 
 // entry pairs a dataset with its snapshots (sorted by Creation asc).
 type entry struct {
-	ds    *model.Dataset
-	snaps []*model.Snapshot
+	ds    *Dataset
+	snaps []*Snapshot
 }
 
 // Groups computes replication groups (connected components over shared
 // snapshot GUIDs) with display names and per-replica states.
-func Groups(states []model.HostState) []*model.Group {
+func Groups(states []HostState) []*Group {
 	entries := map[string]*entry{}
 	var keys []string
 	for i := range states {
@@ -92,14 +90,14 @@ func Groups(states []model.HostState) []*model.Group {
 		components[root] = append(components[root], k)
 	}
 
-	var groups []*model.Group
+	var groups []*Group
 	for _, members := range components {
 		sort.Strings(members)
-		g := &model.Group{}
+		g := &Group{}
 		var names [][]string // path components sans pool, per member
 		for _, k := range members {
 			e := entries[k]
-			r := &model.Replica{Dataset: e.ds, Written: e.ds.Written}
+			r := &Replica{Dataset: e.ds, Written: e.ds.Written}
 			if n := len(e.snaps); n > 0 {
 				r.Latest = e.snaps[n-1]
 			}
@@ -111,10 +109,13 @@ func Groups(states []model.HostState) []*model.Group {
 			}
 		}
 		// Clones get odd names; don't let them shrink the common suffix.
+		// Boring leading components (snapshot-less container datasets like
+		// "bak/", "srv/") are trimmed before the suffix computation, so they
+		// end up in cell prefixes instead of the displayed group name.
 		var sufNames [][]string
 		for i, k := range members {
 			if entries[k].ds.Origin == "" {
-				sufNames = append(sufNames, names[i])
+				sufNames = append(sufNames, trimBoring(entries, entries[k].ds, names[i]))
 			}
 		}
 		if len(sufNames) == 0 {
@@ -151,7 +152,25 @@ func Groups(states []model.HostState) []*model.Group {
 	return groups
 }
 
-func splitNameInPool(d *model.Dataset) []string {
+// trimBoring drops leading name components whose ancestor dataset (on the
+// same host) exists but has no snapshots at all — pure containers like a
+// bare "bak"/"srv", the same plumbing the hidden rule classifies. Trimming
+// stops at the first ancestor that has snapshots (a real replicated parent,
+// e.g. "blobs" of "blobs/01"), and always keeps the last component.
+func trimBoring(entries map[string]*entry, d *Dataset, comps []string) []string {
+	path := d.Pool()
+	for len(comps) > 1 {
+		path += "/" + comps[0]
+		e := entries[replicaKey(d.Host, path)]
+		if e == nil || len(e.snaps) > 0 {
+			break
+		}
+		comps = comps[1:]
+	}
+	return comps
+}
+
+func splitNameInPool(d *Dataset) []string {
 	nip := d.NameInPool()
 	if nip == "" {
 		return nil
@@ -210,7 +229,7 @@ done:
 // "ahead of" B if A has snapshots newer than the base or unsnapshotted writes
 // (written > 0). Both ahead => the pair has diverged. Pairs with no shared
 // snapshot are incomparable and skipped (connectivity may be transitive).
-func classify(g *model.Group, entries map[string]*entry, members []string) {
+func classify(g *Group, entries map[string]*entry, members []string) {
 	n := len(members)
 	ahead := make([]bool, n)  // ahead of at least one peer
 	behind := make([]bool, n) // behind at least one peer
@@ -235,7 +254,7 @@ func classify(g *model.Group, entries map[string]*entry, members []string) {
 		for j := i + 1; j < n; j++ {
 			// Newest shared snapshot, scanning i's snaps newest-first.
 			ei := entries[members[i]]
-			var base *model.Snapshot
+			var base *Snapshot
 			for s := len(ei.snaps) - 1; s >= 0; s-- {
 				if guidSets[j][ei.snaps[s].GUID] {
 					base = ei.snaps[s]
@@ -260,18 +279,18 @@ func classify(g *model.Group, entries map[string]*entry, members []string) {
 	for i, r := range g.Members {
 		switch {
 		case r.Dataset.Origin != "":
-			r.State = model.StateClone
+			r.State = StateClone
 		case r.Dataset.ResumeToken != "":
-			r.State = model.StateResumable
+			r.State = StateResumable
 		case diverged[i]:
-			r.State = model.StateDiverged
+			r.State = StateDiverged
 			g.Diverged = true
 		case ahead[i] && !behind[i]:
-			r.State = model.StateAhead
+			r.State = StateAhead
 		case behind[i]:
-			r.State = model.StateBehind
+			r.State = StateBehind
 		default:
-			r.State = model.StateInSync
+			r.State = StateInSync
 		}
 	}
 }

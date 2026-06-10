@@ -1,24 +1,22 @@
-package store
+package main
 
 import (
 	"errors"
 	"path/filepath"
 	"testing"
-
-	"ivank.me/zfstui/internal/model"
 )
 
-func sample(host string) model.HostState {
-	return model.HostState{
+func sample(host string) HostState {
+	return HostState{
 		Host: host,
-		Pools: []model.Pool{
+		Pools: []Pool{
 			{Host: host, Name: "ssd", GUID: "p1", Size: 100, Alloc: 40, Free: 60, Health: "ONLINE"},
 		},
-		Datasets: []model.Dataset{
+		Datasets: []Dataset{
 			{Host: host, Name: "ssd/srv/git", Type: "filesystem", GUID: "d1",
 				Written: 4096, Encryption: "aes-256-gcm", Mounted: true, Mountpoint: "/srv/git"},
 		},
-		Snapshots: []model.Snapshot{
+		Snapshots: []Snapshot{
 			{Host: host, Dataset: "ssd/srv/git", Name: "20260601", GUID: "s1", Creation: 100},
 			{Host: host, Dataset: "ssd/srv/git", Name: "20260610", GUID: "s2", Creation: 200},
 		},
@@ -26,7 +24,7 @@ func sample(host string) model.HostState {
 }
 
 func TestRoundTrip(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	s, err := openStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

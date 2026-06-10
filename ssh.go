@@ -1,6 +1,6 @@
 // Package sshx runs commands on hosts by shelling out to the system ssh
 // binary, so the user's ~/.ssh/config, agent, ProxyJump etc. all apply.
-package sshx
+package main
 
 import (
 	"bytes"
@@ -10,14 +10,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-
-	"ivank.me/zfstui/internal/model"
 )
 
 // Runner abstracts remote execution so refresh logic is testable offline.
 type Runner interface {
 	// Run executes cmd on host and returns its stdout.
-	Run(ctx context.Context, host model.Host, cmd string) ([]byte, error)
+	Run(ctx context.Context, host Host, cmd string) ([]byte, error)
 }
 
 // SSH is the real Runner. ControlMaster multiplexing makes repeated calls to
@@ -41,7 +39,7 @@ func NewSSH() *SSH {
 
 // Args builds the full ssh argv for running cmd on host (exposed for tests
 // and for job-launch code that needs -A etc. via extra).
-func (s *SSH) Args(host model.Host, extra []string, cmd string) []string {
+func (s *SSH) Args(host Host, extra []string, cmd string) []string {
 	args := []string{
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=" + strconv.Itoa(s.ConnectTimeoutSec),
@@ -62,7 +60,7 @@ func (s *SSH) Args(host model.Host, extra []string, cmd string) []string {
 	return args
 }
 
-func (s *SSH) Run(ctx context.Context, host model.Host, cmd string) ([]byte, error) {
+func (s *SSH) Run(ctx context.Context, host Host, cmd string) ([]byte, error) {
 	c := exec.CommandContext(ctx, "ssh", s.Args(host, nil, cmd)...)
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout

@@ -5,12 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-
-	"ivank.me/zfstui/internal/derive"
-	"ivank.me/zfstui/internal/model"
-	"ivank.me/zfstui/internal/store"
-	"ivank.me/zfstui/internal/view"
-	"ivank.me/zfstui/internal/zfsout"
 )
 
 // fakeRunner serves canned discovery output per host, simulating the README's
@@ -19,7 +13,7 @@ type fakeRunner struct {
 	out map[string]string // host -> discovery stdout
 }
 
-func (f *fakeRunner) Run(_ context.Context, h model.Host, cmd string) ([]byte, error) {
+func (f *fakeRunner) Run(_ context.Context, h Host, cmd string) ([]byte, error) {
 	out, ok := f.out[h.Name]
 	if !ok {
 		return nil, fmt.Errorf("connect to %s: timeout", h.Name)
@@ -29,11 +23,11 @@ func (f *fakeRunner) Run(_ context.Context, h model.Host, cmd string) ([]byte, e
 
 func discovery(pools, datasets, snapshots string) string {
 	sec := func(mark, body string) string {
-		return mark + "\n" + body + zfsout.MarkRC + "0===\n"
+		return mark + "\n" + body + MarkRC + "0===\n"
 	}
-	return sec(zfsout.MarkPools, pools) +
-		sec(zfsout.MarkDatasets, datasets) +
-		sec(zfsout.MarkSnapshots, snapshots)
+	return sec(MarkPools, pools) +
+		sec(MarkDatasets, datasets) +
+		sec(MarkSnapshots, snapshots)
 }
 
 func dsLine(name string, written int64) string {
@@ -63,28 +57,28 @@ func TestRefreshAndStatusEndToEnd(t *testing.T) {
 		// "hetzner" missing => unreachable
 	}}
 
-	st, err := store.Open(":memory:")
+	st, err := openStore(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
-	hosts := []model.Host{{Name: "dev1"}, {Name: "dev2"}, {Name: "hetzner"}}
+	hosts := []Host{{Name: "dev1"}, {Name: "dev2"}, {Name: "hetzner"}}
 	var failed []string
-	for _, h := range hosts {
-		if err := refreshHost(context.Background(), runner, st, h); err != nil {
-			failed = append(failed, h.Name)
+	for _, res := range Refresh(context.Background(), runner, st, hosts) {
+		if res.Err != nil {
+			failed = append(failed, res.Host)
 		}
 	}
 	if len(failed) != 1 || failed[0] != "hetzner" {
 		t.Fatalf("failed hosts: %v", failed)
 	}
 
-	states, err := st.AllHostStates()
+	data, err := loadData(st)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := view.Status(derive.Groups(states))
+	out := Status(data.Groups)
 	t.Log("\n" + out)
 	if !strings.Contains(out, "git") ||
 		!strings.Contains(out, "srv/@20260601+") || // unsnapshotted writes

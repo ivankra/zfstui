@@ -2,21 +2,33 @@
 
 ## Status (2026-06-10)
 
-**M1 implemented** (discovery + status): `zfstui refresh` ssh-es to all
-configured hosts in parallel, scrapes `zpool list`/`zfs list -H -p` into the
-sqlite cache; `zfstui status` prints the groups × host:pool matrix with
-per-replica states derived from snapshot GUIDs (`*` ahead, `+` unsnapshotted
-writes, `!` diverged, `~` resumable, `%` clone). Unit tests cover parsers,
-grouping/state derivation (divergence, clones, transitive chains,
-same-name-unrelated), config, store, and an ssh-free end-to-end path.
+**M1 (discovery + status) and M3 (read-only TUI) are done.** Next: M2 sync
+planner (`sync --dry-run` + compatibility gate), then M4 actions/jobs.
 
-Try: `go build && ./zfstui -hosts host1,host2 refresh && ./zfstui status`
-(or put hosts in `~/.config/zfstui/config.toml`, see DESIGN.md).
+- `zfstui refresh` ssh-es to all configured hosts in parallel and scrapes
+  `zpool list`/`zfs list -H -p` into a sqlite cache (a pure cache — safe to
+  delete any time). Read-only on the hosts.
+- `zfstui status` prints the groups × host:pool matrix. Replication groups
+  and per-replica states (ahead/behind/diverged/resumable/clone) are derived
+  from **snapshot GUIDs**, never names. Cell markers: `+` unsnapshotted
+  writes, `!` diverged, `~` resumable, `%` clone; the newest `@name` in a
+  row is the source. Snapshot-less "plumbing" groups are hidden (`-a` shows)
+  and boring `bak/`/`srv/`-style prefixes are auto-trimmed from row names
+  into cells — all convention-free, derived from the data.
+- bare `./zfstui` opens the TUI: scrollable matrix with a two-level
+  host/pool header (both navigable, with details), color-coded cells, a
+  details pane (Tab to focus/scroll), async refresh (`r` host / `R` all),
+  `h` toggles hidden groups, `?` help.
 
-Not yet: TUI, snap/sync/prune/jobs/doctor (M2+ in the
-[DESIGN.md](DESIGN.md) roadmap). Design decisions and rationale live there
-too. Language: **Go**. Snapshot pruning is in scope (interactive dialog +
-batch command); destructive ops (`recv -F`, rollback, dataset destroy) are
+Try: `go build && ./zfstui -hosts host1,host2 refresh && ./zfstui`
+(or put hosts in `./zfstui.toml`; config/db default to cwd during
+development).
+
+Docs: [DESIGN.md](DESIGN.md) — architecture, decisions log, roadmap,
+implementation notes; [CLAUDE.md](CLAUDE.md) — code map and conventions for
+coding sessions. Code is a flat `package main`, tested ssh-free (parsers,
+derivation scenarios, fake-runner end-to-end). Data safety is the #1
+constraint: destructive ops (`recv -F`, rollback, dataset destroy) are
 banned outright.
 
 Core ideas:

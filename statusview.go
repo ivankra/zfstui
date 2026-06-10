@@ -1,36 +1,34 @@
 // Package view renders inventory as a plain-text table (the `status`
 // command; the TUI has its own renderer).
-package view
+package main
 
 import (
 	"fmt"
 	"sort"
 	"strings"
-
-	"ivank.me/zfstui/internal/model"
 )
 
 // Marker suffixes:
 //
-//	+  unsnapshotted local writes   !  diverged
-//	~  interrupted recv (resumable) %  clone
+//   - unsnapshotted local writes   !  diverged
+//     ~  interrupted recv (resumable) %  clone
 //
 // "Ahead" needs no marker: the per-cell @names already show who is newest.
-func cellText(r *model.Replica) string {
+func CellText(r *Replica) string {
 	var b strings.Builder
 	b.WriteString(r.CellPrefix)
 	if r.Latest != nil {
 		b.WriteString("@" + r.Latest.Name)
 	}
 	switch r.State {
-	case model.StateDiverged:
+	case StateDiverged:
 		b.WriteString("!")
-	case model.StateResumable:
+	case StateResumable:
 		b.WriteString("~")
-	case model.StateClone:
+	case StateClone:
 		b.WriteString("%")
 	}
-	if r.State != model.StateClone && r.Written > 0 {
+	if r.State != StateClone && r.Written > 0 {
 		b.WriteString("+")
 	}
 	if b.Len() == 0 {
@@ -42,7 +40,7 @@ func cellText(r *model.Replica) string {
 }
 
 // Status renders the groups × host:pool matrix.
-func Status(groups []*model.Group) string {
+func Status(groups []*Group) string {
 	colSet := map[string]bool{}
 	for _, g := range groups {
 		for _, r := range g.Members {
@@ -67,7 +65,7 @@ func Status(groups []*model.Group) string {
 		row[0] = g.DisplayName
 		for _, r := range g.Members {
 			i := colIdx[r.Dataset.Host+":"+r.Dataset.Pool()] + 1
-			cell := cellText(r)
+			cell := CellText(r)
 			if row[i] != "" {
 				row[i] += " " + cell // >1 replica of a group in one pool (rare)
 			} else {

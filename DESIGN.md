@@ -30,6 +30,13 @@ that host and are picked up on the next refresh — even by a brand-new control 
   prefix (`srv/`, `bak/`). Conventions like `srv/`/`bak/` thus render exactly
   as in the README illustration without the tool knowing about them. If there
   is no common suffix, the full name is shown per cell.
+- Additionally, leading components whose ancestor dataset is **snapshot-less
+  plumbing** (a bare `bak`/`srv` container — the same datasets the hidden
+  rule classifies) are trimmed from display names even when *all* replicas
+  share them (`bak/anki` everywhere → group `anki`, cells `bak/@…`), so
+  related rows sort together. Trimming stops at the first ancestor with its
+  own snapshots (a real replicated parent like `blobs` of `blobs/01`) and the
+  trimmed part still shows in cell prefixes.
 - This automatically keeps same-named-but-unrelated datasets (`rpool`, `cache`)
   apart, and tolerates renamed/odd-prefixed replicas.
 - Clones are detected via the `origin` property and shown annotated/indented
@@ -71,10 +78,8 @@ shows the `written` byte count so a 4K-atime-blip is easy to recognize.
 Groups where **no member has any snapshot at all** are hidden by default —
 these are almost always system/plumbing datasets (container datasets like a
 bare `bak`/`srv`, pool roots, OS datasets), not replication subjects. `status
--a` (and a TUI toggle) shows them. The TUI's `h` key hides/unhides the
-selected group manually; manual overrides are persisted in sqlite keyed by
-*dataset* GUID (per replica, so they survive cache rebuilds in practice; an
-"unhide" on any member outweighs the default rule). Hiding is pure display —
+-a` and the TUI `h` key toggle showing them. Hidden is purely computed (no
+persisted per-dataset flags — keep it stateless); hiding is pure display, and
 hidden groups still refresh and still count for safety checks.
 
 ### Per-replica freshness (drives table cell rendering)
@@ -300,7 +305,7 @@ Keyboard scheme (mnemonic letters, consistent everywhere):
   the group; incompatible ones greyed out with the reason), engine, recursive,
   dry-run toggle, "run from" (default: source host)
 - `d` prune dialog (destroy snapshots) for the selected group/replica
-- `h` hide/unhide the selected group; `H` toggle showing hidden groups
+- `h` toggle showing hidden (snapshot-less) groups
 - in Jobs pane: `Enter` opens job's log in the Log pane, `x` cancel (kills pid)
 - dialogs: `Enter` confirm, `Esc` cancel
 - function-key aliases for the F-key inclined: `F5`=copy, `F2`=snapshot
@@ -363,13 +368,56 @@ inventory (ansible-ish); with no config file at all it *is* the inventory.
 - Later: integration harness — a VM/container with a few file-backed zpools
   and ssh-to-localhost simulating multiple "hosts".
 
+## Implementation notes (as of M3, 2026-06-10)
+
+Flat `package main`, one directory (user preference — keep it flat). File
+map and the invariants worth knowing before touching code live in
+[CLAUDE.md](CLAUDE.md); the short version of the data flow:
+
+```
+refresh:  config → ssh (DiscoverCommand, 1 round-trip/host, errgroup×8)
+            → ParseDiscovery → store.PutHostState (atomic per host)
+view:     store → loadData → Groups (union-find by snapshot GUID; display
+            names; pairwise ahead/behind/diverged; hidden rule)
+            → statusview (CLI) / tui (bubbletea)
+```
+
+Non-obvious implementation decisions, with reasons:
+
+- `store.go` pins sqlite to **one connection** — parallel refresh writers
+  otherwise race to SQLITE_BUSY, and `:memory:` would otherwise mean a
+  different database per pool connection. Don't "optimize" this away.
+- Discovery output sections carry their own exit codes (`===ZFSTUI:rc=N===`)
+  so a missing zfs binary / sudo failure on one section is attributable
+  instead of silently yielding an empty host.
+- The TUI cursor uses negative rows for the header (−2 host, −1 pool); the
+  name column is `curCol == 0`, data columns are 1-based into the sorted
+  `host:pool` column list. Left/right on the host row jumps host-to-host.
+- Cell text logic is shared (`cellText`) between CLI and TUI; the TUI adds
+  color on top, the CLI relies on markers alone.
+- The "ahead" state intentionally has **no marker/asterisk** in cells: the
+  newest `@name` in the row identifies the source (user preference).
+- Display-name pipeline: name-in-pool → `trimBoring` (drop leading
+  components whose ancestor dataset has zero snapshots) → longest common
+  suffix across non-clone members → remainder becomes the cell prefix.
+- Everything derived is recomputed on every load; sqlite is a pure cache and
+  deleting it is always safe.
+
+Testing: pure-function table tests for parsers/derive (see the `fx` builder
+in derive_test.go), a `fakeRunner` end-to-end in main_test.go, sqlite
+round-trip in store_test.go. The TUI's rendering can be smoke-checked under
+`script`(1) but key delivery there is unreliable — behavior testing of the
+TUI is manual for now.
+
 ## Roadmap
 
-1. **M1 — see**: config, ssh runner, parsers, sqlite cache, grouping/source
+1. ✅ **M1 — see**: config, ssh runner, parsers, sqlite cache, grouping/source
    derivation, `refresh`/`status` CLI. (Most of the risk and most of the value
    for confidence-building lives here.)
-2. **M2 — plan**: sync planner + `sync --dry-run`, `doctor`.
-3. **M3 — watch**: read-only TUI (table, details, scrolling, refresh).
+2. **M2 — plan** *(next)*: sync planner + `sync --dry-run`, `doctor`.
+3. ✅ **M3 — watch**: read-only TUI (table with two-level host/pool header,
+   details pane with Tab focus + scrolling, host/pool/group/cell details,
+   async refresh, hidden-group toggle, boring-prefix-trimmed names).
 4. **M4 — act**: job protocol, `snap`, real `sync` (raw engine), jobs/log
    panes, resume handling.
 5. **M5 — polish**: syncoid engine, prune dialog + `prune` command, job
@@ -399,7 +447,10 @@ inventory (ansible-ish); with no config file at all it *is* the inventory.
   (dest clean at a snapshot the source has, or absent, or resumable) rejects
   exactly the destructive ones.
 - 2026-06-10: **hidden groups** — snapshot-less groups (system/plumbing
-  datasets) are hidden by default in status/TUI; `-a`/`H` reveals, TUI `h`
-  toggles manually (override persisted per dataset GUID). Display-only.
+  datasets) are hidden by default in status/TUI; `-a` / TUI `h` toggles
+  showing them. Purely computed, no persisted flags. Display-only.
+- 2026-06-10: **boring prefix trimming** — display names drop leading
+  components whose ancestor dataset is snapshot-less plumbing; the prefix
+  moves into the cell. Convention-free `bak/`/`srv/` cleanup.
 - Name: `zfstui`. Jobs dir: `~/.local/state/zfstui/jobs` (default; works
   non-root).

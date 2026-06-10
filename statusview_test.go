@@ -1,35 +1,32 @@
-package view
+package main
 
 import (
 	"strings"
 	"testing"
-
-	"ivank.me/zfstui/internal/derive"
-	"ivank.me/zfstui/internal/model"
 )
 
 func TestStatusTable(t *testing.T) {
-	states := []model.HostState{
+	states := []HostState{
 		{
 			Host: "dev1",
-			Datasets: []model.Dataset{
+			Datasets: []Dataset{
 				{Host: "dev1", Name: "ssd/srv/git", Type: "filesystem", Written: 4096},
 			},
-			Snapshots: []model.Snapshot{
+			Snapshots: []Snapshot{
 				{Host: "dev1", Dataset: "ssd/srv/git", Name: "20260601", GUID: "g1", Creation: 100},
 			},
 		},
 		{
 			Host: "dev2",
-			Datasets: []model.Dataset{
+			Datasets: []Dataset{
 				{Host: "dev2", Name: "tank/bak/git", Type: "filesystem"},
 			},
-			Snapshots: []model.Snapshot{
+			Snapshots: []Snapshot{
 				{Host: "dev2", Dataset: "tank/bak/git", Name: "20260601", GUID: "g1", Creation: 100},
 			},
 		},
 	}
-	out := Status(derive.Groups(states))
+	out := Status(Groups(states))
 	t.Log("\n" + out)
 
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")

@@ -1,4 +1,4 @@
-package zfsout
+package main
 
 import (
 	"strings"

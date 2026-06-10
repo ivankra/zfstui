@@ -1,5 +1,5 @@
 // Package config loads the TOML inventory and merges inline -hosts flags.
-package config
+package main
 
 import (
 	"fmt"
@@ -8,8 +8,6 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
-
-	"ivank.me/zfstui/internal/model"
 )
 
 type Defaults struct {
@@ -35,7 +33,7 @@ type file struct {
 
 type Config struct {
 	Defaults Defaults
-	Hosts    []model.Host // sorted by name
+	Hosts    []Host // sorted by name
 	DBPath   string
 }
 
@@ -56,7 +54,7 @@ func DefaultDBPath() string {
 // non-empty) and merges inline hosts: names already configured are kept
 // as-is, unknown names are added with defaults — ansible-ish add/extend.
 // If inlineHosts is non-empty it also acts as a filter on configured hosts.
-func Load(path string, inlineHosts []string) (*Config, error) {
+func loadConfig(path string, inlineHosts []string) (*Config, error) {
 	var f file
 	explicit := path != ""
 	if path == "" {
@@ -75,7 +73,7 @@ func Load(path string, inlineHosts []string) (*Config, error) {
 	}
 
 	cfg := &Config{Defaults: f.Defaults, DBPath: DefaultDBPath()}
-	mk := func(name string, h hostSection) model.Host {
+	mk := func(name string, h hostSection) Host {
 		sudo := f.Defaults.Sudo
 		if h.Sudo != nil {
 			sudo = *h.Sudo
@@ -84,7 +82,7 @@ func Load(path string, inlineHosts []string) (*Config, error) {
 		if user == "" {
 			user = f.Defaults.User
 		}
-		return model.Host{
+		return Host{
 			Name: name, Addr: h.Addr, Port: h.Port, User: user, Sudo: sudo,
 			SendUser: h.SendUser, RecvUser: h.RecvUser, SSHOpts: h.SSHOpts,
 		}

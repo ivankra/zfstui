@@ -1,4 +1,4 @@
-package config
+package main
 
 import (
 	"os"
@@ -15,7 +15,7 @@ func write(t *testing.T, content string) string {
 	return p
 }
 
-const sample = `
+const sampleConfig = `
 [defaults]
 user = "root"
 engine = "raw"
@@ -32,7 +32,7 @@ recv_user = "zfsrecv"
 `
 
 func TestLoad(t *testing.T) {
-	cfg, err := Load(write(t, sample), nil)
+	cfg, err := loadConfig(write(t, sampleConfig), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestLoad(t *testing.T) {
 }
 
 func TestInlineFiltersAndAdds(t *testing.T) {
-	cfg, err := Load(write(t, sample), []string{"dev2", "newhost"})
+	cfg, err := loadConfig(write(t, sampleConfig), []string{"dev2", "newhost"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestInlineFiltersAndAdds(t *testing.T) {
 }
 
 func TestInlineUserAtHost(t *testing.T) {
-	cfg, err := Load(write(t, sample), []string{"admin@dev2", "root@newhost"})
+	cfg, err := loadConfig(write(t, sampleConfig), []string{"admin@dev2", "root@newhost"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,18 +91,18 @@ func TestInlineUserAtHost(t *testing.T) {
 func TestNoConfigInlineOnly(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nope.toml")
 	// Default-path semantics: missing file tolerated when -hosts given...
-	cfg, err := Load("", []string{"a", "b"})
+	cfg, err := loadConfig("", []string{"a", "b"})
 	if err == nil && len(cfg.Hosts) != 2 {
 		t.Errorf("got %+v", cfg.Hosts)
 	}
 	// ...but an explicitly named missing file is an error.
-	if _, err := Load(missing, []string{"a"}); err == nil {
+	if _, err := loadConfig(missing, []string{"a"}); err == nil {
 		t.Error("want error for explicit missing config")
 	}
 }
 
 func TestNoHostsAtAll(t *testing.T) {
-	if _, err := Load(write(t, "[defaults]\n"), nil); err == nil {
+	if _, err := loadConfig(write(t, "[defaults]\n"), nil); err == nil {
 		t.Error("want error when config has no hosts")
 	}
 }

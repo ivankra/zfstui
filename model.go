@@ -1,7 +1,7 @@
 // Package model holds the inventory data structures shared by all layers:
 // what exists on the hosts (pools, datasets, snapshots) and what we derive
 // from it (replication groups, per-replica states).
-package model
+package main
 
 // Host is one entry from the inventory config.
 type Host struct {
