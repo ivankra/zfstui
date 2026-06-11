@@ -100,3 +100,7 @@ func TestRefreshAndStatusEndToEnd(t *testing.T) {
 		t.Errorf("unreachable: %v", unreachable)
 	}
 }
+
+func (f *fakeRunner) RunInput(ctx context.Context, h Host, cmd string, stdin []byte) ([]byte, error) {
+	return f.Run(ctx, h, cmd)
+}

@@ -37,9 +37,11 @@ fleet db may be present in cwd; `./zfstui status` works offline from it.
 Only ever emit: `zfs snapshot`, `zfs send | zfs recv -s -u` (NEVER `-F`),
 `zfs destroy <ds>@<snap>` (prune only), `zfs receive -A` (explicit abandon).
 Never: dataset/clone destroy, rollback, rename, `destroy -R/-f`, zpool or
-property mutations. When M2/M4 add command generation, build all mutating
-command lines in one place and golden-test them (DESIGN "Data safety").
-Everything implemented so far is read-only (`zpool list`/`zfs list`).
+property mutations. ALL mutating command lines are built in mutate.go and
+nowhere else (charset validation + shell quoting); mutate_test.go/jobs_test.go
+assert constructor output and every mutating job-script line match the
+allowlist regex. Extend the regex + constructors together. The global
+`-dry-run` flag must keep disabling every mutation path.
 
 ## Code map (flat package main, one dir — user explicitly wants no subdirs)
 
@@ -71,6 +73,12 @@ Everything implemented so far is read-only (`zpool list`/`zfs list`).
     ahead; clones and resume tokens override display state. No stored
     "master", no pins — source is always derived (DESIGN "Source detection").
   - `Group.Hidden` = no member has any snapshot (plumbing datasets).
+- `mutate.go` — THE ONLY place mutation command lines are built (see Hard
+  rules). Currently: buildSnapshotCmd.
+- `jobs.go` — remote job protocol: /tmp/zfstui-job-<id>/ dirs (job.sh,
+  meta.json written by job.sh itself, status, log), one-round-trip launch
+  with job.sh on ssh stdin + setsid, waitJob status polling. snapshotJob is
+  the first job kind.
 - `ops.go` — `Refresh` (errgroup fan-out, limit 8; unreachable hosts are
   recorded, cache kept) and `loadData` (cache → Data{States, Groups, Hosts,
   SnapsByReplica}).
@@ -84,7 +92,19 @@ Everything implemented so far is read-only (`zpool list`/`zfs list`).
   (underlined, spanning) over pools (bold). `focus` 0=Datasets 1=Details
   (Tab toggles; Details scrolls via `detOff`). `h` toggles hidden groups —
   NOT vim-left (user decision). Refresh runs as tea.Cmd, results via
-  `refreshDoneMsg`.
+  `refreshDoneMsg`. `s` opens the snapshot dialog: a centered lipgloss-
+  bordered modal form composited OVER the table (overlayCenter, ANSI-aware
+  splicing) with bubbles textinput + checkbox + buttons (Tab/↑↓ cycle focus,
+  Space toggles/presses, Enter = default action). The form previews the
+  exact command live and Create acts immediately — no separate confirm
+  screen (user decision); in -dry-run the button reads "Create (dry run)"
+  and opens a scrollable centered `textModal` with command/job dir/job.sh
+  instead of executing. `m.modal` (textModal) is the generic scrollable
+  text modal (also used for job-failure logs). Reuse button()/checkbox()/
+  styleDialog*/overlayCenter/textModal for future dialogs (sync, prune).
+  Dialog state machine is unit-tested without a pty (tui_test.go drives
+  Update with tea.KeyMsg directly; throwaway render tests for eyeballing
+  layout are in git history).
 - `main.go` — flag parsing (global flags BEFORE command), command dispatch;
   first positional arg is the command iff it matches one, the rest are host
   specs. `status` works from cache alone; the TUI resolves hosts from sqlite
@@ -116,5 +136,6 @@ Everything implemented so far is read-only (`zpool list`/`zfs list`).
   (needs full resend; relevant for M2 messaging).
 - M2 next: sync planner + compatibility gate (DESIGN "Sync planning") +
   `sync --dry-run`; pure functions + tests first, then `doctor`.
-- M4 after: job dirs on source host (DESIGN "Remote job protocol"), snapshot/
-  sync dialogs, jobs/log panes.
+- M4 partly done: job mechanics + TUI snapshot dialog + -dry-run. Still
+  missing: batch `snap` command, refresh-time job discovery (glob
+  /tmp/zfstui-job-* into a jobs table/pane), sync execution, prune.

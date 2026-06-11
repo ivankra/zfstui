@@ -12,10 +12,13 @@ import (
 	"strconv"
 )
 
-// Runner abstracts remote execution so refresh logic is testable offline.
+// Runner abstracts remote execution so refresh/job logic is testable offline.
 type Runner interface {
 	// Run executes cmd on host and returns its stdout.
 	Run(ctx context.Context, host Host, cmd string) ([]byte, error)
+	// RunInput is Run with data piped to the remote command's stdin
+	// (used to transfer job scripts).
+	RunInput(ctx context.Context, host Host, cmd string, stdin []byte) ([]byte, error)
 }
 
 // SSH is the real Runner. ControlMaster multiplexing makes repeated calls to
@@ -60,7 +63,14 @@ func (s *SSH) Args(host Host, extra []string, cmd string) []string {
 }
 
 func (s *SSH) Run(ctx context.Context, host Host, cmd string) ([]byte, error) {
+	return s.RunInput(ctx, host, cmd, nil)
+}
+
+func (s *SSH) RunInput(ctx context.Context, host Host, cmd string, stdin []byte) ([]byte, error) {
 	c := exec.CommandContext(ctx, "ssh", s.Args(host, nil, cmd)...)
+	if stdin != nil {
+		c.Stdin = bytes.NewReader(stdin)
+	}
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr

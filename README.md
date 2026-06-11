@@ -19,6 +19,14 @@ planner (`sync --dry-run` + compatibility gate), then M4 actions/jobs.
   host/pool header (both navigable, with details), color-coded cells, a
   details pane (Tab to focus/scroll), async refresh (`r` host / `R` all),
   `h` toggles hidden groups, `?` help.
+- **first mutation (M4 started)**: `s` snapshots the selected dataset via a
+  dialog (name, default YYYYMMDD; recursive toggle; confirm screen showing
+  the exact `zfs snapshot` command). Runs as a detached job in
+  `/tmp/zfstui-job-<id>/` on the host (status/log/meta files; survives
+  control-node disconnect), then auto-refreshes. A global `-dry-run` flag
+  disables all mutations and shows the would-be command + job script
+  instead. All mutation command lines are built in one audited place and
+  allowlist-tested.
 
 Try: `go build && ./zfstui refresh root@host1 user@host2 && ./zfstui`.
 Hosts are positional specs (`host`, `user@host[:pool]`, or

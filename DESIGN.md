@@ -1,7 +1,7 @@
 # zfstui — Design
 
-Status: **draft for discussion** (nothing implemented yet). See README.md for the
-original wishes; this document is the proposed answer. Open questions at the bottom.
+Living design doc. See README.md for the original wishes and current status;
+the decisions log and implementation notes below track what's actually built.
 
 ## One-paragraph summary
 
@@ -109,7 +109,7 @@ hackability of the tool by its user beats marginal library preferences.
   is the one genuinely concurrent part and where Go shines.
 - All `zfs`/`zpool` output parsed by hand from `-H -p` tab-separated output per
   the no-unnecessary-deps preference. Full dep list stays around: bubbletea,
-  lipgloss, modernc.org/sqlite, x/sync.
+  bubbles (textinput), lipgloss, modernc.org/sqlite, x/sync.
 
 ### SSH: shell out to the system `ssh` binary
 
@@ -190,7 +190,9 @@ Given a compatible (group, source replica, dest replica):
    preserves props; your `bak/` convention handles mounting).
 7. Dry-run mode prints/logs the exact pipeline without executing — this exact
    command line is also what goes into the generated job script, so dry-run
-   output is trustworthy.
+   output is trustworthy. Implemented as a global `-dry-run` flag: all
+   mutations are disabled; confirming a dialog shows the command, the job dir
+   and the full job.sh in an overlay instead of executing.
 
 Engine selection per job: `auto` (use syncoid if found on the source host, else
 raw ssh+bash), or forced `syncoid` / `raw` via config/flag/dialog. The raw
@@ -213,8 +215,10 @@ Never, under any code path: `zfs destroy` of a filesystem/volume/clone,
 property changes. If a destination has diverged or otherwise needs surgery,
 the tool refuses with a clear explanation and the user fixes it with a shell.
 This allowlist is enforced structurally: command lines are built by typed
-constructors in one package, and job-script golden tests assert nothing
-outside the allowlist ever appears.
+constructors in one place (mutate.go: charset validation + shell quoting),
+and tests assert both the constructors' output and every mutating line of
+generated job scripts match the allowlist regex (mutate_test.go,
+jobs_test.go).
 
 ## Snapshot pruning
 
@@ -246,22 +250,33 @@ differ per host. (`zfs allow` delegation is a documented alternative.)
 
 ## Remote job protocol (the keystone)
 
-A job = a directory on the **source host** (or the control node itself when
-the user overrides "run from"): `~/.local/state/zfstui/jobs/<job-id>/` with:
+A job = a directory on the **executing host** (the source host for syncs; or
+the control node itself when the user overrides "run from"):
+`/tmp/zfstui-job-<job-id>/` — deliberately /tmp rather than a user dir, so we
+aren't tied to account layouts and discovery of active/finished jobs is one
+glob (`/tmp/zfstui-job-*`) away. Contents:
 
 ```
 job.sh      generated, self-contained bash (the only thing that "runs")
-meta.json   src/dst/snapshots/engine/flags — written by control node
+meta.json   id/kind/host/command + per-kind fields — written by job.sh itself
+            (heredoc), so the whole job is a single file transfer
 status      one line: running <pid> | done | failed <exitcode>  (+ rfc3339 time)
 log         stdout+stderr of the pipeline
 progress    pv machine-readable output (bytes done / total), if pv available
 ```
 
 - Job IDs are `<utc-timestamp>-<short-random>` — sortable, collision-free.
-- Launch: control node writes the dir over ssh, then
-  `ssh -A host 'cd <dir> && setsid bash job.sh >log 2>&1 & echo $! > pid'`
-  and disconnects. The send|recv pipeline is already connected at that point,
-  so the agent is no longer needed.
+- Launch is ONE ssh round trip: job.sh arrives on the remote command's stdin
+  (`mkdir -m 0700 dir && cat > dir/job.sh && setsid bash dir/job.sh ... &`),
+  prints `launched <dir>`, and the control node may disconnect. (`ssh -A` for
+  syncs: the send|recv pipeline is already connected at that point, so the
+  agent is no longer needed afterwards.)
+- status file format: `running <pid> <ts>` | `done <ts>` | `failed <rc> <ts>`,
+  rewritten on every exit path of job.sh.
+- Implemented (M4 started 2026-06-11): the job mechanics (jobs.go) and
+  `snapshot` as the first job kind, driven by the TUI `s` dialog; the control
+  node polls the status file briefly (~20s) and otherwise leaves the job to
+  be picked up by a later refresh.
 - `job.sh` traps errors, writes `status` on every exit path, and does **no
   retries** in v1: if the network drops mid-transfer it fails fast, recv `-s`
   leaves a resume token on dest, and the next refresh shows a "resumable" cell —
@@ -428,7 +443,8 @@ TUI is manual for now.
 3. ✅ **M3 — watch**: read-only TUI (table with two-level host/pool header,
    details pane with Tab focus + scrolling, host/pool/group/cell details,
    async refresh, hidden-group toggle, boring-prefix-trimmed names).
-4. **M4 — act**: job protocol, `snap`, real `sync` (raw engine), jobs/log
+4. **M4 — act** *(started: job protocol + TUI snapshot dialog + -dry-run
+   done)*: batch `snap`, real `sync` (raw engine), jobs/log
    panes, resume handling.
 5. **M5 — polish**: syncoid engine, prune dialog + `prune` command, job
    cancel, job-dir pruning, packaging.
@@ -470,5 +486,10 @@ TUI is manual for now.
   in one invocation are rejected; root is the default user.
 - 2026-06-11: **sudo is implied** — root access user ⇒ no sudo, non-root ⇒
   `sudo -n`. No sudo option anywhere.
-- Name: `zfstui`. Jobs dir: `~/.local/state/zfstui/jobs` (default; works
-  non-root).
+- 2026-06-11: **jobs live in `/tmp/zfstui-job-<id>/`** (not user dirs):
+  account-independent, and active/finished job discovery is a single glob.
+  Job launch is one ssh round trip with job.sh on stdin; meta.json is written
+  by job.sh itself. First job kind: snapshot (TUI `s` dialog).
+- 2026-06-11: **global `-dry-run` flag** — disables all mutations everywhere;
+  confirmations show the exact command + job dir + job.sh instead.
+- Name: `zfstui`.

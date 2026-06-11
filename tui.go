@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 var (
@@ -82,10 +84,41 @@ type Model struct {
 	refreshing bool
 	status     string
 	statusErr  bool
+
+	dryRun bool
+	dialog *snapDialog // snapshot dialog when non-nil
+	modal  *textModal  // scrollable centered text modal (dry-run details, job logs)
 }
 
-func New(st *Store, hosts []Host) (*Model, error) {
-	m := &Model{st: st, hosts: hosts}
+// textModal is a centered, scrollable read-only text box.
+type textModal struct {
+	title string
+	lines []string
+	off   int
+}
+
+// snapDialog is the state of the snapshot dialog (TUI `s`): a modal form
+// with a text input, a checkbox and buttons; Tab/↑↓ cycle focus. The Create
+// button acts immediately (in -dry-run it opens the details modal instead).
+type snapDialog struct {
+	host      Host
+	dataset   string
+	input     textinput.Model
+	recursive bool
+	focus     int // formFocus* constants
+	errMsg    string
+}
+
+const (
+	formFocusName = iota
+	formFocusRecursive
+	formFocusOK
+	formFocusCancel
+	formFocusCount
+)
+
+func New(st *Store, hosts []Host, dryRun bool) (*Model, error) {
+	m := &Model{st: st, hosts: hosts, dryRun: dryRun}
 	if err := m.reload(); err != nil {
 		return nil, err
 	}
@@ -279,10 +312,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case snapDoneMsg:
+		return m.onSnapDone(msg)
+
 	case tea.KeyMsg:
+		if m.modal != nil {
+			m.updateModal(msg)
+			return m, nil
+		}
 		if m.showHelp {
 			m.showHelp = false
 			return m, nil
+		}
+		if m.dialog != nil {
+			return m.updateDialog(msg)
 		}
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -342,6 +385,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.curRow = len(m.rows) - 1
 			}
+		case "s":
+			m.openSnapshotDialog()
 		case "r":
 			return m.startRefresh(false)
 		case "R":
@@ -408,7 +453,122 @@ func (m *Model) View() string {
 	b.WriteString(m.paneTitle("Details", m.focus == 1))
 	b.WriteString(m.detailsBody())
 	b.WriteString(m.footerView())
+	if m.dialog != nil {
+		// Modal: composite the dialog box over the normal view.
+		return overlayCenter(b.String(), m.dialogView(), m.width, m.height)
+	}
+	if m.modal != nil {
+		return overlayCenter(b.String(), m.modalView(), m.width, m.height)
+	}
 	return b.String()
+}
+
+// --- scrollable text modal ---
+
+func (m *Model) modalBodyH() int {
+	h := m.height - 8
+	if h > 24 {
+		h = 24
+	}
+	if h < 4 {
+		h = 4
+	}
+	return h
+}
+
+func (m *Model) updateModal(msg tea.KeyMsg) {
+	mo := m.modal
+	bodyH := m.modalBodyH()
+	maxOff := len(mo.lines) - bodyH
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	switch msg.String() {
+	case "up", "k":
+		mo.off--
+	case "down", "j":
+		mo.off++
+	case "pgup":
+		mo.off -= bodyH
+	case "pgdown", " ":
+		mo.off += bodyH
+	case "g", "home":
+		mo.off = 0
+	case "G", "end":
+		mo.off = maxOff
+	case "esc", "q", "enter":
+		m.modal = nil
+		return
+	}
+	if mo.off > maxOff {
+		mo.off = maxOff
+	}
+	if mo.off < 0 {
+		mo.off = 0
+	}
+}
+
+func (m *Model) modalView() string {
+	mo := m.modal
+	bodyH := m.modalBodyH()
+	maxW := m.width - 12
+	if maxW > 96 {
+		maxW = 96
+	}
+	if maxW < 20 {
+		maxW = 20
+	}
+	var b strings.Builder
+	b.WriteString(styleDialogTitle.Render(mo.title) + "\n\n")
+	end := mo.off + bodyH
+	if end > len(mo.lines) {
+		end = len(mo.lines)
+	}
+	for i := mo.off; i < end; i++ {
+		b.WriteString(pad(mo.lines[i], maxW) + "\n")
+	}
+	for i := end - mo.off; i < bodyH; i++ {
+		b.WriteString("\n")
+	}
+	pos := ""
+	if len(mo.lines) > bodyH {
+		pos = fmt.Sprintf("  %d–%d/%d", mo.off+1, end, len(mo.lines))
+	}
+	b.WriteString("\n" + styleDim.Render("↑↓/jk scroll · PgUp/PgDn · Esc close"+pos))
+	return styleDialogBox.Render(b.String())
+}
+
+// overlayCenter splices the box into the middle of base, ANSI-aware, so the
+// underlying view stays visible around a modal dialog.
+func overlayCenter(base, box string, w, h int) string {
+	boxLines := strings.Split(strings.TrimRight(box, "\n"), "\n")
+	bw := 0
+	for _, l := range boxLines {
+		if x := ansi.StringWidth(l); x > bw {
+			bw = x
+		}
+	}
+	x := (w - bw) / 2
+	if x < 0 {
+		x = 0
+	}
+	y := (h - len(boxLines)) / 2
+	if y < 0 {
+		y = 0
+	}
+	baseLines := strings.Split(base, "\n")
+	for len(baseLines) < y+len(boxLines) {
+		baseLines = append(baseLines, "")
+	}
+	const reset = "\x1b[0m"
+	for i, bl := range boxLines {
+		orig := baseLines[y+i]
+		left := ansi.Truncate(orig, x, "")
+		pad := strings.Repeat(" ", max(x-ansi.StringWidth(left), 0))
+		right := ansi.TruncateLeft(orig, x+bw, "")
+		baseLines[y+i] = left + reset + pad + bl + reset + right
+	}
+	return strings.Join(baseLines, "\n")
 }
 
 // paneTitle renders "── Name ───…" with the name highlighted when focused.
@@ -852,7 +1012,10 @@ func snapList(snaps []Snapshot, n int) string {
 }
 
 func (m *Model) footerView() string {
-	keys := "q quit · ? help · ←↓↑→ move · Tab focus · r/R refresh · h hidden"
+	keys := "q quit · ? help · ←↓↑→ move · Tab focus · s snap · r/R refresh · h hidden"
+	if m.dryRun {
+		keys = styleDiverged.Render("DRY-RUN") + " · " + keys
+	}
 	if m.hiddenN > 0 {
 		mark := "+"
 		if m.showHidden {
@@ -883,6 +1046,7 @@ func (m *Model) helpView() string {
   ←↓↑→ / jk     move cursor (name column selects the whole group; ↑ past the
                  first row selects a pool, ↑ again a host — details follow)
   Tab            switch focus between Datasets and Details (jk/↑↓ scroll there)
+  s              snapshot the selected dataset (dialog: name, recursive, confirm)
   g / G          first / last row
   r              refresh the selected cell's host (all hosts if on name column)
   R              refresh all hosts
@@ -910,12 +1074,282 @@ func hostNames(hosts []Host) []string {
 }
 
 // Run starts the TUI.
-func runTUI(st *Store, hosts []Host) error {
-	m, err := New(st, hosts)
+func runTUI(st *Store, hosts []Host, dryRun bool) error {
+	m, err := New(st, hosts, dryRun)
 	if err != nil {
 		return err
 	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err = p.Run()
 	return err
+}
+
+// --- snapshot dialog ---
+
+// openSnapshotDialog picks the snapshot target from the cursor: a specific
+// cell's replica, or — on the name column — the group's sole ahead replica.
+func (m *Model) openSnapshotDialog() {
+	g, c := m.selected()
+	if m.curRow < 0 || g == nil {
+		m.status, m.statusErr = "select a dataset to snapshot", true
+		return
+	}
+	var r *Replica
+	switch {
+	case c != nil && len(c.replicas) > 0:
+		r = c.replicas[0]
+	case m.curCol == 0:
+		var ahead []*Replica
+		for _, mem := range g.Members {
+			if mem.State == StateAhead {
+				ahead = append(ahead, mem)
+			}
+		}
+		if len(ahead) != 1 {
+			m.status, m.statusErr = "no single ahead replica — select a specific cell to snapshot", true
+			return
+		}
+		r = ahead[0]
+	default:
+		m.status, m.statusErr = "empty cell — nothing to snapshot here", true
+		return
+	}
+	var host Host
+	found := false
+	for _, h := range m.hosts {
+		if h.Name == r.Dataset.Host {
+			host, found = h, true
+			break
+		}
+	}
+	if !found {
+		host = Host{Name: r.Dataset.Host}
+	}
+	in := textinput.New()
+	in.Prompt = ""
+	in.CharLimit = 64
+	in.Width = 28
+	in.TextStyle = lipgloss.NewStyle().Underline(true)
+	in.SetValue(time.Now().Format("20060102"))
+	in.CursorEnd()
+	in.Focus()
+	m.dialog = &snapDialog{host: host, dataset: r.Dataset.Name, input: in}
+}
+
+func (m *Model) updateDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	d := m.dialog
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.dialog = nil
+		return m, nil
+	case "tab", "down":
+		d.setFocus((d.focus + 1) % formFocusCount)
+		return m, nil
+	case "shift+tab", "up":
+		d.setFocus((d.focus + formFocusCount - 1) % formFocusCount)
+		return m, nil
+	case "left":
+		if d.focus == formFocusCancel {
+			d.setFocus(formFocusOK)
+			return m, nil
+		}
+	case "right":
+		if d.focus == formFocusOK {
+			d.setFocus(formFocusCancel)
+			return m, nil
+		}
+	case " ":
+		switch d.focus {
+		case formFocusRecursive:
+			d.recursive = !d.recursive
+			return m, nil
+		case formFocusOK:
+			return m, m.submitDialog()
+		case formFocusCancel:
+			m.dialog = nil
+			return m, nil
+		}
+	case "enter":
+		if d.focus == formFocusCancel {
+			m.dialog = nil
+			return m, nil
+		}
+		return m, m.submitDialog() // Enter anywhere else = default action
+	}
+	if d.focus == formFocusName {
+		var cmd tea.Cmd
+		d.input, cmd = d.input.Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (d *snapDialog) setFocus(f int) {
+	d.focus = f
+	if f == formFocusName {
+		d.input.Focus()
+	} else {
+		d.input.Blur()
+	}
+}
+
+// submitDialog validates the form and acts: in -dry-run it opens the
+// details modal; otherwise it launches the snapshot job. The form itself is
+// the confirmation — the exact command is shown before pressing Create.
+func (m *Model) submitDialog() tea.Cmd {
+	d := m.dialog
+	name := strings.TrimSpace(d.input.Value())
+	for _, sn := range m.data.SnapsByReplica[d.host.Name+":"+d.dataset] {
+		if sn.Name == name {
+			d.errMsg = fmt.Sprintf("snapshot @%s already exists on this replica", name)
+			return nil
+		}
+	}
+	spec, err := snapshotJob(d.host, d.dataset, name, d.recursive)
+	if err != nil {
+		d.errMsg = err.Error()
+		return nil
+	}
+	m.dialog = nil
+	if m.dryRun {
+		m.modal = dryRunModal(spec)
+		m.status, m.statusErr = "[dry-run] nothing was executed", false
+		return nil
+	}
+	m.refreshing = true
+	m.status, m.statusErr = fmt.Sprintf("creating %s@%s on %s (job %s)…",
+		d.dataset, name, d.host.Name, spec.ID), false
+	return runSnapshotCmd(d.host, spec)
+}
+
+// --- dialog rendering ---
+
+var (
+	styleDialogBox = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("6")).
+			Padding(1, 3)
+	styleDialogTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	styleFieldLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleButton      = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("7"))
+	styleButtonFocus = lipgloss.NewStyle().Padding(0, 1).Reverse(true).Bold(true)
+	styleFocusMark   = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+)
+
+func button(label string, focused bool) string {
+	if focused {
+		return styleButtonFocus.Render("▶ " + label + " ◀")
+	}
+	return styleButton.Render("  " + label + "  ")
+}
+
+func checkbox(label string, checked, focused bool) string {
+	box := "[ ]"
+	if checked {
+		box = "[x]"
+	}
+	s := box + " " + label
+	if focused {
+		return styleFocusMark.Render("› ") + styleCursor.Render(s)
+	}
+	return "  " + s
+}
+
+func (m *Model) dialogView() string {
+	d := m.dialog
+	var b strings.Builder
+	b.WriteString(styleDialogTitle.Render("Create snapshot") + "\n\n")
+	fmt.Fprintf(&b, "%s %s\n", styleFieldLabel.Render("host    "), d.host.Name+"  ("+d.host.URL()+")")
+	fmt.Fprintf(&b, "%s %s\n\n", styleFieldLabel.Render("dataset "), d.dataset)
+	mark := "  "
+	if d.focus == formFocusName {
+		mark = styleFocusMark.Render("› ")
+	}
+	fmt.Fprintf(&b, "%s%s %s\n\n", mark, styleFieldLabel.Render("name"), d.input.View())
+	b.WriteString(checkbox("recursive (-r)", d.recursive, d.focus == formFocusRecursive) + "\n")
+	if cmd, err := buildSnapshotCmd(d.host.NeedSudo(), d.dataset,
+		strings.TrimSpace(d.input.Value()), d.recursive); err == nil {
+		b.WriteString("\n" + styleFieldLabel.Render("will run ") + styleName.Render(cmd) + "\n")
+	}
+	if d.errMsg != "" {
+		b.WriteString("\n" + styleErr.Render("⚠ "+d.errMsg) + "\n")
+	}
+	create := "Create"
+	if m.dryRun {
+		create = "Create (dry run)"
+	}
+	b.WriteString("\n" + button(create, d.focus == formFocusOK) + "   " +
+		button("Cancel", d.focus == formFocusCancel) + "\n")
+	b.WriteString("\n" + styleDim.Render("Tab/↑↓ move · Space toggle · Enter ok · Esc cancel"))
+	return styleDialogBox.Render(b.String())
+}
+
+func dryRunModal(spec jobSpec) *textModal {
+	lines := []string{
+		"on host " + spec.Host + ", zfstui would launch a detached job:",
+		"",
+		"  job dir:  " + spec.Dir(),
+		"  command:  " + spec.Command,
+		"",
+		"mechanics: job.sh is piped over ssh and started with setsid,",
+		"writing meta.json, status and log into the job dir; the TUI then",
+		"polls status and refreshes the host. Full job.sh:",
+		"",
+	}
+	for _, l := range strings.Split(strings.TrimRight(spec.script(), "\n"), "\n") {
+		lines = append(lines, "  "+l)
+	}
+	return &textModal{title: "DRY RUN — nothing was executed", lines: lines}
+}
+
+// --- snapshot execution ---
+
+type snapDoneMsg struct {
+	spec    jobSpec
+	host    Host
+	state   string // done | failed | running (still going after our wait)
+	logTail string
+	err     error // launch/transport error
+}
+
+func runSnapshotCmd(h Host, spec jobSpec) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		r := newSSH()
+		if err := launchJob(ctx, r, h, spec); err != nil {
+			return snapDoneMsg{spec: spec, host: h, err: err}
+		}
+		state, logTail, err := waitJob(ctx, r, h, spec.ID, 20*time.Second)
+		return snapDoneMsg{spec: spec, host: h, state: state, logTail: logTail, err: err}
+	}
+}
+
+func (m *Model) onSnapDone(msg snapDoneMsg) (tea.Model, tea.Cmd) {
+	m.refreshing = false
+	switch {
+	case msg.err != nil:
+		m.status, m.statusErr = "snapshot job: "+msg.err.Error(), true
+	case msg.state == "done":
+		m.status, m.statusErr = fmt.Sprintf("snapshot created (job %s) — refreshing %s…",
+			msg.spec.ID, msg.host.Name), false
+		m.refreshing = true
+		return m, m.refreshCmd([]Host{msg.host})
+	case msg.state == "failed":
+		m.status, m.statusErr = "snapshot FAILED", true
+		lines := []string{
+			"job:      " + msg.spec.ID + " on " + msg.host.Name,
+			"command:  " + msg.spec.Command,
+			"log tail:",
+			"",
+		}
+		for _, l := range strings.Split(strings.TrimRight(msg.logTail, "\n"), "\n") {
+			lines = append(lines, "  "+l)
+		}
+		m.modal = &textModal{title: "snapshot job failed", lines: lines}
+	default: // still running
+		m.status, m.statusErr = fmt.Sprintf("job %s still running on %s — its result will show on next refresh",
+			msg.spec.ID, msg.host.Name), false
+	}
+	return m, nil
 }
