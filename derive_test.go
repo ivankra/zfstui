@@ -351,3 +351,31 @@ func TestTransitiveChain(t *testing.T) {
 		t.Errorf("c state=%s", s)
 	}
 }
+
+// Field bug (2026-06-11): a freshly received replica carries the SAME
+// snapshot GUID but a different (pool-local!) createtxg — typically larger,
+// since it's the txg of the receive. That must not make it "ahead": equal
+// GUIDs are equal snapshots, and createtxg must never be compared across
+// replicas.
+func TestReceivedReplicaNotAheadDespiteLargerTXG(t *testing.T) {
+	f := newFx()
+	f.ds("ws", "ws-boot/ws-boot", 0, "")
+	st := f.host("ws")
+	st.Snapshots = append(st.Snapshots,
+		Snapshot{Host: "ws", Dataset: "ws-boot/ws-boot", Name: "20260611",
+			GUID: "g1", Creation: 500, CreateTXG: 100},
+		// the backup, received later: same guid/creation, huge local txg
+	)
+	f.ds("ws", "ws-tank/bak/ws-boot", 0, "")
+	st.Snapshots = append(st.Snapshots,
+		Snapshot{Host: "ws", Dataset: "ws-tank/bak/ws-boot", Name: "20260611",
+			GUID: "g1", Creation: 500, CreateTXG: 999999},
+	)
+
+	g := findGroup(t, f.groups(), "ws-boot")
+	for _, r := range g.Members {
+		if r.State != StateInSync {
+			t.Errorf("%s: state=%s, want in-sync", r.Dataset.Name, r.State)
+		}
+	}
+}

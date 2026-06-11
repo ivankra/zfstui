@@ -241,14 +241,22 @@ func classify(g *Group, entries map[string]*entry, members []string) {
 			guidSets[i][s.GUID] = true
 		}
 	}
-	hasNewerThan := func(i int, baseCreation int64, baseTXG int64) bool {
+	// hasNewerThan: does replica i have snapshots past the shared base?
+	// Identity is the GUID — a replica's copy of the base itself is never
+	// "newer". createtxg is POOL-LOCAL (a received snapshot gets the recv
+	// txg) and must never be compared across replicas; creation has 1s
+	// resolution, so equal-creation distinct snapshots compare as not-newer
+	// (conservative: prefer behind/in-sync over a spurious diverged).
+	hasNewerThan := func(i int, base *Snapshot) bool {
 		e := entries[members[i]]
 		if len(e.snaps) == 0 {
 			return false
 		}
 		last := e.snaps[len(e.snaps)-1]
-		return last.Creation > baseCreation ||
-			(last.Creation == baseCreation && last.CreateTXG > baseTXG)
+		if last.GUID == base.GUID {
+			return false
+		}
+		return last.Creation > base.Creation
 	}
 	for i := 0; i < n; i++ {
 		for j := i + 1; j < n; j++ {
@@ -264,8 +272,8 @@ func classify(g *Group, entries map[string]*entry, members []string) {
 			if base == nil {
 				continue // incomparable pair
 			}
-			iAhead := hasNewerThan(i, base.Creation, base.CreateTXG) || ei.ds.Written > 0
-			jAhead := hasNewerThan(j, base.Creation, base.CreateTXG) || entries[members[j]].ds.Written > 0
+			iAhead := hasNewerThan(i, base) || ei.ds.Written > 0
+			jAhead := hasNewerThan(j, base) || entries[members[j]].ds.Written > 0
 			switch {
 			case iAhead && jAhead:
 				diverged[i], diverged[j] = true, true

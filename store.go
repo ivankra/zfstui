@@ -4,6 +4,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +19,7 @@ type Store struct {
 
 // Bump whenever the schema changes: the db is a disposable cache, so on
 // mismatch we just drop everything and start over (no migrations).
-const schemaVersion = 2
+const schemaVersion = 3
 
 const schema = `
 CREATE TABLE IF NOT EXISTS hosts (
@@ -56,6 +57,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
   PRIMARY KEY (host, dataset, name)
 );
 CREATE INDEX IF NOT EXISTS snapshots_guid ON snapshots (guid);
+CREATE TABLE IF NOT EXISTS jobs (
+  host TEXT NOT NULL, id TEXT NOT NULL, dir TEXT NOT NULL,
+  kind TEXT, state TEXT, status TEXT, meta TEXT,
+  progress INTEGER, expected INTEGER,
+  PRIMARY KEY (host, id)
+);
 `
 
 // Open opens (creating if needed) the cache at path; ":memory:" works.
@@ -79,7 +86,7 @@ func openStore(path string) (*Store, error) {
 	}
 	if version != schemaVersion {
 		// Stale or fresh db: it's a disposable cache, recreate from scratch.
-		for _, t := range []string{"hosts", "pools", "datasets", "snapshots", "hidden_overrides"} {
+		for _, t := range []string{"hosts", "pools", "datasets", "snapshots", "jobs", "hidden_overrides"} {
 			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 				db.Close()
 				return nil, err
@@ -135,7 +142,7 @@ func (s *Store) PutHostState(st HostState) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"pools", "datasets", "snapshots"} {
+	for _, table := range []string{"pools", "datasets", "snapshots", "jobs"} {
 		if _, err := tx.Exec("DELETE FROM "+table+" WHERE host = ?", st.Host); err != nil {
 			return err
 		}
@@ -163,6 +170,14 @@ func (s *Store) PutHostState(st HostState) error {
 		if _, err := tx.Exec(
 			`INSERT INTO snapshots (host,dataset,name,guid,used,creation,createtxg) VALUES (?,?,?,?,?,?,?)`,
 			sn.Host, sn.Dataset, sn.Name, sn.GUID, sn.Used, sn.Creation, sn.CreateTXG); err != nil {
+			return err
+		}
+	}
+	for _, j := range st.Jobs {
+		meta, _ := json.Marshal(j.Meta)
+		if _, err := tx.Exec(
+			`INSERT INTO jobs (host,id,dir,kind,state,status,meta,progress,expected) VALUES (?,?,?,?,?,?,?,?,?)`,
+			j.Host, j.ID, j.Dir, j.Kind, j.State, j.Status, string(meta), j.Progress, j.Expected); err != nil {
 			return err
 		}
 	}
@@ -259,6 +274,24 @@ func (s *Store) AllHostStates() ([]HostState, error) {
 		}
 		st := get(d.Host)
 		st.Datasets = append(st.Datasets, d)
+	}
+	rows.Close()
+
+	rows, err = s.db.Query(`SELECT host,id,dir,kind,state,status,meta,progress,expected FROM jobs ORDER BY host,id`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var j JobInfo
+		var meta string
+		if err := rows.Scan(&j.Host, &j.ID, &j.Dir, &j.Kind, &j.State, &j.Status, &meta, &j.Progress, &j.Expected); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		j.Meta = map[string]string{}
+		_ = json.Unmarshal([]byte(meta), &j.Meta)
+		st := get(j.Host)
+		st.Jobs = append(st.Jobs, j)
 	}
 	rows.Close()
 

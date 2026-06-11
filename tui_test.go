@@ -153,3 +153,257 @@ func TestSnapshotDialogRejectsDuplicateAndBadNames(t *testing.T) {
 		t.Error("Esc should close the dialog")
 	}
 }
+
+func syncTestModel(t *testing.T) *Model {
+	t.Helper()
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	sn := func(host, ds, name, guid string, c int64) Snapshot {
+		return Snapshot{Host: host, Dataset: ds, Name: name, GUID: guid, Creation: c}
+	}
+	put := func(host, ds string, written int64, snaps ...Snapshot) {
+		err := st.PutHostState(HostState{
+			Host:      host,
+			Datasets:  []Dataset{{Host: host, Name: ds, Type: "filesystem", GUID: host + ds, Written: written}},
+			Snapshots: snaps,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("ws", "tank/srv/git", 0,
+		sn("ws", "tank/srv/git", "20260501", "g1", 100),
+		sn("ws", "tank/srv/git", "20260611", "g2", 200))
+	put("cml", "root/bak/git", 0,
+		sn("cml", "root/bak/git", "20260501", "g1", 100))
+	put("hetzner", "tank/bak/git", 0,
+		sn("hetzner", "tank/bak/git", "20260611", "g2", 200))
+	put("dev", "tank/bak/git", 0,
+		sn("dev", "tank/bak/git", "20260501", "g1", 100),
+		sn("dev", "tank/bak/git", "own", "gX", 150))
+
+	hosts := []Host{{Name: "ws"}, {Name: "cml", User: "ivan"}, {Name: "hetzner"}, {Name: "dev"}}
+	m, err := New(st, hosts, true /* dry-run */)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.width, m.height = 110, 34
+	return m
+}
+
+func (m *Model) moveCursorToCol(t *testing.T, col string) {
+	t.Helper()
+	for i, c := range m.cols {
+		if c == col {
+			m.curRow, m.curCol = 0, i+1
+			return
+		}
+	}
+	t.Fatalf("column %q not found in %v", col, m.cols)
+}
+
+func TestSyncDialogFlow(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	if m.syncDlg == nil {
+		t.Fatal("sync dialog should open")
+	}
+	d := m.syncDlg
+
+	// Only the behind destination is selectable and pre-checked; up-to-date
+	// and diverged are listed but not selectable.
+	if len(d.selectable) != 1 {
+		t.Fatalf("selectable: %v (plans %+v)", d.selectable, d.plans)
+	}
+	sel := d.plans[d.selectable[0]]
+	if sel.Dest.Dataset.Host != "cml" || !d.checked[d.selectable[0]] {
+		t.Errorf("pre-checked selection: %+v", sel)
+	}
+	view := m.View()
+	for _, want := range []string{"up to date", "diverged", "@20260501 ⇒ @20260611", "Sync (dry run)"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("dialog view missing %q", want)
+		}
+	}
+
+	// Submit (dry run): modal with the pipeline; agent-forward note present.
+	m.Update(key("enter"))
+	if m.syncDlg != nil || m.modal == nil {
+		t.Fatal("expected details modal after dry-run submit")
+	}
+	content := strings.Join(m.modal.lines, "\n")
+	for _, want := range []string{
+		`zfs send -L -c -I 'tank/srv/git@20260501' 'tank/srv/git@20260611'`,
+		`$DSSH "sudo -n zfs recv -s -u 'root/bak/git'"`, // ivan@cml => sudo
+		"ssh -A", "ivan@cml", "#!/usr/bin/env bash",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("modal missing %q:\n%s", want, content)
+		}
+	}
+}
+
+func TestSyncDialogUnselectAll(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	m.Update(key(" ")) // focus starts on the only checkbox: uncheck it
+	m.Update(key("enter"))
+	if m.syncDlg == nil || m.syncDlg.errMsg == "" {
+		t.Fatal("submitting with nothing selected must show an error")
+	}
+	m.Update(key("esc"))
+	if m.syncDlg != nil {
+		t.Error("Esc should close")
+	}
+}
+
+func TestSyncDialogFromUpToDateSource(t *testing.T) {
+	m := syncTestModel(t)
+	// Source = hetzner (in sync with ws): everything is up-to-date,
+	// diverged or otherwise unselectable; dialog still opens, just with
+	// nothing pre-checked.
+	m.moveCursorToCol(t, "hetzner:tank")
+	m.openSyncDialog()
+	if m.syncDlg == nil {
+		t.Fatal("dialog should open")
+	}
+	if len(m.syncDlg.selectable) != 0 {
+		t.Errorf("nothing should be selectable: %+v", m.syncDlg.plans)
+	}
+}
+
+func TestSyncDialogCustomDestination(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	d := m.syncDlg
+
+	// Move focus to the editbox (after the one checkbox) and type a custom
+	// destination; j/k must type, not navigate, while in the editbox.
+	m.Update(key("tab"))
+	if d.focus != len(d.selectable) {
+		t.Fatalf("focus = %d", d.focus)
+	}
+	for _, r := range "kiwi:tank/bak/git" {
+		m.Update(key(string(r)))
+	}
+	if d.custom.Value() != "kiwi:tank/bak/git" {
+		t.Fatalf("custom = %q", d.custom.Value())
+	}
+	m.Update(key("enter"))
+	if m.modal == nil {
+		t.Fatalf("expected dry-run modal, err=%q", d.errMsg)
+	}
+	content := strings.Join(m.modal.lines, "\n")
+	for _, want := range []string{
+		"kiwi:tank/bak/git (full send)",
+		`zfs send -L -c 'tank/srv/git@20260611'`,    // full, not incremental
+		`zfs send -L -c -I 'tank/srv/git@20260501'`, // the checked group member too
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("modal missing %q:\n%s", want, content)
+		}
+	}
+}
+
+func TestSyncDialogCustomRejectsExisting(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	m.Update(key("tab"))
+	for _, r := range "dev:tank/bak/git" { // exists (the diverged replica)
+		m.Update(key(string(r)))
+	}
+	m.Update(key("enter"))
+	if m.modal != nil || m.syncDlg == nil ||
+		!strings.Contains(m.syncDlg.errMsg, "already exists") {
+		t.Fatalf("existing dataset not rejected: %+v", m.syncDlg)
+	}
+}
+
+func TestSyncDialogSingleReplicaGroup(t *testing.T) {
+	m := dialogTestModel(t) // one host, one replica
+	m.curRow, m.curCol = 0, 1
+	m.openSyncDialog()
+	if m.syncDlg == nil {
+		t.Fatal("dialog must open even with no other group members")
+	}
+	if len(m.syncDlg.selectable) != 0 {
+		t.Fatalf("selectable: %v", m.syncDlg.selectable)
+	}
+	// Editbox is focused from the start; type and submit (dry run).
+	for _, r := range "dev2:ssd/bak/git" {
+		m.Update(key(string(r)))
+	}
+	m.Update(key("enter"))
+	if m.modal == nil {
+		t.Fatalf("expected dry-run modal, err=%q", m.syncDlg.errMsg)
+	}
+	if !strings.Contains(strings.Join(m.modal.lines, "\n"), "full send") {
+		t.Error("modal should describe a full send")
+	}
+}
+
+func TestJobProgressInTUI(t *testing.T) {
+	m := syncTestModel(t)
+	// Inject a running sync job on ws targeting cml's replica.
+	for i := range m.data.States {
+		if m.data.States[i].Host == "ws" {
+			m.data.States[i].Jobs = []JobInfo{{
+				Host: "ws", ID: "20260611T100000Z-aa11", Kind: "sync", State: "running",
+				Meta:     map[string]string{"src": "ws:tank/srv/git", "dest": "cml:root/bak/git"},
+				Progress: 500, Expected: 1000,
+			}}
+		}
+	}
+	m.data.JobsByReplica = indexJobs(m.data.States)
+
+	// Receiving cell shows a spinner.
+	m.moveCursorToCol(t, "cml:root")
+	view := m.View()
+	if !strings.Contains(view, spinnerFrames[0]) {
+		t.Error("table should show a spinner on the receiving cell")
+	}
+	// Details show progress with percentage.
+	if !strings.Contains(view, "500B / 1000B (50%)") {
+		t.Errorf("details should show progress:\n%s", view)
+	}
+	// Ticker machinery engages.
+	if hosts := m.runningJobHosts(); len(hosts) != 1 || hosts[0] != "ws" {
+		t.Errorf("runningJobHosts: %v", hosts)
+	}
+	if cmd := m.ensureTicker(); cmd == nil || !m.ticking {
+		t.Error("ticker should start with running jobs")
+	}
+
+	// Poll transition running→done triggers refresh of affected hosts.
+	_, cmd := m.onJobsPoll(jobsPollMsg{host: "ws", jobs: []JobInfo{{
+		Host: "ws", ID: "20260611T100000Z-aa11", Kind: "sync", State: "done",
+		Meta: map[string]string{"src": "ws:tank/srv/git", "dest": "cml:root/bak/git"},
+	}}})
+	if cmd == nil || !m.refreshing {
+		t.Error("job completion should trigger a refresh")
+	}
+}
+
+// Field panic (occasional): refresh completing while the cursor is on a
+// header row (curRow -1/-2) indexed m.rows[-1] in reload.
+func TestReloadWithHeaderCursor(t *testing.T) {
+	m := syncTestModel(t)
+	for _, row := range []int{-1, -2} {
+		m.curRow, m.curCol = row, 1
+		m.clampCursor()
+		if err := m.reload(); err != nil {
+			t.Fatal(err)
+		}
+		if m.curRow != row {
+			t.Errorf("header cursor not preserved: %d -> %d", row, m.curRow)
+		}
+		_ = m.View() // and render fine
+	}
+}

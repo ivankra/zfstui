@@ -22,8 +22,30 @@ func testSnapshotJob(t *testing.T) jobSpec {
 
 func TestJobIDShape(t *testing.T) {
 	id := newJobID()
-	if !regexp.MustCompile(`^\d{8}T\d{6}Z-[0-9a-f]{4}$`).MatchString(id) {
+	if !regexp.MustCompile(`^[0-9A-Za-z]{6}$`).MatchString(id) {
 		t.Errorf("job id %q", id)
+	}
+	if id2 := newJobID(); id2 == id {
+		t.Errorf("ids should differ: %q", id)
+	}
+}
+
+// Agent-forwarded launches must be able to defeat ControlMaster reuse: ssh
+// honors the FIRST occurrence of an option, so caller extras go first.
+func TestSSHArgsExtraFirst(t *testing.T) {
+	s := &SSH{ControlDir: "/x", ConnectTimeoutSec: 5}
+	args := s.Args(Host{Name: "h"}, []string{"-A", "-o", "ControlPath=none"}, "true")
+	if args[0] != "-A" || args[1] != "-o" || args[2] != "ControlPath=none" {
+		t.Errorf("extras not first: %v", args)
+	}
+	found := false
+	for _, a := range args[3:] {
+		if strings.HasPrefix(a, "ControlPath=") && a != "ControlPath=none" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("multiplexed ControlPath should still follow: %v", args)
 	}
 }
 
@@ -38,24 +60,39 @@ func TestJobScriptIsValidBash(t *testing.T) {
 	}
 }
 
-// Structural data-safety check: every mutating line in a generated job
-// script must match the allowlist (the command is on the "( cmd ) >> log"
-// line; nothing else in the script may invoke zfs/zpool).
-func TestJobScriptMutationsAllowlisted(t *testing.T) {
-	spec := testSnapshotJob(t)
-	for _, line := range strings.Split(spec.script(), "\n") {
+// Structural data-safety check: every zfs-invoking segment of a generated
+// job script must match the allowlist — including each stage of sync
+// pipelines (send | $ZBUF | [$DSSH] recv). Nothing else may invoke zfs/zpool.
+func assertScriptAllowlisted(t *testing.T, script string) {
+	t.Helper()
+	for _, line := range strings.Split(script, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.Contains(trimmed, "zfs ") && !strings.Contains(trimmed, "zpool ") {
 			continue
 		}
 		if strings.HasPrefix(trimmed, "\"command\":") {
-			continue // meta.json echo, not executed
+			continue // meta.json content, not executed
 		}
-		cmd := strings.TrimSuffix(strings.TrimPrefix(trimmed, "( "), " ) >> log 2>&1")
-		if !allowlist.MatchString(cmd) {
-			t.Errorf("job script contains non-allowlisted mutation: %q", trimmed)
+		trimmed = strings.TrimSuffix(strings.TrimPrefix(trimmed, "( "), " ) >> log 2>&1")
+		for _, seg := range strings.Split(trimmed, "|") {
+			seg = strings.TrimSpace(seg)
+			if !strings.Contains(seg, "zfs ") {
+				continue
+			}
+			// Unwrap the remote-recv form: $DSSH "recv..." and strip
+			// shell redirections (progress/size plumbing).
+			seg = strings.TrimPrefix(seg, "$DSSH ")
+			seg = strings.Trim(seg, "\"")
+			seg = strings.TrimSuffix(seg, " 2>/dev/null")
+			if !allowlisted(seg) {
+				t.Errorf("job script contains non-allowlisted mutation: %q (line %q)", seg, line)
+			}
 		}
 	}
+}
+
+func TestJobScriptMutationsAllowlisted(t *testing.T) {
+	assertScriptAllowlisted(t, testSnapshotJob(t).script())
 }
 
 func TestJobScriptContents(t *testing.T) {
@@ -80,6 +117,7 @@ func TestJobScriptContents(t *testing.T) {
 type jobRunner struct {
 	launchedCmd   string
 	launchedStdin string
+	launchedExtra []string
 	statusOut     []string // successive poll outputs
 	polls         int
 }
@@ -90,9 +128,10 @@ func (j *jobRunner) Run(_ context.Context, h Host, cmd string) ([]byte, error) {
 	return []byte(out), nil
 }
 
-func (j *jobRunner) RunInput(_ context.Context, h Host, cmd string, stdin []byte) ([]byte, error) {
+func (j *jobRunner) RunInput(_ context.Context, h Host, cmd string, stdin []byte, sshExtra ...string) ([]byte, error) {
 	j.launchedCmd = cmd
 	j.launchedStdin = string(stdin)
+	j.launchedExtra = sshExtra
 	return []byte("launched " + jobDirPrefix + extractJobID(cmd) + "\n"), nil
 }
 

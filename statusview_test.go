@@ -38,8 +38,8 @@ func TestStatusTable(t *testing.T) {
 	}
 	// dev1 has unsnapshotted writes => +; dev2 is behind, no marker.
 	if !strings.HasPrefix(lines[1], "git") ||
-		!strings.Contains(lines[1], "srv/@20260601+") ||
-		!strings.Contains(lines[1], "bak/@20260601") {
+		!strings.Contains(lines[1], "srv@20260601+") ||
+		!strings.Contains(lines[1], "bak@20260601") {
 		t.Errorf("row: %q", lines[1])
 	}
 }

@@ -1,12 +1,81 @@
-# zfstui — Design
+# zfstui design doc
 
-Living design doc. See README.md for the original wishes and current status;
-the decisions log and implementation notes below track what's actually built.
+## Status (2026-06-12)
+
+**Working end-to-end on a real fleet**: discovery + status (M1), full TUI
+(M3), sync planner with compatibility gate (M2 core), and snapshot/sync
+execution with detached jobs and live progress (most of M4). Not yet: batch
+`snap`/`sync` CLI, prune, jobs pane, `doctor`, job-dir cleanup.
+
+- `zfstui refresh` ssh-es to all known hosts in parallel and scrapes
+  `zpool list`/`zfs list -H -p` plus `/tmp/zfstui-job-*` job state into a
+  sqlite cache (a pure cache — safe to delete any time). Read-only on the
+  hosts.
+- `zfstui status` prints the groups × host:pool matrix. Replication groups
+  and per-replica states (ahead/behind/diverged/resumable/clone) are derived
+  from **snapshot GUIDs**, never names. Cell markers: `+` unsnapshotted
+  writes, `!` diverged, `~` resumable, `%` clone; the newest `@name` in a
+  row is the source. Snapshot-less "plumbing" groups are hidden (`-a` shows)
+  and boring `bak/`/`srv/`-style prefixes are auto-trimmed from row names
+  into cells — all convention-free, derived from the data.
+- bare `./zfstui` opens the TUI: scrollable matrix with a two-level
+  host/pool header (both navigable, with details), color-coded cells, a
+  details pane (Tab to focus/scroll), async refresh (`r` host / `R` all),
+  `h` toggles hidden groups, `?` help.
+- **sync (the core!)**: `y` opens the sync dialog for the selected dataset:
+  destinations in its group that need syncing are pre-checked (up-to-date
+  skipped; diverged/dirty/clone listed disabled with reasons), intermediate
+  snapshots (`-I`) default-on, resume of interrupted receives offered when a
+  token is present, plus a free-form editbox for new/custom destinations
+  (`host:pool/dataset` → full send; works for seeding a first backup of a
+  single-replica dataset). One detached job per destination runs on the source
+  host (`zfs send … | mbuffer | pv | ssh dest zfs recv -s -u …`; `-w` raw
+  for encrypted sources, `-L -c` for plain ones), using the
+  control node's forwarded agent only to authenticate a per-job ssh
+  ControlMaster — transfers survive the laptop disconnecting. Running
+  transfers show a spinner on the affected cells and live progress
+  ("1.2G / 3.4G (29%)", via pv + `zfs send -nP` estimate) in the details
+  pane, polled every ~3s; completion auto-refreshes.
+- **snapshots**: `s` snapshots the selected dataset via a
+  dialog (name, default YYYYMMDD; recursive toggle; live preview of the
+  exact `zfs snapshot` command). Runs as a detached job in
+  `/tmp/zfstui-job-<id>/` on the host (status/log/meta files; survives
+  control-node disconnect), then auto-refreshes. A global `-dry-run` flag
+  disables all mutations and shows the would-be command + job script
+  instead. All mutation command lines are built in one audited place and
+  allowlist-tested.
+
+Try: `go build && ./zfstui refresh root@host1 user@host2 && ./zfstui`.
+Hosts are positional specs (`host`, `user@host[:pool]`, or
+`ssh://user;send_user=x;recv_user=y@host[:port][/pool]`); the hostname is the
+identity, access info is remembered in the sqlite cache (`./zfstui.db` in cwd
+during development; disposable), so after the first run a bare `./zfstui`
+works. No config file. Non-root access user implies sudo.
+
+Docs: [DESIGN.md](DESIGN.md) — architecture, decisions log, roadmap,
+implementation notes; [CLAUDE.md](CLAUDE.md) — code map and conventions for
+coding sessions. Code is a flat `package main`, tested ssh-free (parsers,
+derivation scenarios, fake-runner end-to-end). Data safety is the #1
+constraint: destructive ops (`recv -F`, rollback, dataset destroy) are
+banned outright.
+
+Core ideas:
+- correlate replicas across hosts by **snapshot GUID**, never by name
+- shell out to system `ssh` (user's ssh config/agent/ProxyJump work for free)
+- replication runs as a detached, self-describing **job dir** on the source
+  host (script+status+log+progress files), so transfers survive control-node
+  shutdown and any fresh control node can rediscover them on refresh
+- no master role stored, no pins, no name-prefix conventions: the sync source
+  is *derived* — the replica holding data the others lack; ≥2 such replicas =
+  diverged (flagged red for manual repair); none = in sync, direction moot.
+  Divergence is pairwise: compatible pairs of a diverged group still sync;
+  only destructive receives are rejected
 
 ## One-paragraph summary
 
 A single static binary (`zfstui`) running on a *control node* (your laptop). It
-ssh-es into a configured list of hosts, scrapes `zpool`/`zfs` machine-readable
+ssh-es into the known hosts (positional specs, remembered in sqlite — no
+config file), scrapes `zpool`/`zfs` machine-readable
 output into a local sqlite cache, correlates datasets across hosts **by snapshot
 GUID** (not by name), and presents a hosts×datasets matrix in a TUI (plus batch
 CLI subcommands). Replication is executed by generating a self-contained bash
@@ -66,6 +135,11 @@ snapshot: snapshots with GUIDs no other replica has, and/or `written > 0`
 
 Wrong-direction replication is structurally impossible this way: the tool only
 ever proposes sending from the replica that provably has the newer data.
+
+Implementation caveat: snapshot equality is GUID equality, full stop —
+`creation` has 1s resolution and `createtxg` is pool-local (received
+snapshots get the txg of the receive), so neither may break ties across
+replicas; ambiguous cases resolve toward in-sync/behind, never diverged.
 
 Caveat worth documenting for users: `written` counts *any* writes, including
 atime updates on a mounted replica, which would surface as false divergence.
@@ -133,7 +207,7 @@ One ssh invocation per host running a small command batch:
 zpool list -H -p -o name,size,alloc,free,health,guid
 zfs list -H -p -t filesystem,volume -o name,guid,used,avail,refer,creation,createtxg,written,origin,encryption,keystatus,keylocation,mounted,canmount,mountpoint,readonly,receive_resume_token,compression,recordsize
 zfs list -H -p -t snapshot -o name,guid,used,creation,createtxg
-ls + cat of the zfstui job state dirs (see job protocol)
+glob+dump of /tmp/zfstui-job-* (status, meta.json, progress, expected)
 ```
 
 Unreachable hosts (short connect timeout) are marked stale in the UI with the
@@ -184,10 +258,18 @@ Given a compatible (group, source replica, dest replica):
 5. Dest doesn't exist → full send (with confirmation, since it can be huge).
    (Other no-common-base / unclean-dest cases never reach planning — the
    compatibility gate already rejected them.)
-6. Flags: `-w` (raw) when source `encryption != off`; `-L` always; recv side
-   `-s` (resumable) `-u` (don't mount). `-F` is never passed — not even behind
-   a confirmation. Mountpoint/canmount on dest are left alone (raw recv
-   preserves props; your `bak/` convention handles mounting).
+6. Flags by source encryption: encrypted → `-w` (raw, required for key-less
+   backups); unencrypted → `-L -c` and **never `-w`** — for unencrypted
+   datasets `-w` implies `-e` (embedded blocks), and such streams "may not
+   be received as an encrypted dataset" (zfs-send(8)) — i.e. it breaks
+   unencrypted→encrypted-parent syncs with "inherited key must be loaded"
+   (found in the field 2026-06-11). Recv side `-s` (resumable) `-u` (don't
+   mount). `-F` is never passed — not even behind a confirmation.
+   Full sends of *unencrypted* sources receive with `-o encryption=off`:
+   the new child matches the source instead of inheriting the destination
+   parent's encryption (which would demand the parent's key be loaded —
+   second field bug 2026-06-11). Mountpoint/canmount on dest are left alone
+   (raw recv preserves props; your `bak/` convention handles mounting).
 7. Dry-run mode prints/logs the exact pipeline without executing — this exact
    command line is also what goes into the generated job script, so dry-run
    output is trustworthy. Implemented as a global `-dry-run` flag: all
@@ -260,12 +342,15 @@ glob (`/tmp/zfstui-job-*`) away. Contents:
 job.sh      generated, self-contained bash (the only thing that "runs")
 meta.json   id/kind/host/command + per-kind fields — written by job.sh itself
             (heredoc), so the whole job is a single file transfer
+progress    pv -nb byte counts (2s interval) when pv is available
+expected    estimated stream size from a no-op `zfs send -nP`
 status      one line: running <pid> | done | failed <exitcode>  (+ rfc3339 time)
 log         stdout+stderr of the pipeline
 progress    pv machine-readable output (bytes done / total), if pv available
 ```
 
-- Job IDs are `<utc-timestamp>-<short-random>` — sortable, collision-free.
+- Job IDs are 6 random base62 chars (e.g. `kF3x9Q`); time ordering comes
+  from meta.json's "created" field, not the ID.
 - Launch is ONE ssh round trip: job.sh arrives on the remote command's stdin
   (`mkdir -m 0700 dir && cat > dir/job.sh && setsid bash dir/job.sh ... &`),
   prints `launched <dir>`, and the control node may disconnect. (`ssh -A` for
@@ -273,10 +358,13 @@ progress    pv machine-readable output (bytes done / total), if pv available
   agent is no longer needed afterwards.)
 - status file format: `running <pid> <ts>` | `done <ts>` | `failed <rc> <ts>`,
   rewritten on every exit path of job.sh.
-- Implemented (M4 started 2026-06-11): the job mechanics (jobs.go) and
-  `snapshot` as the first job kind, driven by the TUI `s` dialog; the control
-  node polls the status file briefly (~20s) and otherwise leaves the job to
-  be picked up by a later refresh.
+- Implemented (M4, 2026-06-11): job mechanics (jobs.go), `snapshot` and
+  `sync` job kinds, refresh-time job discovery (4th discovery section), and
+  live progress: while running jobs are known, the TUI ticks a spinner
+  (500ms) and re-polls the job dirs every ~3s (status/progress only — much
+  lighter than a refresh); job completion auto-refreshes affected hosts.
+  Receiving/sending cells show the spinner; the details pane shows
+  "bytes / total (pct)" per job plus recent finished/failed jobs.
 - `job.sh` traps errors, writes `status` on every exit path, and does **no
   retries** in v1: if the network drops mid-transfer it fails fast, recv `-s`
   leaves a resume token on dest, and the next refresh shows a "resumable" cell —
@@ -439,13 +527,15 @@ TUI is manual for now.
 1. ✅ **M1 — see**: config, ssh runner, parsers, sqlite cache, grouping/source
    derivation, `refresh`/`status` CLI. (Most of the risk and most of the value
    for confidence-building lives here.)
-2. **M2 — plan** *(next)*: sync planner + `sync --dry-run`, `doctor`.
+2. **M2 — plan** *(planner done 2026-06-11 — planSync in sync.go with the
+   compatibility gate; batch `sync --dry-run` CLI + `doctor` still open)*.
 3. ✅ **M3 — watch**: read-only TUI (table with two-level host/pool header,
    details pane with Tab focus + scrolling, host/pool/group/cell details,
    async refresh, hidden-group toggle, boring-prefix-trimmed names).
-4. **M4 — act** *(started: job protocol + TUI snapshot dialog + -dry-run
-   done)*: batch `snap`, real `sync` (raw engine), jobs/log
-   panes, resume handling.
+4. **M4 — act** *(mostly done 2026-06-11/12: job protocol, TUI snapshot &
+   sync dialogs, -dry-run, full sends to custom destinations, resume via
+   tokens, refresh-time job discovery, live progress with spinner +
+   bytes/percent)*. Still open: batch `snap`/`sync` CLI, a jobs/log pane.
 5. **M5 — polish**: syncoid engine, prune dialog + `prune` command, job
    cancel, job-dir pruning, packaging.
 
@@ -492,4 +582,100 @@ TUI is manual for now.
   by job.sh itself. First job kind: snapshot (TUI `s` dialog).
 - 2026-06-11: **global `-dry-run` flag** — disables all mutations everywhere;
   confirmations show the exact command + job dir + job.sh instead.
+- 2026-06-11: **sync implemented (TUI `y`)** — dialog pre-checks exactly
+  the destinations that need syncing (skips up-to-date; lists diverged/
+  dirty/clone/empty disabled with reasons); `-I` intermediate snapshots
+  default-on; one detached job per destination on the source host. Always
+  `send -w`; base snapshot resolved via GUID to its source-side NAME (names
+  may differ across replicas). Agent story: launch with `ssh -A`, job
+  authenticates its own ControlMaster to the destination, touches `ssh-ok`,
+  launcher disconnects; reconnects later would fail fast and leave a resume
+  token (next `y` offers resume). TRAP (field bug 2026-06-12): the agent-
+  forwarded launch must bypass the control node's ControlMaster
+  (`-o ControlPath=none` BEFORE the multiplexing options — ssh honors the
+  first occurrence) — a reused master silently ignores `-A`.
+- 2026-06-11: **custom destinations** — the sync dialog has a free-form
+  editbox (`host:pool/dataset`, comma-separated) next to the member
+  checkboxes; these get a FULL `send -w` of the source's latest snapshot and
+  must be new datasets (existing ones are rejected — receiving into an
+  existing unrelated dataset can't succeed non-destructively). Works on
+  single-replica groups too (that's how a first backup is seeded).
+- 2026-06-11: **progress display** — sync jobs estimate stream size up front
+  (`zfs send -nP`, read-only) into ./expected and tick ./progress via
+  optional pv; TUI spinner + percentage as above. Old job dirs are not yet
+  pruned (manual `rm -rf /tmp/zfstui-job-*` of finished ones is safe).
 - Name: `zfstui`.
+
+## Initial wishes
+
+Original user's wishes for this project verbatim.
+
+I have a bunch of linux hosts (laptops, desktops, NAS, cloud servers) with ZFS, and many ZFS datasets replicated across them. I want a tool/system to manage these datasets. Currently I run periodically a bunch of manual `sudo zfs send ... | ssh ... zfs recv ...` commands and want something better, less error prone and easier.
+
+Note on data organization i typically have (keep in mind: this is my typical setup, but not always the case, and also I want tool to be somewhat general also for other people):
+  * YYYYMMDD snapshot names as a rule (but not always, so probably sort on internal timestamp of when snapshot was taken to find latest)
+  * For each dataset normally only one copy will be master, and othersare backups. note i might have master on ssd pool with backup on hdd on same host even.
+  * Usually a replicated dataset's name is the same across all machines, but it may have varying prefixes. Typically (but not always) I like using `bak/` and `srv/` prefix in dataset names (e.g. `dev1:ssd/srv/git` is a master in the master table: `srv/git` dataset on `ssd` pool on host `dev1`). With `srv` automounting datasets in `/srv` dir and `bak` disabling the mount - this make it easy to switch master/backups by merely renaming stuff. Some datasets using hierarchical names e.g `blobs/NN`. (perhaps table needs to have also `blobs` parent entry in these cases? unsure)
+  * I also have some datasets that are not replicated despite same name (e.g. `rpool`, `cache` etc) - so you'd need to use actually zfs's internal dataset identifiers to figure out inter-related/syncable datasets. Names are mostly relevant for displaying stuff in shorthand form like in table above when they conform to expectations.
+  * some nodes have extra snapshots and clones of snapshots and even divergent datasets, so you should be able to handle/tolerate them, but these are rather exceptional, so avoid overcomplicating stuff for them.
+  * usually using encrypted datasets with `zfs send --raw -L` when syncing. pay attention to properies of zfs datasets to make sure zfs send will work and set correct flags for it.
+
+Wishlist/preferences/thoughts below.
+
+* Global/centeralized view/config/tool. I'd prefer to avoid having to setup each host/pair individually and instead having a centralized config or tool or something (e.g. i could kick off sync jobs off of my laptop which has ssh to all hosts)
+* Global status
+  * control node should know or quickly update/boostrap its knowledge of state of the whole system by sshing to remote hosts and running commands (zfs/zpool etc)
+  * e.g. i may have to start the tool on a new laptop, just give it the list of hostnames and it should be able to ssh and figure out what datasets are there, where are they replecated, where's the masters, where are backups and at what snapshot etc.
+  * if i add a new host, likewsie, it should quickly figure out its relationship to the rest of hosts and update its knowledge
+  * i suggest using sqlite to keep this local state on control node and keep it simple. when ssh'ign to query nodes, probably use zfs/zpool to get machine-readable info about pools and datasets, as much as possible (size of metadata is no concern - we have just O(10-100) hosts and datasets) and store that in sqlite
+* Intuitive CLI TUI to view the state and manually kick off replication using keyboard shortcuts or menu
+* TUI should have multiple windows i suppose
+* One window to display a table with hosts / datasets, maybe something like
+  ```
+             dev1:ssd     dev2:ssd      dev2:tank     hetzner:tank
+    git      srv/         bak/@20260601 bak/@20260501
+    blobs/01                            srv/          bak/@20260501
+    blobs/02                            srv/          bak/@20260501
+  ```
+* In the above table I mean i have `dev2:ssd/srv/git` (master), `dev2:ssd/bak/git@20260602` (latest) and `dev2:tank/bak/git@20260501`;
+  `dev2:tank/srv/blobs/01` (master), `hetzner:tank/blobs/01@20260501` (backup) etc.
+* Arrow keys could be used to move cursor in the table. Perhaps another window could display detailed state of the selected cell
+* Color coding, maybe suffix coding ok (e.g. `@<snapshot name>` with no special color indicates its at that latest globally-consistent snapshot and hasn't diverged/no writes after it)
+* Should scale to dozens/hundreds of hosts and datasets, so table needs to be scrollable
+* Shortcuts to refresh, take a new snapshot (maybe S or F2?), replicate (maybe R or S(sync) or C(copy) or F5(copy))? think of good consistent shortcuts schema. these should pop up a dialog to confirm and set options. snapshot dialog needs to ask snapshot name (default to YYYYMMDD). sync needs to ask to which destinations to replicate (default all current backup destinations for that dataset), and allow specifying new dests or something, recursive copy or not etc.
+* should be possible to display log of replication jobs and scroll them? maybe tab to swtich between windows
+* window to see progress bars of all transfers; maybe moving cursor there -> show log of a transfer in log window?
+* I kick off sync at the control node, but the syncing probably should be done autonomously by the job on the host that has the done. i should e able to shutdown my laptop with control node and syncing should just continue, with some tolerance for network failures. thus, the control node needs to send a batch script over ssh to the host that going to do the syncing - by default the host with master (but allow sync dialog to override, including also using control node itself to do syncing - read from master, write to destinations)
+* Global status: should be aware of the replications in the progress that were kicked off and in progress. if control node's state is reset (or i start on another fresh laptop etc), when updating, it should besides zfs/zpool info also fetch status of ongoing replication jobs on remote hosts. so make sure to design how the replication batch jobs run, where they write progress/logs/results/completion status - so that when updating the state, you could pick that stuff up from remote host.
+* Language if implementing stuff from scratch: pick rust or golang (static typing to catch errors important, maturity of libraries, your coding expertise are the main factors). maaaybe python if TUI libraries story are compelling and it would make stuff easier but my gut feeling unlikely.
+* keep stuff as simple as possible, prefer to minimize unnecessary deps. e.g. parse zfs/zpool command output yourself rather some library.
+* besides TUI, also a batch mode is useful. e.g. i should be able to run a command to kick off replication of a specific or all master datasets to backup destinations.
+* incremental sends are critical
+* inventory config: yaml or toml
+  * maybe toml makes more sense since syncoid uses it?
+  * normally, just hostname is the single critical piece of info for each host i think, we can probably zeroconfig everything from it right? but sometimes i may need to tweak stuff, like username and ssh key
+  * also allow no-config-file by taking inventory from command line flag (like ansible?). database unclear - either ephemeral or the default one but with subset of hosts and add any missing i.e. inline inventory could add, rather than replace hosts?
+  * maybe ansible-style investory and vars? then the very basic config could be just `[hosts]` sections and list of hostnames, very simple
+  * UPDATE (2026-06-11), superseding the above — host model notes:
+    * hostname is the *primary identifier* of a host; `root@ws` and `ws` are the same host (we had a bug where they weren't - never again!)
+    * things like `root@ws` or ssh/scp urls are *access specification*; extract the hostname out of them and key everything on it
+    * default to `root@` when no username given; non-root username implies sudo (no separate sudo option needed)
+    * no inventory/config file and no `-hosts` flag: hosts are positional args, e.g. `zfstui localhost user@dev1 user2@server`
+    * no positional args -> take hosts from sqlite (it remembers hosts i'm working with); positional args *limit* the run to those hosts and their access spec *overrides/replaces* what's stored
+    * reject if one invocation gives multiple different access urls for the same host (e.g. `root@ws user@ws`)
+    * support `ssh://[user[;option=value]@]host[:port][/path]` (chrome-style options carry extra params like send/recv users) and scp-style `[user@]host[:path]`; the path component refers to a zfs pool (for now)
+    * sqlite stores parsed/normalized fields (not raw urls); details window reassembles them into a url for display
+    * sqlite db is mostly disposable: cache + remembered hosts, never critical to keep
+* some hosts may be unreachable, ping when refreshing
+* synchronization:
+  * i'm ok with using syncoid/sanoid as the lower-level synchronization tool or just raw ssh + bash or both options (sync dialog or config or flag could specify preference, maybe default to autodetecting syncoid/sanoid)
+  * when using bash, autodetect the tools needed to speed stuff up (mbuffer, pv etc) but cope gracefully if unavail with warning message in logs
+  * should support ssh'ing as root or a user with sudo
+  * note: recv and send sudo users may sometimes be different, on a per-host basis
+* should be maybe possible to use control node's ssh agent (ssh -A or something) to estable src -> destination ssh connection then disconnect so that I could avoid provisioning ssh keys in typical case. if conn aborted and agent needed but unreachable? well next time i could see it in UI and resume; zfs resume tokens?
+* dry mode (both TUI and batch) to help me debug and gain confidence in the tool
+* should be properly unittested (without reliance on zfs and syncoid) and later also intergration tests (maybe running on a local VM proeprly set up with zfs and multiple pools to do it or something)
+* working names ideas for the tool: zfstui, zfsman, syncoid-tui (to emphasise syncoid? maybe we'll market it as that but it should still supported general ssh/bash fallack)
+* not all 100% of above have to be implemented. this is a starting point of roughly what i'd like in a tool. deviation possible, especially for consistency, practicality, simplicity, rationality, common sense welcome.
+* make sure to edit this file often enough as you work (add design, notes, project status etc). Frequent update more important, don't keep me in the dark! You can always keep refining your thoughts here later.
+

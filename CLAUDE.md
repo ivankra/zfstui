@@ -1,9 +1,13 @@
 # zfstui — agent notes
 
 TUI/CLI for managing ZFS dataset replication across ssh-reachable hosts.
-READ DESIGN.md first: it has the architecture, the decisions log, and the
-roadmap (M1 discovery + M3 read-only TUI are done; next is M2 sync planner,
-then M4 jobs/actions). README.md has the original wishes + status.
+READ DESIGN.md first: architecture, decisions log (dated, explains *why*),
+roadmap. README.md has the user's original wishes + a status summary.
+
+State as of 2026-06-12: discovery/status (M1), read-only TUI (M3), sync
+planner (M2 core), and most of M4 (snapshot + sync dialogs, detached jobs,
+live progress, -dry-run) are DONE and field-tested on the user's real fleet.
+Missing: batch snap/sync CLI, jobs pane, prune, job-dir cleanup, doctor.
 
 ## Commands
 
@@ -12,130 +16,179 @@ go build -o zfstui . && go vet ./... && go test ./...   # all must stay green
 gofmt -l .                                              # must print nothing
 ./zfstui refresh root@ws ivan@cml                       # real ssh discovery (read-only on hosts)
 ./zfstui status [-a] [host...]                          # matrix from cache
-./zfstui [host-spec...]                                 # TUI
+./zfstui [-dry-run] [host-spec...]                      # TUI
 ```
 
-Host model (2026-06-11, "never again" bug class): the **hostname is the sole
-identity** — `root@ws` and `ws` are the same host. Specs are positional args
-(`host`, `user@host[:pool]`, `ssh://user;send_user=x;recv_user=y@host[:port]
-[/pool]` — chrome-style `;opt=value` userinfo options). Parsed/normalized
-access fields are remembered in the sqlite hosts table and replaced wholesale
-by new specs; no specs → use remembered hosts; specs → limit to them.
-Conflicting specs for one host in one invocation → error. Default user is
-root; **non-root user implies sudo** (no sudo option exists). There is **no
-config file** (TOML inventory was dropped 2026-06-11). The pool path part is
-parsed/stored/displayed, not yet enforced.
+Host model ("never again" bug class): the **hostname is the sole identity** —
+`root@ws` and `ws` are the same host. Specs are positional args (`host`,
+`user@host[:pool]`, `ssh://user;send_user=x;recv_user=y@host[:port][/pool]` —
+chrome-style `;opt=value` userinfo options). Parsed/normalized access fields
+are remembered in the sqlite hosts table and replaced wholesale by new specs;
+no specs → use remembered hosts; specs → limit the run to them. Conflicting
+specs for one host in one invocation → error. Default user is root;
+**non-root user implies sudo** (no sudo option exists). There is **no config
+file**. The pool path part is parsed/stored/displayed, not yet enforced.
 
 Dev-mode default (deliberate, revert to XDG before release): sqlite cache
 `./zfstui.db`, cwd-relative so the user can run and the agent can inspect the
-same file. It is disposable (cache + remembered hosts); a schemaVersion bump
-in store.go wipes and recreates it — no migrations, ever. The user's real
-fleet db may be present in cwd; `./zfstui status` works offline from it.
+same file. Disposable: a schemaVersion bump in store.go wipes and recreates
+it — no migrations, ever. The user's real fleet db may be present in cwd;
+`./zfstui status` works offline from it. Never ssh to the user's hosts
+yourself; ask the user to run things and paste output.
 
 ## Hard rules (data safety — the project's #1 constraint)
 
-Only ever emit: `zfs snapshot`, `zfs send | zfs recv -s -u` (NEVER `-F`),
-`zfs destroy <ds>@<snap>` (prune only), `zfs receive -A` (explicit abandon).
-Never: dataset/clone destroy, rollback, rename, `destroy -R/-f`, zpool or
-property mutations. ALL mutating command lines are built in mutate.go and
-nowhere else (charset validation + shell quoting); mutate_test.go/jobs_test.go
-assert constructor output and every mutating job-script line match the
-allowlist regex. Extend the regex + constructors together. The global
+Only ever emit: `zfs snapshot`, `zfs send | zfs recv -s -u` (NEVER -F),
+`zfs destroy <ds>@<snap>` (prune only, not implemented yet), `zfs receive -A`
+(explicit abandon). Never: dataset/clone destroy, rollback, rename,
+`destroy -R/-f`, zpool or property mutations (sole exception:
+`recv -o encryption=off`, see mutate.go). ALL mutating command lines are
+built in mutate.go and nowhere else (charset validation + shell quoting);
+mutate_test.go's allowlist regexes + jobs_test.go's job-script scanner verify
+every emitted shape — extend regexes and constructors together. The global
 `-dry-run` flag must keep disabling every mutation path.
+
+## Field-bug traps (each cost a real debugging session — don't reintroduce)
+
+1. **createtxg is pool-local.** A received snapshot gets the txg of the recv.
+   Snapshot identity/comparison across replicas is GUID-only; never break
+   ties with createtxg (made fresh backups look "ahead" of their source).
+   Regression: TestReceivedReplicaNotAheadDespiteLargerTXG.
+2. **A reused ssh ControlMaster silently ignores -A.** Agent-forwarded job
+   launches pass `-A -o ControlPath=none`, and SSH.Args puts caller extras
+   FIRST because ssh honors the first occurrence of an option.
+   Regression: TestSSHArgsExtraFirst.
+3. **`send -w` on an unencrypted dataset implies -e (embedded blocks)**,
+   which cannot be received into an encrypted destination. Flags: encrypted
+   source → `-w`; unencrypted → `-L -c`, never -w.
+4. **Receiving a NEW dataset under an encrypted parent demands the parent's
+   key be loaded** — full sends of unencrypted sources therefore recv with
+   `-o encryption=off` (child matches source; raw sends carry their own keys
+   and don't need this).
 
 ## Code map (flat package main, one dir — user explicitly wants no subdirs)
 
 - `model.go` — types: Host (identity=Name + access spec; EffUser/NeedSudo/
-  Dest/URL helpers), Pool, Dataset, Snapshot, HostState (per-host raw
-  inventory), Replica/Group (derived). No logic beyond tiny helpers.
-- `hostspec.go` — parseHostSpec/parseHostSpecs (ssh/scp URL forms, conflict
-  rejection, root-user normalization to "") and resolveHosts (specs → sqlite
-  memory; specs limit + replace stored access).
-- `zfsparse.go` — parsers for `-H -p` tab-separated output ("-" = absent) +
-  `DiscoverCommand` (one ssh round-trip: three sections with `===ZFSTUI:*===`
-  markers and per-section exit codes) + `ParseDiscovery` splitter.
-- `ssh.go` — `runner` interface (everything testable offline via fakes);
-  real impl shells out to system `ssh` (BatchMode, ConnectTimeout,
+  Dest/URL helpers), Pool, Dataset, Snapshot, JobInfo, HostState (per-host
+  raw inventory incl. Jobs), Replica/Group (derived).
+- `hostspec.go` — parseHostSpec/parseHostSpecs (URL forms, conflict
+  rejection, root normalized to "") and resolveHosts (specs ↔ sqlite memory).
+- `zfsparse.go` — hand parsers for `-H -p` tab-separated output ("-" =
+  absent) + DiscoverCommand (ONE ssh round-trip, four marker-delimited
+  sections with per-section exit codes; 4th = `jobsProbe` globbing
+  /tmp/zfstui-job-*, also used standalone for live progress polling) +
+  ParseDiscovery/ParseJobs.
+- `ssh.go` — Runner interface (Run/RunInput; everything testable offline via
+  fakes); shells out to system `ssh` (BatchMode, ConnectTimeout,
   ControlMaster sockets in ~/.local/state/zfstui/cm). Never use an ssh lib.
 - `store.go` — sqlite cache (modernc.org/sqlite). `db.SetMaxOpenConns(1)` is
-  load-bearing: parallel refresh writers otherwise hit SQLITE_BUSY, and
-  `:memory:` would mean one DB per pool connection.
+  load-bearing (SQLITE_BUSY under parallel refresh; `:memory:` per-conn DBs).
+  schemaVersion mismatch drops all tables.
 - `derive.go` — THE core; pure functions of inventory:
-  - groups = union-find over shared **snapshot** GUIDs (+ clone `origin`
-    links). Dataset GUIDs differ per replica by design — never use them for
-    identity; snapshot GUIDs survive send/recv and are the cross-host truth.
-  - display name = longest common path suffix (pool stripped) of members,
-    clones excluded; leading components whose ancestor dataset is
-    snapshot-less ("bak"/"srv" plumbing) are trimmed (`trimBoring`); whatever
-    isn't in the group name shows as the per-cell prefix.
-  - states via pairwise compare against newest shared snapshot: ahead /
-    behind / diverged (both sides ahead) / in-sync; `written>0` counts as
-    ahead; clones and resume tokens override display state. No stored
-    "master", no pins — source is always derived (DESIGN "Source detection").
-  - `Group.Hidden` = no member has any snapshot (plumbing datasets).
-- `mutate.go` — THE ONLY place mutation command lines are built (see Hard
-  rules). Currently: buildSnapshotCmd.
-- `jobs.go` — remote job protocol: /tmp/zfstui-job-<id>/ dirs (job.sh,
-  meta.json written by job.sh itself, status, log), one-round-trip launch
-  with job.sh on ssh stdin + setsid, waitJob status polling. snapshotJob is
-  the first job kind.
-- `ops.go` — `Refresh` (errgroup fan-out, limit 8; unreachable hosts are
-  recorded, cache kept) and `loadData` (cache → Data{States, Groups, Hosts,
-  SnapsByReplica}).
-- `statusview.go` — plain-text matrix for `status`. Cell markers: `+` written
-  `!` diverged `~` resumable `%` clone; ahead deliberately has NO marker
-  (user prefers @names to speak); newest @name in a row = the source.
-- `tui.go` — bubbletea+lipgloss. Cursor coordinate system: `curRow == -2`
-  host header row (←/→ jump host-to-host, span highlighted), `-1` pool header
-  row, `0..` group rows; `curCol == 0` name column (group details), `1..N`
-  data columns into sorted `cols` ("host:pool"). Two-line header: hosts
-  (underlined, spanning) over pools (bold). `focus` 0=Datasets 1=Details
-  (Tab toggles; Details scrolls via `detOff`). `h` toggles hidden groups —
-  NOT vim-left (user decision). Refresh runs as tea.Cmd, results via
-  `refreshDoneMsg`. `s` opens the snapshot dialog: a centered lipgloss-
-  bordered modal form composited OVER the table (overlayCenter, ANSI-aware
-  splicing) with bubbles textinput + checkbox + buttons (Tab/↑↓ cycle focus,
-  Space toggles/presses, Enter = default action). The form previews the
-  exact command live and Create acts immediately — no separate confirm
-  screen (user decision); in -dry-run the button reads "Create (dry run)"
-  and opens a scrollable centered `textModal` with command/job dir/job.sh
-  instead of executing. `m.modal` (textModal) is the generic scrollable
-  text modal (also used for job-failure logs). Reuse button()/checkbox()/
-  styleDialog*/overlayCenter/textModal for future dialogs (sync, prune).
-  Dialog state machine is unit-tested without a pty (tui_test.go drives
-  Update with tea.KeyMsg directly; throwaway render tests for eyeballing
-  layout are in git history).
-- `main.go` — flag parsing (global flags BEFORE command), command dispatch;
-  first positional arg is the command iff it matches one, the rest are host
-  specs. `status` works from cache alone; the TUI resolves hosts from sqlite
-  so refresh always works (no "refresh disabled" states).
+  - groups = union-find over shared **snapshot GUIDs** (+ clone `origin`
+    links). Dataset GUIDs differ per replica — never identity.
+  - display name = longest common path suffix (pool stripped), clones
+    excluded; leading components whose ancestor dataset is snapshot-less
+    plumbing get trimmed (`trimBoring`); the remainder is the cell prefix.
+  - states via pairwise compare against the newest shared snapshot (GUID
+    equality only — trap #1): ahead / behind / diverged (both sides ahead) /
+    in-sync; written>0 counts as ahead; clone/resume-token override display.
+    No stored "master", no pins — the source is always derived.
+  - Group.Hidden = no member has any snapshot (plumbing datasets).
+- `mutate.go` — THE ONLY place mutation command lines are built:
+  buildSnapshotCmd, buildSendCmd / buildFullSendCmd (flags per trap #3),
+  buildResumeSendCmd (send -t), buildRecvCmd (-s -u; `-o encryption=off`
+  per trap #4), sizeVariant (-nP read-only sizing twin).
+- `sync.go` — planSync (pure compatibility gate: resume token → resume; no
+  shared latest GUID → diverged; dest written>0 → dirty; latest==target →
+  up-to-date; else incremental with the base resolved BY GUID to the
+  source-side snapshot NAME — names can differ across replicas!) +
+  customDestPlan (full send to a not-yet-existing dataset) + syncJob (the
+  pipeline job: send | mbuffer-if-available | pv-if-available | [ssh] recv;
+  remote dests get a per-job ssh ControlMaster authed under the launcher's
+  forwarded agent, `touch ssh-ok` releases the launcher (WaitStart), the
+  pipeline rides the master; `zfs send -nP` estimate → ./expected, pv bytes
+  → ./progress).
+- `jobs.go` — job protocol: /tmp/zfstui-job-<id>/ (job.sh; meta.json written
+  by job.sh itself via heredoc = single file transfer; status
+  `running pid ts|done ts|failed rc ts`; log; progress; expected; ssh-ok).
+  One-round-trip launch with job.sh on ssh stdin + setsid; bootstrap
+  optionally waits for ssh-ok (WaitStart). waitJob polls status+log tail.
+  Job IDs: 6 random base62 chars; time order lives in meta "created".
+- `ops.go` — Refresh (errgroup fan-out, limit 8; unreachable hosts recorded,
+  cache kept; persists host access) and loadData (cache → Data{States,
+  Groups, Hosts, SnapsByReplica, JobsByReplica}); indexJobs sorts by meta
+  "created" desc.
+- `statusview.go` — plain-text matrix for `status`. CellText shared with the
+  TUI: prefix without its trailing slash (`bak@20250409`), markers `+`
+  written `!` diverged `~` resumable `%` clone; ahead deliberately has NO
+  marker (the newest @name in a row identifies the source).
+- `tui.go` (big; all UI) — bubbletea+lipgloss+bubbles(textinput):
+  - cursor: curRow -2 = host header (←→ jump host-to-host), -1 = pool
+    header, 0.. = group rows; curCol 0 = name column, 1..N = sorted
+    "host:pool" columns. Row guide: cursor's row gets bg tint 238 always.
+  - colors: white normal/behind, green unsynced snapshots (ahead), orange
+    214 unsnapshotted writes (+), red diverged, cyan resumable, dim clone /
+    unreachable-host columns.
+  - panes: Datasets / Details, Tab switches focus (Details scrolls via
+    detOff). Pane titles plain white, active gets [ brackets ]; Details
+    title IS the selection identity ("group anki", "host cml",
+    "pool ws:tank", "ws:tank/srv/git") and content is unindented.
+  - `s` snapshot dialog, `y` sync dialog: centered dialogBox (title in the
+    border) composited OVER the table via overlayCenter (ANSI-aware
+    splicing). Forms: bubbles textinput + checkbox() + button(), Tab/↑↓
+    focus cycle, Space toggles, Enter = default action, NO separate confirm
+    screen — the form previews the exact command live; in -dry-run buttons
+    say "(dry run)" and a textModal shows command/job dir/job.sh instead.
+    Sync dialog: members pre-checked iff they need syncing, disabled rows
+    show reasons, free-form "new dest" editbox (host:pool/dataset, comma-
+    separated → full send, must not exist); editbox focus passes ALL keys to
+    textinput. Submit launches one job per dest, polls ~12s, leaves long
+    transfers detached.
+  - textModal: generic scrollable text box (↑↓/jk, ←→/hl horizontal pan,
+    PgUp/PgDn, g/G) used for dry-run details and failure logs (always shows
+    the failing command + log tail).
+  - live progress: ensureTicker starts a 150ms tick while runningJobHosts()
+    is non-empty; every 20th tick re-polls jobsProbe per host (jobsPollMsg)
+    updating Jobs/JobsByReplica in place; running→done/failed transitions
+    auto-refresh affected hosts. Cells with running jobs get a braille
+    spinner (cellTextLive); details show jobProgressLine "X / Y (Z%)".
+  - `h` toggles hidden groups — NOT vim-left (user decision).
+- `main.go` — global flags BEFORE the command; first positional arg is the
+  command iff it matches one, the rest are host specs. `status` works from
+  cache alone; the TUI resolves hosts from sqlite so refresh always works.
 
 ## Conventions & user preferences (learned, don't regress)
 
-- No naming-convention config or hardcoded `srv/`/`bak/` anywhere; everything
-  display-related is derived from data.
+- No naming-convention config or hardcoded `srv/`/`bak/` anywhere; all
+  display logic is derived from data.
 - Keep deps minimal; parse zfs output by hand; stdlib `flag`, no cobra.
-- Minimal cell markers; no master indicator; usernames not shown in table.
-- Tests: table-driven pure-function tests (see derive_test.go `fx` builder,
-  hostspec_test.go for spec parsing/resolution), fixture text for parsers,
-  fakeRunner for end-to-end (main_test.go). New derive/planner logic must
-  come with scenario tests.
-- TUI can't be keyboard-tested here: pty via `script` renders one frame but
-  key delivery is unreliable — verify render with
-  `timeout 6 script -qec "stty rows 32 cols 120; ./zfstui" /dev/null >/tmp/t.txt`
-  + strip ANSI, and ask the user to drive interactively for behavior.
-- The user commits; agent cannot (`.git` is read-only here). Keep README.md
-  and DESIGN.md updated as you work — explicit user requirement.
+- Minimal cell markers; no master indicator; usernames never shown in the
+  table (access ≠ identity); short job IDs; subtle-but-visible styling.
+- Tests: table-driven pure-function tests (derive_test.go `fx` builder,
+  sync_test.go `syncFixture` zoo, hostspec_test.go), fixture text for
+  parsers, fakeRunner/jobRunner for ssh-free end-to-end, tui_test.go drives
+  Update() with tea.KeyMsg directly (no pty needed). New derive/planner
+  logic must come with scenario tests.
+- Eyeballing layout: write a throwaway `render_eyeball_test.go` printing
+  m.View(), run with -v, strip ANSI with sed, delete the file (pattern used
+  many times; pty key delivery via `script` is unreliable here, rendering
+  one frame works).
+- BEWARE silent no-op python str.replace doc/code edits — verify with grep
+  after batch edits (bit us twice).
+- The user commits; the agent cannot (`.git` is read-only here). Keep
+  README.md and DESIGN.md updated as you work — explicit user requirement.
 
 ## Known warts / next steps
 
+- Old job dirs accumulate in /tmp until reboot/manual rm (safe to delete
+  when not running) — auto-pruning planned; keeps details job history noisy.
 - Hosts table keeps entries for hosts you stop using (and `status <typo>`
   remembers the typo) until the db is wiped — a `forget` command may come.
-- Real-data oddity to remember: `packages` appears as two unrelated groups
-  (no shared snapshot GUIDs) — correct but user may ask about re-linking
-  (needs full resend; relevant for M2 messaging).
-- M2 next: sync planner + compatibility gate (DESIGN "Sync planning") +
-  `sync --dry-run`; pure functions + tests first, then `doctor`.
-- M4 partly done: job mechanics + TUI snapshot dialog + -dry-run. Still
-  missing: batch `snap` command, refresh-time job discovery (glob
-  /tmp/zfstui-job-* into a jobs table/pane), sync execution, prune.
+- Real-data oddity: `packages` shows as two unrelated groups (no shared
+  GUIDs) — correct; re-linking would need a full resend.
+- Pool part of host specs (user@host:pool) is stored/displayed but doesn't
+  filter anything yet.
+- Next candidates: prune dialog (`d`, DESIGN "Snapshot pruning" — destroy
+  snapshots with pairwise-common-base locking), batch `snap`/`sync` CLI,
+  jobs pane, `doctor`, job-dir cleanup, XDG paths before release.

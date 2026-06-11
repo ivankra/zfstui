@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -149,8 +150,17 @@ const (
 	MarkPools     = "===ZFSTUI:pools==="
 	MarkDatasets  = "===ZFSTUI:datasets==="
 	MarkSnapshots = "===ZFSTUI:snapshots==="
+	MarkJobs      = "===ZFSTUI:jobs==="
 	MarkRC        = "===ZFSTUI:rc=" // followed by "<n>==="
 )
+
+// jobsProbe dumps every /tmp/zfstui-job-* dir: status, meta, last progress
+// line and expected size. Also used standalone for live progress polling.
+const jobsProbe = `for d in /tmp/zfstui-job-*; do [ -d "$d" ] || continue; ` +
+	`echo "==J== $d"; head -n1 "$d/status" 2>/dev/null; ` +
+	`echo "==M=="; cat "$d/meta.json" 2>/dev/null; echo; ` +
+	`echo "==P=="; tail -n1 "$d/progress" 2>/dev/null; echo; ` +
+	`echo "==E=="; head -n1 "$d/expected" 2>/dev/null; echo; done; true`
 
 // DiscoverCommand returns the shell command run on each host during refresh.
 // Each section echoes its marker, runs one command, and records its exit code
@@ -167,6 +177,8 @@ func DiscoverCommand(sudo bool) string {
 		section(MarkPools, "zpool list -H -p -o "+PoolCols),
 		section(MarkDatasets, "zfs list -H -p -t filesystem,volume -o "+DatasetCols),
 		section(MarkSnapshots, "zfs list -H -p -t snapshot -o "+SnapshotCols),
+		// Jobs need no sudo: dirs are owned by the ssh user that made them.
+		fmt.Sprintf("echo '%s'; %s; echo '%s'$?'==='", MarkJobs, jobsProbe, MarkRC),
 	}, "; ")
 }
 
@@ -179,7 +191,7 @@ func ParseDiscovery(host, out string) (HostState, error) {
 	for _, line := range strings.Split(out, "\n") {
 		trimmed := strings.TrimSpace(line)
 		switch {
-		case trimmed == MarkPools || trimmed == MarkDatasets || trimmed == MarkSnapshots:
+		case trimmed == MarkPools || trimmed == MarkDatasets || trimmed == MarkSnapshots || trimmed == MarkJobs:
 			curMark = trimmed
 			cur = &strings.Builder{}
 			sections[curMark] = cur
@@ -194,7 +206,7 @@ func ParseDiscovery(host, out string) (HostState, error) {
 			cur.WriteString("\n")
 		}
 	}
-	for _, mark := range []string{MarkPools, MarkDatasets, MarkSnapshots} {
+	for _, mark := range []string{MarkPools, MarkDatasets, MarkSnapshots, MarkJobs} {
 		if sections[mark] == nil {
 			return st, fmt.Errorf("%s: discovery output missing section %s", host, mark)
 		}
@@ -209,5 +221,69 @@ func ParseDiscovery(host, out string) (HostState, error) {
 	if st.Snapshots, err = ParseSnapshots(host, sections[MarkSnapshots].String()); err != nil {
 		return st, err
 	}
+	st.Jobs = ParseJobs(host, sections[MarkJobs].String())
 	return st, nil
+}
+
+// ParseJobs parses jobsProbe output. Malformed entries are skipped — job
+// dirs may be mid-write or owned by another user.
+func ParseJobs(host, out string) []JobInfo {
+	var jobs []JobInfo
+	var cur *JobInfo
+	mode := ""
+	var metaBuf strings.Builder
+	flush := func() {
+		if cur == nil {
+			return
+		}
+		cur.Meta = map[string]string{}
+		_ = json.Unmarshal([]byte(metaBuf.String()), &cur.Meta)
+		if k := cur.Meta["kind"]; k != "" {
+			cur.Kind = k
+		}
+		if cur.State == "" {
+			cur.State = "unknown"
+		}
+		jobs = append(jobs, *cur)
+		cur = nil
+		metaBuf.Reset()
+	}
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "==J== "):
+			flush()
+			dir := strings.TrimSpace(strings.TrimPrefix(line, "==J== "))
+			cur = &JobInfo{Host: host, Dir: dir, ID: strings.TrimPrefix(dir, jobDirPrefix)}
+			mode = "status"
+		case line == "==M==":
+			mode = "meta"
+		case line == "==P==":
+			mode = "progress"
+		case line == "==E==":
+			mode = "expected"
+		case cur == nil:
+			// ignore noise outside entries
+		default:
+			switch mode {
+			case "status":
+				if cur.Status == "" && strings.TrimSpace(line) != "" {
+					cur.Status = strings.TrimSpace(line)
+					cur.State, _, _ = strings.Cut(cur.Status, " ")
+				}
+			case "meta":
+				metaBuf.WriteString(line)
+				metaBuf.WriteString("\n")
+			case "progress":
+				if v, err := strconv.ParseInt(strings.TrimSpace(line), 10, 64); err == nil {
+					cur.Progress = v
+				}
+			case "expected":
+				if v, err := strconv.ParseInt(strings.TrimSpace(line), 10, 64); err == nil {
+					cur.Expected = v
+				}
+			}
+		}
+	}
+	flush()
+	return jobs
 }

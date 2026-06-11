@@ -152,6 +152,20 @@ type HostState struct {
 	Pools     []Pool
 	Datasets  []Dataset
 	Snapshots []Snapshot
+	Jobs      []JobInfo
+}
+
+// JobInfo is a zfstui job discovered in /tmp/zfstui-job-* on a host.
+type JobInfo struct {
+	Host     string
+	ID       string
+	Dir      string
+	Kind     string            // snapshot | sync
+	State    string            // running | done | failed | unknown
+	Status   string            // raw status line (pid, rc, timestamps)
+	Meta     map[string]string // from meta.json (src, dest, dataset, …)
+	Progress int64             // bytes transferred so far (pv), 0 if unknown
+	Expected int64             // estimated total bytes (zfs send -nP), 0 if unknown
 }
 
 // ReplicaState classifies one replica within its group.

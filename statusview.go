@@ -16,7 +16,9 @@ import (
 // "Ahead" needs no marker: the per-cell @names already show who is newest.
 func CellText(r *Replica) string {
 	var b strings.Builder
-	b.WriteString(r.CellPrefix)
+	// Display drops the prefix's trailing slash: "bak@20250409", not
+	// "bak/@20250409".
+	b.WriteString(strings.TrimSuffix(r.CellPrefix, "/"))
 	if r.Latest != nil {
 		b.WriteString("@" + r.Latest.Name)
 	}

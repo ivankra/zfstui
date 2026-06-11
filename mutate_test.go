@@ -8,8 +8,27 @@ import (
 
 // The data-safety allowlist (DESIGN.md "Data safety (hard rules)"): every
 // mutating command line the tool can emit must match one of these shapes.
-var allowlist = regexp.MustCompile(
-	`^(sudo -n )?zfs (snapshot( -r)? |send |recv -s -u |receive -A |destroy )'[^;|&$<>\\]*'$`)
+// Note what is absent: recv -F, rollback, destroy of datasets, destroy -r/-R.
+var allowlistRes = []*regexp.Regexp{
+	regexp.MustCompile(`^(sudo -n )?zfs snapshot( -r)? '[^';|&$<>\\]+'$`),
+	regexp.MustCompile(`^(sudo -n )?zfs send (-w|-L -c) -[iI] '[^';|&$<>\\]+@[^';|&$<>\\]+' '[^';|&$<>\\]+@[^';|&$<>\\]+'$`),
+	regexp.MustCompile(`^(sudo -n )?zfs send (-w|-L -c) '[^';|&$<>\\]+@[^';|&$<>\\]+'$`), // full send (new dest)
+	regexp.MustCompile(`^(sudo -n )?zfs send -t '[A-Za-z0-9-]+'$`),
+	// -nP sizing twins are no-op/read-only (never generate stream data):
+	regexp.MustCompile(`^(sudo -n )?zfs send -nP (-w |-L -c )?(-[iI] |-t )?'[^']+'( '[^']+')?$`),
+	regexp.MustCompile(`^(sudo -n )?zfs recv -s -u( -o encryption=off)? '[^';|&$<>\\]+'$`),
+	regexp.MustCompile(`^(sudo -n )?zfs receive -A '[^';|&$<>\\]+'$`),
+	regexp.MustCompile(`^(sudo -n )?zfs destroy '[^'@;|&$<>\\]+@[^';|&$<>\\]+'$`),
+}
+
+func allowlisted(cmd string) bool {
+	for _, re := range allowlistRes {
+		if re.MatchString(cmd) {
+			return true
+		}
+	}
+	return false
+}
 
 func TestSnapshotCmdAllowlist(t *testing.T) {
 	for _, c := range []struct {
@@ -28,7 +47,7 @@ func TestSnapshotCmdAllowlist(t *testing.T) {
 			t.Errorf("%+v: %v", c, err)
 			continue
 		}
-		if !allowlist.MatchString(cmd) {
+		if !allowlisted(cmd) {
 			t.Errorf("command outside allowlist: %q", cmd)
 		}
 	}
@@ -82,5 +101,69 @@ func TestQuotedPayloadNeverBreaksOut(t *testing.T) {
 	q := shellQuote(`a'; rm -rf / #`)
 	if strings.Contains(q, `'; rm`) && !strings.Contains(q, `'\''`) {
 		t.Errorf("quote escape failed: %q", q)
+	}
+}
+
+func TestSendRecvCmdShapes(t *testing.T) {
+	send, err := buildSendCmd(true, true, true, "tank/srv/git", "20260501", "20260611")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if send != `sudo -n zfs send -w -I 'tank/srv/git@20260501' 'tank/srv/git@20260611'` {
+		t.Errorf("send = %q", send)
+	}
+	if !allowlisted(send) {
+		t.Errorf("send not allowlisted: %q", send)
+	}
+	// Unencrypted source: -L -c, never -w (would imply -e: unreceivable
+	// into encrypted destinations).
+	send, _ = buildSendCmd(false, false, false, "tank/srv/git", "a", "b")
+	if send != `zfs send -L -c -i 'tank/srv/git@a' 'tank/srv/git@b'` {
+		t.Errorf("send -i = %q", send)
+	}
+	if !allowlisted(send) {
+		t.Errorf("plain send not allowlisted: %q", send)
+	}
+	full, _ := buildFullSendCmd(false, false, "tank/x", "s1")
+	if full != `zfs send -L -c 'tank/x@s1'` || !allowlisted(full) {
+		t.Errorf("plain full = %q", full)
+	}
+
+	resume, err := buildResumeSendCmd(false, "1-e604ea4bf-e0-789c63a2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resume != `zfs send -t '1-e604ea4bf-e0-789c63a2'` || !allowlisted(resume) {
+		t.Errorf("resume = %q", resume)
+	}
+
+	recv, err := buildRecvCmd(true, "tank/bak/git", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recv != `sudo -n zfs recv -s -u 'tank/bak/git'` || !allowlisted(recv) {
+		t.Errorf("recv = %q", recv)
+	}
+	recv, _ = buildRecvCmd(false, "tank/bak/git", true)
+	if recv != `zfs recv -s -u -o encryption=off 'tank/bak/git'` || !allowlisted(recv) {
+		t.Errorf("plain recv = %q", recv)
+	}
+}
+
+func TestSendRecvCmdRejectsBadInput(t *testing.T) {
+	if _, err := buildSendCmd(false, true, true, "tank/x", "ok", "$(boom)"); err == nil {
+		t.Error("bad target snap accepted")
+	}
+	if _, err := buildSendCmd(false, true, true, "tank/x", "a;b", "ok"); err == nil {
+		t.Error("bad base snap accepted")
+	}
+	if _, err := buildResumeSendCmd(false, "short"); err == nil {
+		t.Error("short token accepted")
+	}
+	if _, err := buildResumeSendCmd(false, "1-abc'; rm -rf /;'x"); err == nil {
+		t.Error("evil token accepted")
+	}
+	if _, err := buildRecvCmd(false, "tank/`boom`", false); err == nil {
+		t.Error("bad recv dataset accepted")
 	}
 }

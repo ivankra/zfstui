@@ -16,9 +16,9 @@ import (
 type Runner interface {
 	// Run executes cmd on host and returns its stdout.
 	Run(ctx context.Context, host Host, cmd string) ([]byte, error)
-	// RunInput is Run with data piped to the remote command's stdin
-	// (used to transfer job scripts).
-	RunInput(ctx context.Context, host Host, cmd string, stdin []byte) ([]byte, error)
+	// RunInput is Run with data piped to the remote command's stdin (used
+	// to transfer job scripts); sshExtra adds ssh flags (e.g. -A).
+	RunInput(ctx context.Context, host Host, cmd string, stdin []byte, sshExtra ...string) ([]byte, error)
 }
 
 // SSH is the real Runner. ControlMaster multiplexing makes repeated calls to
@@ -43,10 +43,14 @@ func newSSH() *SSH {
 // Args builds the full ssh argv for running cmd on host (exposed for tests
 // and for job-launch code that needs -A etc. via extra).
 func (s *SSH) Args(host Host, extra []string, cmd string) []string {
-	args := []string{
+	// extra goes FIRST: ssh honors the first occurrence of an option, so
+	// callers can override multiplexing (e.g. ControlPath=none for agent-
+	// forwarded job launches — a reused master ignores -A!).
+	args := append([]string{}, extra...)
+	args = append(args,
 		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=" + strconv.Itoa(s.ConnectTimeoutSec),
-	}
+		"-o", "ConnectTimeout="+strconv.Itoa(s.ConnectTimeoutSec),
+	)
 	if s.ControlDir != "" {
 		args = append(args,
 			"-o", "ControlMaster=auto",
@@ -66,8 +70,8 @@ func (s *SSH) Run(ctx context.Context, host Host, cmd string) ([]byte, error) {
 	return s.RunInput(ctx, host, cmd, nil)
 }
 
-func (s *SSH) RunInput(ctx context.Context, host Host, cmd string, stdin []byte) ([]byte, error) {
-	c := exec.CommandContext(ctx, "ssh", s.Args(host, nil, cmd)...)
+func (s *SSH) RunInput(ctx context.Context, host Host, cmd string, stdin []byte, sshExtra ...string) ([]byte, error) {
+	c := exec.CommandContext(ctx, "ssh", s.Args(host, sshExtra, cmd)...)
 	if stdin != nil {
 		c.Stdin = bytes.NewReader(stdin)
 	}

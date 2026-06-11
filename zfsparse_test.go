@@ -87,7 +87,8 @@ func TestParseSnapshotsRejectsMissingAt(t *testing.T) {
 func TestParseDiscovery(t *testing.T) {
 	out := MarkPools + "\n" + poolsOut + MarkRC + "0===\n" +
 		MarkDatasets + "\n" + datasetsOut + MarkRC + "0===\n" +
-		MarkSnapshots + "\n" + snapsOut + MarkRC + "0===\n"
+		MarkSnapshots + "\n" + snapsOut + MarkRC + "0===\n" +
+		MarkJobs + "\n" + MarkRC + "0===\n"
 	st, err := ParseDiscovery("dev1", out)
 	if err != nil {
 		t.Fatal(err)
@@ -120,5 +121,53 @@ func TestDiscoverCommandSudo(t *testing.T) {
 	}
 	if strings.Contains(DiscoverCommand(false), "sudo") {
 		t.Error("unexpected sudo in non-sudo command")
+	}
+}
+
+const jobsOut = `==J== /tmp/zfstui-job-20260611T100000Z-aa11
+running 4242 2026-06-11T10:00:01Z
+==M==
+{
+  "id": "20260611T100000Z-aa11",
+  "kind": "sync",
+  "src": "ws:tank/srv/git",
+  "dest": "cml:root/bak/git"
+}
+==P==
+123456789
+==E==
+1000000000
+==J== /tmp/zfstui-job-20260610T090000Z-bb22
+done 2026-06-10T09:05:00Z
+==M==
+{"id": "20260610T090000Z-bb22", "kind": "snapshot", "dataset": "tank/srv/git", "snapshot": "x"}
+==P==
+==E==
+`
+
+func TestParseJobs(t *testing.T) {
+	jobs := ParseJobs("ws", jobsOut)
+	if len(jobs) != 2 {
+		t.Fatalf("got %d jobs", len(jobs))
+	}
+	j := jobs[0]
+	if j.ID != "20260611T100000Z-aa11" || j.Kind != "sync" || j.State != "running" ||
+		j.Progress != 123456789 || j.Expected != 1000000000 ||
+		j.Meta["dest"] != "cml:root/bak/git" {
+		t.Errorf("job0: %+v", j)
+	}
+	if jobs[1].State != "done" || jobs[1].Kind != "snapshot" || jobs[1].Progress != 0 {
+		t.Errorf("job1: %+v", jobs[1])
+	}
+}
+
+func TestParseJobsEmptyAndGarbage(t *testing.T) {
+	if jobs := ParseJobs("ws", ""); len(jobs) != 0 {
+		t.Errorf("empty: %v", jobs)
+	}
+	// A half-written dir (no meta yet) still yields an entry.
+	jobs := ParseJobs("ws", "==J== /tmp/zfstui-job-x\n==M==\n==P==\n==E==\n")
+	if len(jobs) != 1 || jobs[0].State != "unknown" {
+		t.Errorf("partial: %+v", jobs)
 	}
 }

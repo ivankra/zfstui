@@ -27,7 +27,8 @@ func discovery(pools, datasets, snapshots string) string {
 	}
 	return sec(MarkPools, pools) +
 		sec(MarkDatasets, datasets) +
-		sec(MarkSnapshots, snapshots)
+		sec(MarkSnapshots, snapshots) +
+		sec(MarkJobs, "")
 }
 
 func dsLine(name string, written int64) string {
@@ -81,8 +82,8 @@ func TestRefreshAndStatusEndToEnd(t *testing.T) {
 	out := Status(data.Groups)
 	t.Log("\n" + out)
 	if !strings.Contains(out, "git") ||
-		!strings.Contains(out, "srv/@20260601+") || // unsnapshotted writes
-		!strings.Contains(out, "bak/@20260501") { // the stale tank backup
+		!strings.Contains(out, "srv@20260601+") || // unsnapshotted writes
+		!strings.Contains(out, "bak@20260501") { // the stale tank backup
 		t.Errorf("unexpected status output:\n%s", out)
 	}
 
@@ -101,6 +102,6 @@ func TestRefreshAndStatusEndToEnd(t *testing.T) {
 	}
 }
 
-func (f *fakeRunner) RunInput(ctx context.Context, h Host, cmd string, stdin []byte) ([]byte, error) {
+func (f *fakeRunner) RunInput(ctx context.Context, h Host, cmd string, stdin []byte, sshExtra ...string) ([]byte, error) {
 	return f.Run(ctx, h, cmd)
 }

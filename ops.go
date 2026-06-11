@@ -55,6 +55,52 @@ type Data struct {
 	Hosts  []HostInfo
 	// SnapsByReplica indexes snapshots by "host:dataset" (ascending creation).
 	SnapsByReplica map[string][]Snapshot
+	// JobsByReplica indexes discovered jobs by the "host:dataset" keys they
+	// touch (sync: src and dest; snapshot: the dataset), newest job first.
+	JobsByReplica map[string][]JobInfo
+}
+
+// jobReplicaKeys returns the "host:dataset" keys a job touches.
+func jobReplicaKeys(j JobInfo) []string {
+	var keys []string
+	switch j.Kind {
+	case "sync":
+		if s := j.Meta["src"]; s != "" {
+			keys = append(keys, s)
+		}
+		if d := j.Meta["dest"]; d != "" {
+			keys = append(keys, d)
+		}
+	case "snapshot":
+		if ds := j.Meta["dataset"]; ds != "" {
+			keys = append(keys, j.Host+":"+ds)
+		}
+	}
+	return keys
+}
+
+func indexJobs(states []HostState) map[string][]JobInfo {
+	idx := map[string][]JobInfo{}
+	for _, hs := range states {
+		for _, j := range hs.Jobs {
+			for _, k := range jobReplicaKeys(j) {
+				idx[k] = append(idx[k], j)
+			}
+		}
+	}
+	for k := range idx {
+		jobs := idx[k]
+		// Newest first; IDs are random, time order lives in meta "created".
+		key := func(j JobInfo) string { return j.Meta["created"] + " " + j.ID }
+		for i := 0; i < len(jobs); i++ {
+			for l := i + 1; l < len(jobs); l++ {
+				if key(jobs[l]) > key(jobs[i]) {
+					jobs[i], jobs[l] = jobs[l], jobs[i]
+				}
+			}
+		}
+	}
+	return idx
 }
 
 // loadData reads the cache and derives groups. A non-empty `only` list
@@ -96,5 +142,6 @@ func loadData(st *Store, only []string) (*Data, error) {
 			snaps[k] = append(snaps[k], s)
 		}
 	}
-	return &Data{States: states, Groups: groups, Hosts: hosts, SnapsByReplica: snaps}, nil
+	return &Data{States: states, Groups: groups, Hosts: hosts,
+		SnapsByReplica: snaps, JobsByReplica: indexJobs(states)}, nil
 }

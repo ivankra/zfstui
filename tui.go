@@ -17,35 +17,42 @@ import (
 )
 
 var (
-	styleHeader   = lipgloss.NewStyle().Bold(true).Underline(true)
-	styleName     = lipgloss.NewStyle().Bold(true)
-	styleAhead    = lipgloss.NewStyle().Bold(true)
-	styleBehind   = lipgloss.NewStyle().Foreground(lipgloss.Color("3")) // yellow
-	styleDiverged = lipgloss.NewStyle().Foreground(lipgloss.Color("1")) // red
-	styleResume   = lipgloss.NewStyle().Foreground(lipgloss.Color("6")) // cyan
-	styleClone    = lipgloss.NewStyle().Foreground(lipgloss.Color("8")) // dim
-	styleInSync   = lipgloss.NewStyle().Foreground(lipgloss.Color("2")) // green
-	styleDim      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	styleCursor   = lipgloss.NewStyle().Reverse(true)
-	styleStatus   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	styleErr      = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	styleHeader    = lipgloss.NewStyle().Bold(true).Underline(true)
+	styleName      = lipgloss.NewStyle().Bold(true)
+	styleNormal    = lipgloss.NewStyle()
+	styleNewSnaps  = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))   // green: unsynced snapshots
+	styleWritten   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // orange: unsnapshotted writes (+)
+	styleDiverged  = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))   // red
+	styleResume    = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))   // cyan
+	styleClone     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))   // dim
+	styleDim       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleCursor    = lipgloss.NewStyle().Reverse(true)
+	stylePaneTitle = lipgloss.NewStyle().Foreground(lipgloss.Color("7")) // plain white
+	rowGuideBG     = lipgloss.Color("238")
+	styleRowGuide  = lipgloss.NewStyle().Background(rowGuideBG)
+	styleStatus    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleErr       = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
 
-func stateStyle(s ReplicaState) lipgloss.Style {
-	switch s {
-	case StateAhead:
-		return styleAhead
-	case StateBehind:
-		return styleBehind
+// cellStyle: white = normal (in sync or merely behind — the @names speak),
+// green = has snapshots not yet synced elsewhere, orange = unsnapshotted
+// local writes ("+"); red/cyan/dim keep flagging diverged/resumable/clone.
+func cellStyle(r *Replica) lipgloss.Style {
+	switch r.State {
 	case StateDiverged:
 		return styleDiverged
 	case StateResumable:
 		return styleResume
 	case StateClone:
 		return styleClone
-	default:
-		return styleInSync
 	}
+	if r.Written > 0 {
+		return styleWritten
+	}
+	if r.State == StateAhead {
+		return styleNewSnaps
+	}
+	return styleNormal
 }
 
 // cell is one (group, column) position; usually 0 or 1 replicas, rarely more.
@@ -84,17 +91,22 @@ type Model struct {
 	refreshing bool
 	status     string
 	statusErr  bool
+	spin       int  // spinner frame counter
+	ticking    bool // spinner/poll ticker active
 
-	dryRun bool
-	dialog *snapDialog // snapshot dialog when non-nil
-	modal  *textModal  // scrollable centered text modal (dry-run details, job logs)
+	dryRun  bool
+	dialog  *snapDialog // snapshot dialog when non-nil
+	syncDlg *syncDialog // sync dialog when non-nil
+	modal   *textModal  // scrollable centered text modal (dry-run details, job logs)
 }
 
-// textModal is a centered, scrollable read-only text box.
+// textModal is a centered, scrollable read-only text box (vertical and
+// horizontal — job pipelines are wide).
 type textModal struct {
 	title string
 	lines []string
-	off   int
+	off   int // vertical scroll
+	xOff  int // horizontal pan (display columns)
 }
 
 // snapDialog is the state of the snapshot dialog (TUI `s`): a modal form
@@ -142,8 +154,9 @@ func (m *Model) reload() error {
 		}
 	}
 
+	// Header rows have negative curRow — there is no group there.
 	var curName string
-	if m.curRow < len(m.rows) && len(m.rows) > 0 {
+	if m.curRow >= 0 && m.curRow < len(m.rows) {
 		curName = m.rows[m.curRow].DisplayName
 	}
 
@@ -182,7 +195,12 @@ func (m *Model) reload() error {
 		}
 	}
 
-	// Restore cursor onto the same group if possible.
+	// Restore cursor onto the same group if possible; a header-row cursor
+	// (negative) stays where it is.
+	if m.curRow < 0 {
+		m.clampCursor()
+		return nil
+	}
 	m.curRow = 0
 	for i, g := range m.rows {
 		if g.DisplayName == curName {
@@ -281,13 +299,19 @@ func (m *Model) refreshCmd(hosts []Host) tea.Cmd {
 	}
 }
 
-func (m *Model) Init() tea.Cmd { return nil }
+func (m *Model) Init() tea.Cmd { return m.ensureTicker() }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
+
+	case tickMsg:
+		return m.onTick()
+
+	case jobsPollMsg:
+		return m.onJobsPoll(msg)
 
 	case refreshDoneMsg:
 		m.refreshing = false
@@ -310,10 +334,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("refreshed %d host(s) at %s", ok, time.Now().Format("15:04:05"))
 			m.statusErr = false
 		}
-		return m, nil
+		return m, m.ensureTicker()
 
 	case snapDoneMsg:
 		return m.onSnapDone(msg)
+
+	case syncDoneMsg:
+		return m.onSyncDone(msg)
 
 	case tea.KeyMsg:
 		if m.modal != nil {
@@ -326,6 +353,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.dialog != nil {
 			return m.updateDialog(msg)
+		}
+		if m.syncDlg != nil {
+			return m.updateSyncDialog(msg)
 		}
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -387,6 +417,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "s":
 			m.openSnapshotDialog()
+		case "y", "Y":
+			m.openSyncDialog()
 		case "r":
 			return m.startRefresh(false)
 		case "R":
@@ -450,12 +482,15 @@ func (m *Model) View() string {
 	var b strings.Builder
 	b.WriteString(m.paneTitle("Datasets", m.focus == 0))
 	b.WriteString(m.tableView(m.tableBodyH()))
-	b.WriteString(m.paneTitle("Details", m.focus == 1))
+	b.WriteString(m.paneTitle(m.detailsTitle(), m.focus == 1))
 	b.WriteString(m.detailsBody())
 	b.WriteString(m.footerView())
 	if m.dialog != nil {
 		// Modal: composite the dialog box over the normal view.
 		return overlayCenter(b.String(), m.dialogView(), m.width, m.height)
+	}
+	if m.syncDlg != nil {
+		return overlayCenter(b.String(), m.syncDialogView(), m.width, m.height)
 	}
 	if m.modal != nil {
 		return overlayCenter(b.String(), m.modalView(), m.width, m.height)
@@ -488,12 +523,16 @@ func (m *Model) updateModal(msg tea.KeyMsg) {
 		mo.off--
 	case "down", "j":
 		mo.off++
+	case "left", "h":
+		mo.xOff -= 10
+	case "right", "l":
+		mo.xOff += 10
 	case "pgup":
 		mo.off -= bodyH
 	case "pgdown", " ":
 		mo.off += bodyH
 	case "g", "home":
-		mo.off = 0
+		mo.off, mo.xOff = 0, 0
 	case "G", "end":
 		mo.off = maxOff
 	case "esc", "q", "enter":
@@ -505,6 +544,18 @@ func (m *Model) updateModal(msg tea.KeyMsg) {
 	}
 	if mo.off < 0 {
 		mo.off = 0
+	}
+	maxLine := 0
+	for _, l := range mo.lines {
+		if w := lipgloss.Width(l); w > maxLine {
+			maxLine = w
+		}
+	}
+	if mo.xOff > maxLine-10 {
+		mo.xOff = max(maxLine-10, 0)
+	}
+	if mo.xOff < 0 {
+		mo.xOff = 0
 	}
 }
 
@@ -519,13 +570,21 @@ func (m *Model) modalView() string {
 		maxW = 20
 	}
 	var b strings.Builder
-	b.WriteString(styleDialogTitle.Render(mo.title) + "\n\n")
 	end := mo.off + bodyH
 	if end > len(mo.lines) {
 		end = len(mo.lines)
 	}
 	for i := mo.off; i < end; i++ {
-		b.WriteString(pad(mo.lines[i], maxW) + "\n")
+		ln := mo.lines[i]
+		if mo.xOff > 0 {
+			r := []rune(ln)
+			if mo.xOff < len(r) {
+				ln = "…" + string(r[mo.xOff:])
+			} else {
+				ln = ""
+			}
+		}
+		b.WriteString(pad(ln, maxW) + "\n")
 	}
 	for i := end - mo.off; i < bodyH; i++ {
 		b.WriteString("\n")
@@ -534,8 +593,11 @@ func (m *Model) modalView() string {
 	if len(mo.lines) > bodyH {
 		pos = fmt.Sprintf("  %d–%d/%d", mo.off+1, end, len(mo.lines))
 	}
-	b.WriteString("\n" + styleDim.Render("↑↓/jk scroll · PgUp/PgDn · Esc close"+pos))
-	return styleDialogBox.Render(b.String())
+	if mo.xOff > 0 {
+		pos += fmt.Sprintf("  →%d", mo.xOff)
+	}
+	b.WriteString("\n" + styleDim.Render("↑↓←→/hjkl scroll · PgUp/PgDn · Esc close"+pos))
+	return dialogBox(mo.title, b.String())
 }
 
 // overlayCenter splices the box into the middle of base, ANSI-aware, so the
@@ -571,18 +633,32 @@ func overlayCenter(base, box string, w, h int) string {
 	return strings.Join(baseLines, "\n")
 }
 
-// paneTitle renders "── Name ───…" with the name highlighted when focused.
+// paneTitle renders "── Name ───…" — plain white title text (readable
+// against the dim border), with [ ] markers around the focused pane's name.
 func (m *Model) paneTitle(name string, active bool) string {
 	label := " " + name + " "
-	fill := m.width - 2 - len(label)
+	if active {
+		label = " [ " + name + " ] "
+	}
+	fill := m.width - 2 - lipgloss.Width(label)
 	if fill < 0 {
 		fill = 0
 	}
-	styled := styleDim.Render(label)
-	if active {
-		styled = styleCursor.Render(label)
+	return styleDim.Render("──") + stylePaneTitle.Render(label) +
+		styleDim.Render(strings.Repeat("─", fill)) + "\n"
+}
+
+// cellTextLive is the table cell text plus a spinner when a job touching
+// the replica is running (receiving or sending).
+func (m *Model) cellTextLive(c cell) string {
+	txt := c.text()
+	for _, r := range c.replicas {
+		if m.runningJobFor(r) != nil {
+			txt += " " + spinnerFrames[m.spin%len(spinnerFrames)]
+			break
+		}
 	}
-	return styleDim.Render("──") + styled + styleDim.Render(strings.Repeat("─", fill)) + "\n"
+	return txt
 }
 
 func (m *Model) colWidths() (nameW int, colWs []int) {
@@ -600,7 +676,7 @@ func (m *Model) colWidths() (nameW int, colWs []int) {
 		w := len(strings.SplitN(c, ":", 2)[1]) // pool name (host spans above)
 		for ri := range m.rows {
 			if cl, ok := m.cells[ri][i]; ok {
-				if t := len(cl.text()); t > w {
+				if t := lipgloss.Width(m.cellTextLive(cl)); t > w {
 					w = t
 				}
 			}
@@ -731,32 +807,46 @@ func (m *Model) tableView(h int) string {
 	rowsShown := 0
 	for ri := m.rowOff; ri < len(m.rows) && rowsShown < h-2; ri++ {
 		g := m.rows[ri]
+		// Row guide: the cursor's row gets a background tint so the group's
+		// replicas are easy to pick out wherever the cursor is.
+		onRow := ri == m.curRow
+		sep := "  "
+		if onRow {
+			sep = styleRowGuide.Render("  ")
+		}
 		name := pad(g.DisplayName, nameW)
 		nstyle := styleName
 		if g.Hidden {
 			nstyle = styleDim
 		}
-		if ri == m.curRow && m.curCol == 0 {
+		if onRow && m.curCol == 0 {
 			b.WriteString(styleCursor.Render(name))
 		} else {
+			if onRow {
+				nstyle = nstyle.Background(rowGuideBG)
+			}
 			b.WriteString(nstyle.Render(name))
 		}
 		for ci := m.colOff; ci < end; ci++ {
-			b.WriteString("  ")
+			b.WriteString(sep)
 			c, ok := m.cells[ri][ci]
 			txt := ""
-			st := styleInSync
+			st := styleNormal
 			if ok {
-				txt = c.text()
+				txt = m.cellTextLive(c)
 				if len(c.replicas) == 1 {
-					st = stateStyle(c.replicas[0].State)
+					st = cellStyle(c.replicas[0])
 				}
+			}
+			if m.unreach[strings.SplitN(m.cols[ci], ":", 2)[0]] {
+				st = styleDim
+			}
+			if onRow {
+				st = st.Background(rowGuideBG)
 			}
 			cellStr := pad(txt, colWs[ci])
 			if ri == m.curRow && ci == m.curCol-1 {
 				b.WriteString(styleCursor.Render(cellStr))
-			} else if m.unreach[strings.SplitN(m.cols[ci], ":", 2)[0]] {
-				b.WriteString(styleDim.Render(cellStr))
 			} else {
 				b.WriteString(st.Render(cellStr))
 			}
@@ -783,6 +873,27 @@ func human(n int64) string {
 	return fmt.Sprintf("%.1f%c", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
+// detailsTitle names the Details pane after the selection: the first line
+// of content used to repeat this — now the title carries the identity.
+func (m *Model) detailsTitle() string {
+	g, c := m.selected()
+	switch {
+	case m.curRow == -2:
+		if m.curCol >= 1 && m.curCol <= len(m.cols) {
+			return "host " + m.hostOfCol(m.curCol-1)
+		}
+	case m.curRow == -1:
+		if m.curCol >= 1 && m.curCol <= len(m.cols) {
+			return "pool " + m.cols[m.curCol-1]
+		}
+	case g != nil && m.curCol == 0:
+		return "group " + g.DisplayName
+	case g != nil && c != nil && len(c.replicas) > 0:
+		return c.replicas[0].Dataset.Host + ":" + c.replicas[0].Dataset.Name
+	}
+	return "Details"
+}
+
 // detailLines builds the full (unscrolled) Details pane content.
 func (m *Model) detailLines() []string {
 	var lines []string
@@ -795,9 +906,10 @@ func (m *Model) detailLines() []string {
 	case g == nil:
 		lines = append(lines, "nothing selected")
 	case m.curCol == 0:
-		// Name column: group-level summary, columns aligned.
-		lines = append(lines, fmt.Sprintf("group %s — %d replica(s), latest @%s",
-			g.DisplayName, len(g.Members), orDash(g.LatestName)))
+		// Name column: group-level summary, columns aligned (identity is in
+		// the pane title).
+		lines = append(lines, fmt.Sprintf("%d replica(s) · latest @%s",
+			len(g.Members), orDash(g.LatestName)))
 		nameW := 0
 		for _, r := range g.Members {
 			if l := len(r.Dataset.Host + ":" + r.Dataset.Name); l > nameW {
@@ -805,31 +917,40 @@ func (m *Model) detailLines() []string {
 			}
 		}
 		for _, r := range g.Members {
-			lines = append(lines, fmt.Sprintf("  %-*s  %-9s  %s",
-				nameW, r.Dataset.Host+":"+r.Dataset.Name, r.State, replicaBrief(r)))
+			live := ""
+			if j := m.runningJobFor(r); j != nil {
+				live = "  " + spinnerFrames[m.spin%len(spinnerFrames)] + " " + jobProgressLine(j)
+			}
+			lines = append(lines, fmt.Sprintf("%-*s  %-9s  %s%s",
+				nameW, r.Dataset.Host+":"+r.Dataset.Name, r.State, replicaBrief(r), live))
 		}
 	case c == nil || len(c.replicas) == 0:
 		// Empty cell: this group has no replica in this host:pool.
 	default:
-		for _, r := range c.replicas {
+		for ri, r := range c.replicas {
 			d := r.Dataset
 			enc := d.Encryption
 			if enc == "" {
 				enc = "off"
 			}
+			if len(c.replicas) > 1 && ri > 0 {
+				lines = append(lines, "")
+			}
+			if len(c.replicas) > 1 {
+				lines = append(lines, d.Host+":"+d.Name)
+			}
 			lines = append(lines,
-				fmt.Sprintf("%s:%s  [%s]", d.Host, d.Name, r.State),
-				fmt.Sprintf("  used %s  refer %s  written %s  encryption %s  mounted %v (%s)",
-					human(d.Used), human(d.Refer), human(d.Written), enc, d.Mounted, orDash(d.Mountpoint)),
-			)
+				fmt.Sprintf("%-9s  used %s  refer %s  written %s  encryption %s  mounted %v (%s)",
+					r.State, human(d.Used), human(d.Refer), human(d.Written), enc, d.Mounted, orDash(d.Mountpoint)))
 			if d.Origin != "" {
-				lines = append(lines, "  clone of "+d.Origin)
+				lines = append(lines, "clone of "+d.Origin)
 			}
 			if d.ResumeToken != "" {
-				lines = append(lines, "  interrupted recv (resume token present)")
+				lines = append(lines, "interrupted recv (resume token present)")
 			}
 			snaps := m.data.SnapsByReplica[d.Host+":"+d.Name]
-			lines = append(lines, "  snapshots: "+snapList(snaps, 6))
+			lines = append(lines, "snapshots: "+snapList(snaps, 6))
+			lines = append(lines, m.jobDetailLines(r)...)
 		}
 	}
 	return lines
@@ -880,14 +1001,10 @@ func (m *Model) hostDetails() []string {
 		}
 		when := h.LastRefresh.Format("2006-01-02 15:04:05")
 		if h.Reachable {
-			lines = append(lines, fmt.Sprintf("host %s — refreshed %s", host, when))
+			lines = append(lines, "refreshed "+when)
 		} else {
-			lines = append(lines, fmt.Sprintf("host %s — UNREACHABLE at last refresh (%s): %s",
-				host, when, h.LastError))
+			lines = append(lines, fmt.Sprintf("UNREACHABLE at last refresh (%s): %s", when, h.LastError))
 		}
-	}
-	if len(lines) == 0 {
-		lines = append(lines, "host "+host)
 	}
 	for _, h := range m.hosts {
 		if h.Name == host {
@@ -895,7 +1012,7 @@ func (m *Model) hostDetails() []string {
 			if h.NeedSudo() {
 				extra = "  (sudo)"
 			}
-			lines = append(lines, "  access "+h.URL()+extra)
+			lines = append(lines, "access "+h.URL()+extra)
 		}
 	}
 	for i := range m.data.States {
@@ -908,10 +1025,10 @@ func (m *Model) hostDetails() []string {
 			if p.Size > 0 {
 				pct = fmt.Sprintf(" (%d%%)", p.Alloc*100/p.Size)
 			}
-			lines = append(lines, fmt.Sprintf("  pool %-12s %-9s size %-8s alloc %s%s free %s",
+			lines = append(lines, fmt.Sprintf("pool %-12s %-9s size %-8s alloc %s%s free %s",
 				p.Name, p.Health, human(p.Size), human(p.Alloc), pct, human(p.Free)))
 		}
-		lines = append(lines, fmt.Sprintf("  %d dataset(s), %d snapshot(s) cached",
+		lines = append(lines, fmt.Sprintf("%d dataset(s), %d snapshot(s) cached",
 			len(hs.Datasets), len(hs.Snapshots)))
 	}
 	return lines
@@ -949,26 +1066,25 @@ func (m *Model) poolDetails() []string {
 		}
 	}
 	if p == nil {
-		return []string{fmt.Sprintf("pool %s:%s — not in cache", host, pool)}
+		return []string{"not in cache"}
 	}
 	usedPct := ""
 	if p.Size > 0 {
 		usedPct = fmt.Sprintf(" (%d%%)", p.Alloc*100/p.Size)
 	}
 	lines := []string{
-		fmt.Sprintf("pool %s:%s — %s", host, pool, p.Health),
-		fmt.Sprintf("  size %s  alloc %s%s  free %s  guid %s",
-			human(p.Size), human(p.Alloc), usedPct, human(p.Free), orDash(p.GUID)),
-		fmt.Sprintf("  %d dataset(s), %d snapshot(s) cached", nDatasets, nSnaps),
+		fmt.Sprintf("%-9s  size %s  alloc %s%s  free %s  guid %s",
+			p.Health, human(p.Size), human(p.Alloc), usedPct, human(p.Free), orDash(p.GUID)),
+		fmt.Sprintf("%d dataset(s), %d snapshot(s) cached", nDatasets, nSnaps),
 	}
 	for _, h := range m.data.Hosts {
 		if h.Name == host {
 			when := h.LastRefresh.Format("2006-01-02 15:04:05")
 			if !h.Reachable {
 				lines = append(lines, styleErr.Render(
-					fmt.Sprintf("  host unreachable at last refresh (%s): %s", when, h.LastError)))
+					fmt.Sprintf("host unreachable at last refresh (%s): %s", when, h.LastError)))
 			} else {
-				lines = append(lines, fmt.Sprintf("  host refreshed %s", when))
+				lines = append(lines, "host refreshed "+when)
 			}
 		}
 	}
@@ -1012,7 +1128,7 @@ func snapList(snaps []Snapshot, n int) string {
 }
 
 func (m *Model) footerView() string {
-	keys := "q quit · ? help · ←↓↑→ move · Tab focus · s snap · r/R refresh · h hidden"
+	keys := "q quit · ? help · ←↓↑→ move · Tab focus · s snap · y sync · r/R refresh · h hidden"
 	if m.dryRun {
 		keys = styleDiverged.Render("DRY-RUN") + " · " + keys
 	}
@@ -1046,7 +1162,9 @@ func (m *Model) helpView() string {
   ←↓↑→ / jk     move cursor (name column selects the whole group; ↑ past the
                  first row selects a pool, ↑ again a host — details follow)
   Tab            switch focus between Datasets and Details (jk/↑↓ scroll there)
-  s              snapshot the selected dataset (dialog: name, recursive, confirm)
+  s              snapshot the selected dataset (dialog: name, recursive)
+  y              sync: incrementally send the selected dataset to other
+                 replicas in its group (skips up-to-date and incompatible)
   g / G          first / last row
   r              refresh the selected cell's host (all hosts if on name column)
   R              refresh all hosts
@@ -1056,6 +1174,8 @@ func (m *Model) helpView() string {
   ?              close this help
 
 cell markers:  + unsnapshotted writes  ! diverged  ~ resumable  % clone
+cell colors:   white normal · green unsynced snapshots · orange unsnapshotted
+               writes (+) · red diverged · cyan resumable · dim clone
 column dim = host unreachable at last refresh
 
 (snapshot/sync/prune actions arrive in the next milestone)
@@ -1229,12 +1349,35 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("6")).
 			Padding(1, 3)
-	styleDialogTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
-	styleFieldLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	styleButton      = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("7"))
-	styleButtonFocus = lipgloss.NewStyle().Padding(0, 1).Reverse(true).Bold(true)
-	styleFocusMark   = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+	styleDialogBorder = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	styleDialogTitle  = lipgloss.NewStyle().Foreground(lipgloss.Color("7")) // plain white
+	styleFieldLabel   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleButton       = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("7"))
+	styleButtonFocus  = lipgloss.NewStyle().Padding(0, 1).Reverse(true).Bold(true)
+	styleFocusMark    = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
 )
+
+// dialogBox renders content in a rounded border with the title in the top
+// border line, window-style: ╭─ Title ────╮.
+func dialogBox(title, content string) string {
+	box := styleDialogBox.Render(content)
+	lines := strings.Split(box, "\n")
+	if title == "" || len(lines) == 0 {
+		return box
+	}
+	w := lipgloss.Width(lines[0])
+	maxTitle := w - 6
+	if lipgloss.Width(title) > maxTitle && maxTitle > 1 {
+		title = pad(title, maxTitle)
+	}
+	fill := w - 5 - lipgloss.Width(title)
+	if fill < 0 {
+		fill = 0
+	}
+	lines[0] = styleDialogBorder.Render("╭─ ") + styleDialogTitle.Render(title) +
+		styleDialogBorder.Render(" "+strings.Repeat("─", fill)+"╮")
+	return strings.Join(lines, "\n")
+}
 
 func button(label string, focused bool) string {
 	if focused {
@@ -1258,7 +1401,6 @@ func checkbox(label string, checked, focused bool) string {
 func (m *Model) dialogView() string {
 	d := m.dialog
 	var b strings.Builder
-	b.WriteString(styleDialogTitle.Render("Create snapshot") + "\n\n")
 	fmt.Fprintf(&b, "%s %s\n", styleFieldLabel.Render("host    "), d.host.Name+"  ("+d.host.URL()+")")
 	fmt.Fprintf(&b, "%s %s\n\n", styleFieldLabel.Render("dataset "), d.dataset)
 	mark := "  "
@@ -1281,7 +1423,7 @@ func (m *Model) dialogView() string {
 	b.WriteString("\n" + button(create, d.focus == formFocusOK) + "   " +
 		button("Cancel", d.focus == formFocusCancel) + "\n")
 	b.WriteString("\n" + styleDim.Render("Tab/↑↓ move · Space toggle · Enter ok · Esc cancel"))
-	return styleDialogBox.Render(b.String())
+	return dialogBox("Create snapshot", b.String())
 }
 
 func dryRunModal(spec jobSpec) *textModal {
@@ -1352,4 +1494,586 @@ func (m *Model) onSnapDone(msg snapDoneMsg) (tea.Model, tea.Cmd) {
 			msg.spec.ID, msg.host.Name), false
 	}
 	return m, nil
+}
+
+// --- sync dialog (Y) ---
+
+// syncDialog drives incremental replication from a source replica to one or
+// more group members. Destinations that need syncing are pre-checked;
+// up-to-date and incompatible ones are listed disabled, with the reason.
+type syncDialog struct {
+	src          *Replica
+	srcHost      Host
+	plans        []syncPlan
+	selectable   []int // indices into plans that can be (de)selected
+	checked      map[int]bool
+	custom       textinput.Model // free-form extra destinations (full send)
+	intermediate bool            // -I (default) vs -i
+	focus        int             // 0..len(selectable)-1, custom, intermediate, OK, Cancel
+	errMsg       string
+}
+
+func (d *syncDialog) focusCount() int { return len(d.selectable) + 4 }
+
+func (d *syncDialog) setFocus(f int) {
+	d.focus = f
+	if f == len(d.selectable) { // the custom editbox
+		d.custom.Focus()
+	} else {
+		d.custom.Blur()
+	}
+}
+
+func (m *Model) hostByName(name string) Host {
+	for _, h := range m.hosts {
+		if h.Name == name {
+			return h
+		}
+	}
+	return Host{Name: name}
+}
+
+// openSyncDialog picks the sync source from the cursor (cell replica, or the
+// group's sole ahead replica on the name column) and plans all destinations.
+func (m *Model) openSyncDialog() {
+	g, c := m.selected()
+	if m.curRow < 0 || g == nil {
+		m.status, m.statusErr = "select a dataset to sync from", true
+		return
+	}
+	var src *Replica
+	switch {
+	case c != nil && len(c.replicas) > 0:
+		src = c.replicas[0]
+	case m.curCol == 0:
+		var ahead []*Replica
+		for _, mem := range g.Members {
+			if mem.State == StateAhead {
+				ahead = append(ahead, mem)
+			}
+		}
+		if len(ahead) != 1 {
+			m.status, m.statusErr = "no single ahead replica — select the source cell explicitly", true
+			return
+		}
+		src = ahead[0]
+	default:
+		m.status, m.statusErr = "empty cell — nothing to sync from here", true
+		return
+	}
+	plans, err := planSync(src, g, m.data.SnapsByReplica)
+	if err != nil {
+		m.status, m.statusErr = err.Error(), true
+		return
+	}
+	in := textinput.New()
+	in.Prompt = ""
+	in.CharLimit = 256
+	in.Width = 44
+	in.Placeholder = "host:pool/dataset, comma-separated"
+	in.TextStyle = lipgloss.NewStyle().Underline(true)
+	d := &syncDialog{
+		src: src, srcHost: m.hostByName(src.Dataset.Host),
+		plans: plans, checked: map[int]bool{}, custom: in, intermediate: true,
+	}
+	for i, p := range plans {
+		if p.Selectable() {
+			d.selectable = append(d.selectable, i)
+			d.checked[i] = true // everything that needs syncing, on by default
+		}
+	}
+	if len(d.selectable) == 0 {
+		d.setFocus(len(d.selectable)) // nothing to check: focus the editbox
+	}
+	m.syncDlg = d
+}
+
+func (m *Model) updateSyncDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	d := m.syncDlg
+	n := len(d.selectable)
+	iCustom, iIntermediate, iOK, iCancel := n, n+1, n+2, n+3
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.syncDlg = nil
+		return m, nil
+	case "tab", "down":
+		d.setFocus((d.focus + 1) % d.focusCount())
+		return m, nil
+	case "shift+tab", "up":
+		d.setFocus((d.focus + d.focusCount() - 1) % d.focusCount())
+		return m, nil
+	case "enter":
+		if d.focus == iCancel {
+			m.syncDlg = nil
+			return m, nil
+		}
+		return m, m.submitSyncDialog()
+	}
+	if d.focus == iCustom {
+		// Everything else types into the editbox.
+		var cmd tea.Cmd
+		d.custom, cmd = d.custom.Update(msg)
+		return m, cmd
+	}
+	switch msg.String() {
+	case "j":
+		d.setFocus((d.focus + 1) % d.focusCount())
+	case "k":
+		d.setFocus((d.focus + d.focusCount() - 1) % d.focusCount())
+	case "left":
+		if d.focus == iCancel {
+			d.setFocus(iOK)
+		}
+	case "right":
+		if d.focus == iOK {
+			d.setFocus(iCancel)
+		}
+	case " ":
+		switch {
+		case d.focus < n:
+			pi := d.selectable[d.focus]
+			d.checked[pi] = !d.checked[pi]
+		case d.focus == iIntermediate:
+			d.intermediate = !d.intermediate
+		case d.focus == iOK:
+			return m, m.submitSyncDialog()
+		case d.focus == iCancel:
+			m.syncDlg = nil
+		}
+	}
+	return m, nil
+}
+
+// datasetExists reports whether host:dataset is present in the cache.
+func (m *Model) datasetExists(host, ds string) bool {
+	for i := range m.data.States {
+		if m.data.States[i].Host != host {
+			continue
+		}
+		for _, d := range m.data.States[i].Datasets {
+			if d.Name == ds {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// submitSyncDialog builds one job per checked destination and launches them
+// (or shows the dry-run details modal).
+func (m *Model) submitSyncDialog() tea.Cmd {
+	d := m.syncDlg
+	type launch struct {
+		spec  jobSpec
+		label string
+	}
+	var launches []launch
+	for _, pi := range d.selectable {
+		if !d.checked[pi] {
+			continue
+		}
+		p := d.plans[pi]
+		destHost := m.hostByName(p.Dest.Dataset.Host)
+		spec, err := syncJob(d.srcHost, destHost, d.src, p, d.intermediate)
+		if err != nil {
+			d.errMsg = err.Error()
+			return nil
+		}
+		launches = append(launches, launch{spec: spec, label: p.DestLabel()})
+	}
+	// Custom destinations from the editbox: full sends to new datasets.
+	for _, ent := range strings.Split(d.custom.Value(), ",") {
+		ent = strings.TrimSpace(ent)
+		if ent == "" {
+			continue
+		}
+		hostName, ds, ok := strings.Cut(ent, ":")
+		if !ok || hostName == "" || ds == "" {
+			d.errMsg = fmt.Sprintf("custom destination %q: want host:pool/dataset", ent)
+			return nil
+		}
+		if m.datasetExists(hostName, ds) {
+			d.errMsg = fmt.Sprintf("%s already exists — full send only targets new datasets", ent)
+			return nil
+		}
+		p, err := customDestPlan(d.src, m.data.SnapsByReplica, hostName, ds)
+		if err != nil {
+			d.errMsg = err.Error()
+			return nil
+		}
+		spec, err := syncJob(d.srcHost, m.hostByName(hostName), d.src, p, d.intermediate)
+		if err != nil {
+			d.errMsg = err.Error()
+			return nil
+		}
+		launches = append(launches, launch{spec: spec, label: ent + " (full send)"})
+	}
+	if len(launches) == 0 {
+		d.errMsg = "no destinations selected"
+		return nil
+	}
+	srcLabel := d.srcHost.Name + ":" + d.src.Dataset.Name
+	if m.dryRun {
+		lines := []string{"source: " + srcLabel, ""}
+		for _, l := range launches {
+			lines = append(lines,
+				"→ "+l.label+"   (job dir "+l.spec.Dir()+" on "+d.srcHost.Name+", launched with ssh -A)",
+				"")
+			for _, cl := range strings.Split(strings.TrimRight(l.spec.Command, "\n"), "\n") {
+				lines = append(lines, "    "+cl)
+			}
+			lines = append(lines, "")
+		}
+		lines = append(lines, "full job.sh of the first job:", "")
+		for _, cl := range strings.Split(strings.TrimRight(launches[0].spec.script(), "\n"), "\n") {
+			lines = append(lines, "  "+cl)
+		}
+		m.syncDlg = nil
+		m.modal = &textModal{title: "DRY RUN — nothing was executed", lines: lines}
+		m.status, m.statusErr = "[dry-run] nothing was executed", false
+		return nil
+	}
+	m.syncDlg = nil
+	m.refreshing = true
+	m.status, m.statusErr = fmt.Sprintf("syncing %s → %d destination(s)…", srcLabel, len(launches)), false
+	srcHost := d.srcHost
+	hostSet := map[string]Host{srcHost.Name: srcHost}
+	specs := make([]jobSpec, len(launches))
+	labels := make([]string, len(launches))
+	for i, l := range launches {
+		specs[i], labels[i] = l.spec, l.label
+		dh := m.hostByName(strings.SplitN(l.label, ":", 2)[0])
+		hostSet[dh.Name] = dh
+	}
+	var affected []Host
+	for _, h := range hostSet {
+		affected = append(affected, h)
+	}
+	return runSyncJobs(srcHost, specs, labels, affected)
+}
+
+type syncResult struct {
+	label, id, state, logTail string
+	command                   string
+	err                       error
+}
+
+type syncDoneMsg struct {
+	results  []syncResult
+	affected []Host
+}
+
+// runSyncJobs launches all jobs (agent forwarded for src→dest auth), then
+// polls briefly so fast failures surface immediately; long transfers keep
+// running detached.
+func runSyncJobs(srcHost Host, specs []jobSpec, labels []string, affected []Host) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		r := newSSH()
+		results := make([]syncResult, len(specs))
+		for i, spec := range specs {
+			results[i] = syncResult{label: labels[i], id: spec.ID, state: "running", command: spec.Command}
+			// -A forwards the agent; ControlPath=none forces a FRESH
+			// connection — a reused ControlMaster would silently drop -A.
+			if err := launchJob(ctx, r, srcHost, spec, "-A", "-o", "ControlPath=none"); err != nil {
+				results[i].err = err
+				results[i].state = "launch-failed"
+			}
+		}
+		deadline := time.Now().Add(12 * time.Second)
+		for i := range results {
+			if results[i].state != "running" {
+				continue
+			}
+			remain := time.Until(deadline)
+			if remain < 2*time.Second {
+				remain = 2 * time.Second
+			}
+			if st, logTail, err := waitJob(ctx, r, srcHost, results[i].id, remain); err == nil {
+				results[i].state, results[i].logTail = st, logTail
+			}
+		}
+		return syncDoneMsg{results: results, affected: affected}
+	}
+}
+
+func (m *Model) onSyncDone(msg syncDoneMsg) (tea.Model, tea.Cmd) {
+	m.refreshing = false
+	done, running, failed := 0, 0, 0
+	var failLines []string
+	for _, r := range msg.results {
+		switch r.state {
+		case "done":
+			done++
+		case "running":
+			running++
+		default:
+			failed++
+			failLines = append(failLines, "✗ "+r.label+" (job "+r.id+")")
+			if r.err != nil {
+				failLines = append(failLines, "    "+r.err.Error())
+			}
+			failLines = append(failLines, "  command:")
+			for _, cl := range strings.Split(strings.TrimRight(r.command, "\n"), "\n") {
+				failLines = append(failLines, "    "+cl)
+			}
+			failLines = append(failLines, "  log:")
+			for _, l := range strings.Split(strings.TrimRight(r.logTail, "\n"), "\n") {
+				if l != "" {
+					failLines = append(failLines, "    "+l)
+				}
+			}
+			failLines = append(failLines, "")
+		}
+	}
+	parts := []string{}
+	if done > 0 {
+		parts = append(parts, fmt.Sprintf("%d done", done))
+	}
+	if running > 0 {
+		parts = append(parts, fmt.Sprintf("%d still running (will show on refresh)", running))
+	}
+	if failed > 0 {
+		parts = append(parts, fmt.Sprintf("%d FAILED", failed))
+	}
+	m.status = "sync: " + strings.Join(parts, ", ")
+	m.statusErr = failed > 0
+	if failed > 0 {
+		m.modal = &textModal{title: "sync job failures", lines: failLines}
+	}
+	if done > 0 || running > 0 {
+		m.refreshing = true
+		return m, m.refreshCmd(msg.affected)
+	}
+	return m, m.ensureTicker()
+}
+
+func (m *Model) syncDialogView() string {
+	d := m.syncDlg
+	var b strings.Builder
+	srcSnaps := m.data.SnapsByReplica[d.src.Dataset.Host+":"+d.src.Dataset.Name]
+	latest := ""
+	if len(srcSnaps) > 0 {
+		latest = "  @" + srcSnaps[len(srcSnaps)-1].Name
+	}
+	fmt.Fprintf(&b, "%s %s%s\n", styleFieldLabel.Render("source  "),
+		d.srcHost.Name+":"+d.src.Dataset.Name, latest)
+	if d.src.Dataset.Encrypted() {
+		b.WriteString(styleFieldLabel.Render("        ") + " encrypted — raw send (-w)\n")
+	}
+	b.WriteString("\n" + styleFieldLabel.Render("destinations:") + "\n")
+	sel := 0
+	for i, p := range d.plans {
+		if p.Selectable() {
+			focused := d.focus < len(d.selectable) && d.selectable[d.focus] == i
+			b.WriteString(checkbox(fmt.Sprintf("%-28s %s", p.DestLabel(), p.Reason),
+				d.checked[i], focused) + "\n")
+			sel++
+		} else {
+			reason := p.Reason
+			st := styleDim
+			if p.Kind == planIncompatible {
+				st = styleDim.Foreground(lipgloss.Color("1"))
+			}
+			b.WriteString("      " + st.Render(fmt.Sprintf("%-28s %s", p.DestLabel(), reason)) + "\n")
+		}
+	}
+	mark := "  "
+	if d.focus == len(d.selectable) {
+		mark = styleFocusMark.Render("› ")
+	}
+	b.WriteString("\n" + mark + styleFieldLabel.Render("new dest") + " " + d.custom.View() +
+		styleDim.Render("  (full send)") + "\n")
+	b.WriteString("\n" + checkbox("send intermediate snapshots (-I)", d.intermediate,
+		d.focus == len(d.selectable)+1) + "\n")
+	if d.errMsg != "" {
+		b.WriteString("\n" + styleErr.Render("⚠ "+d.errMsg) + "\n")
+	}
+	sync := "Sync"
+	if m.dryRun {
+		sync = "Sync (dry run)"
+	}
+	b.WriteString("\n" + button(sync, d.focus == len(d.selectable)+2) + "   " +
+		button("Cancel", d.focus == len(d.selectable)+3) + "\n")
+	b.WriteString("\n" + styleDim.Render("Tab/↑↓ move · Space toggle · Enter ok · Esc cancel"))
+	return dialogBox("Sync (incremental send)", b.String())
+}
+
+// --- live job progress (spinner + polling) ---
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+type tickMsg time.Time
+
+type jobsPollMsg struct {
+	host string
+	jobs []JobInfo
+	err  error
+}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(150*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+// runningJobHosts returns hosts that have running jobs (poll targets).
+func (m *Model) runningJobHosts() []string {
+	seen := map[string]bool{}
+	var hosts []string
+	for i := range m.data.States {
+		for _, j := range m.data.States[i].Jobs {
+			if j.State == "running" && !seen[j.Host] {
+				seen[j.Host] = true
+				hosts = append(hosts, j.Host)
+			}
+		}
+	}
+	return hosts
+}
+
+// ensureTicker starts the spinner/poll ticker when there is something live.
+func (m *Model) ensureTicker() tea.Cmd {
+	if m.ticking || len(m.runningJobHosts()) == 0 {
+		return nil
+	}
+	m.ticking = true
+	return tickCmd()
+}
+
+func (m *Model) onTick() (tea.Model, tea.Cmd) {
+	hosts := m.runningJobHosts()
+	if len(hosts) == 0 {
+		m.ticking = false
+		return m, nil
+	}
+	m.spin++
+	cmds := []tea.Cmd{tickCmd()}
+	if m.spin%20 == 0 { // every ~3s: poll job dirs on involved hosts
+		for _, hn := range hosts {
+			cmds = append(cmds, m.pollJobsCmd(m.hostByName(hn)))
+		}
+	}
+	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) pollJobsCmd(h Host) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		out, err := newSSH().Run(ctx, h, jobsProbe)
+		if err != nil {
+			return jobsPollMsg{host: h.Name, err: err}
+		}
+		return jobsPollMsg{host: h.Name, jobs: ParseJobs(h.Name, string(out))}
+	}
+}
+
+func (m *Model) onJobsPoll(msg jobsPollMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		return m, nil // transient; next refresh will tell the truth
+	}
+	finished := map[string]bool{} // hosts affected by jobs that just ended
+	for i := range m.data.States {
+		hs := &m.data.States[i]
+		if hs.Host != msg.host {
+			continue
+		}
+		was := map[string]string{}
+		for _, j := range hs.Jobs {
+			was[j.ID] = j.State
+		}
+		for _, j := range msg.jobs {
+			if was[j.ID] == "running" && j.State != "running" {
+				for _, k := range jobReplicaKeys(j) {
+					finished[strings.SplitN(k, ":", 2)[0]] = true
+				}
+				if j.State == "failed" {
+					m.status, m.statusErr = fmt.Sprintf("job %s FAILED on %s — see details / job log", j.ID, j.Host), true
+				}
+			}
+		}
+		hs.Jobs = msg.jobs
+	}
+	m.data.JobsByReplica = indexJobs(m.data.States)
+	if len(finished) > 0 {
+		var hosts []Host
+		for hn := range finished {
+			hosts = append(hosts, m.hostByName(hn))
+		}
+		m.refreshing = true
+		return m, m.refreshCmd(hosts)
+	}
+	return m, nil
+}
+
+// replicaKeyOf builds the jobs-index key for a replica.
+func replicaKeyOf(r *Replica) string {
+	return r.Dataset.Host + ":" + r.Dataset.Name
+}
+
+// runningJobFor returns a running job touching the replica, if any.
+func (m *Model) runningJobFor(r *Replica) *JobInfo {
+	for _, j := range m.data.JobsByReplica[replicaKeyOf(r)] {
+		if j.State == "running" {
+			return &j
+		}
+	}
+	return nil
+}
+
+// jobProgressLine renders "1.2G / 3.4G (35%)" as far as known.
+func jobProgressLine(j *JobInfo) string {
+	switch {
+	case j.Progress > 0 && j.Expected > 0:
+		pct := j.Progress * 100 / j.Expected
+		if pct > 100 {
+			pct = 100
+		}
+		return fmt.Sprintf("%s / %s (%d%%)", human(j.Progress), human(j.Expected), pct)
+	case j.Progress > 0:
+		return human(j.Progress) + " transferred"
+	case j.Expected > 0:
+		return "~" + human(j.Expected) + " to transfer"
+	default:
+		return "progress unknown (pv not installed on source?)"
+	}
+}
+
+// jobDetailLines renders recent jobs touching a replica for the details pane.
+func (m *Model) jobDetailLines(r *Replica) []string {
+	jobs := m.data.JobsByReplica[replicaKeyOf(r)]
+	var lines []string
+	shown := 0
+	for _, j := range jobs {
+		if shown >= 3 {
+			break
+		}
+		desc := j.Kind
+		if j.Kind == "sync" {
+			desc = j.Meta["src"] + " → " + j.Meta["dest"]
+			if j.Meta["full"] == "true" {
+				desc += " (full)"
+			}
+		} else if ds := j.Meta["dataset"]; ds != "" {
+			desc += " " + ds + "@" + j.Meta["snapshot"]
+		}
+		switch j.State {
+		case "running":
+			lines = append(lines, fmt.Sprintf("  %s job %s: %s — %s",
+				spinnerFrames[m.spin%len(spinnerFrames)], j.ID, desc, jobProgressLine(&j)))
+		case "failed":
+			lines = append(lines, styleErr.Render(fmt.Sprintf("  ✗ job %s: %s — FAILED (%s)", j.ID, desc, j.Status)))
+			for _, cl := range strings.Split(j.Meta["command"], "\n") {
+				if strings.Contains(cl, "zfs ") {
+					lines = append(lines, styleDim.Render("      "+strings.TrimSpace(cl)))
+				}
+			}
+		case "done":
+			lines = append(lines, styleDim.Render(fmt.Sprintf("  ✓ job %s: %s — done", j.ID, desc)))
+		default:
+			lines = append(lines, styleDim.Render(fmt.Sprintf("  ? job %s: %s — %s", j.ID, desc, j.State)))
+		}
+		shown++
+	}
+	return lines
 }

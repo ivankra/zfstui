@@ -15,7 +15,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -26,16 +25,28 @@ const jobDirPrefix = "/tmp/zfstui-job-"
 
 type jobSpec struct {
 	ID      string
-	Kind    string // "snapshot"; later "sync", "prune"
+	Kind    string // "snapshot", "sync"; later "prune"
 	Host    string
-	Command string // single mutation command; ALWAYS built by mutate.go
-	Meta    map[string]string
+	Command string // the mutation command/pipeline; zfs parts ALWAYS built by mutate.go
+	// WaitStart makes the launcher hold its (agent-forwarded) ssh session
+	// open until the job touches ./ssh-ok — i.e. until the job's own ssh
+	// ControlMaster to the destination has authenticated (see syncJob).
+	WaitStart bool
+	Meta      map[string]string
 }
 
+const jobIDAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// newJobID: 6 random base62 chars. Time ordering comes from meta.json's
+// "created" field, not the ID.
 func newJobID() string {
-	var b [2]byte
+	var b [6]byte
 	rand.Read(b[:])
-	return time.Now().UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
+	out := make([]byte, len(b))
+	for i, v := range b {
+		out[i] = jobIDAlphabet[int(v)%len(jobIDAlphabet)]
+	}
+	return string(out)
 }
 
 func (j jobSpec) Dir() string { return jobDirPrefix + j.ID }
@@ -60,7 +71,7 @@ func (j jobSpec) metaJSON() string {
 func (j jobSpec) script() string {
 	return fmt.Sprintf(`#!/usr/bin/env bash
 # zfstui job %s (%s) — generated; safe to delete when not running
-set -u
+set -u -o pipefail
 cd "$(dirname "$0")" || exit 1
 cat > meta.json <<'ZFSTUI_META'
 %s
@@ -78,17 +89,25 @@ exit "$rc"
 }
 
 // bootstrap is the remote command that receives job.sh on stdin and detaches
-// it. Prints "launched <dir>" so the caller can verify.
+// it. Prints "launched <dir>" so the caller can verify. With WaitStart it
+// keeps the session open (up to 60s) until the job signals ssh-ok or ends —
+// the window in which the forwarded agent must be available.
 func (j jobSpec) bootstrap() string {
 	d := j.Dir()
-	return fmt.Sprintf(
-		`d=%s && mkdir -m 0700 "$d" && cat > "$d/job.sh" && { setsid bash "$d/job.sh" </dev/null >/dev/null 2>&1 & } && echo "launched $d"`,
-		d)
+	b := fmt.Sprintf(
+		`d=%s && mkdir -m 0700 "$d" && cat > "$d/job.sh" && { setsid bash "$d/job.sh" </dev/null >/dev/null 2>&1 & } || exit 70
+`, d)
+	if j.WaitStart {
+		b += `i=0; while [ $i -lt 60 ]; do [ -e "$d/ssh-ok" ] && break; case "$(cat "$d/status" 2>/dev/null)" in done*|failed*) break;; esac; sleep 1; i=$((i+1)); done
+`
+	}
+	return b + `echo "launched $d"`
 }
 
-// launchJob starts the job on the host and returns once it is detached.
-func launchJob(ctx context.Context, r Runner, h Host, j jobSpec) error {
-	out, err := r.RunInput(ctx, h, j.bootstrap(), []byte(j.script()))
+// launchJob starts the job on the host and returns once it is detached
+// (sshExtra: e.g. "-A" to forward the agent for sync jobs).
+func launchJob(ctx context.Context, r Runner, h Host, j jobSpec, sshExtra ...string) error {
+	out, err := r.RunInput(ctx, h, j.bootstrap(), []byte(j.script()), sshExtra...)
 	if err != nil {
 		return fmt.Errorf("launch job %s on %s: %w", j.ID, h.Name, err)
 	}
