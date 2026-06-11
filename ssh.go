@@ -25,7 +25,7 @@ type SSH struct {
 	ConnectTimeoutSec int
 }
 
-func NewSSH() *SSH {
+func newSSH() *SSH {
 	dir := ""
 	home, err := os.UserHomeDir()
 	if err == nil {
@@ -54,7 +54,6 @@ func (s *SSH) Args(host Host, extra []string, cmd string) []string {
 	if host.Port != 0 {
 		args = append(args, "-p", strconv.Itoa(host.Port))
 	}
-	args = append(args, host.SSHOpts...)
 	args = append(args, extra...)
 	args = append(args, host.Dest(), cmd)
 	return args

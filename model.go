@@ -1,31 +1,76 @@
-// Package model holds the inventory data structures shared by all layers:
-// what exists on the hosts (pools, datasets, snapshots) and what we derive
-// from it (replication groups, per-replica states).
+// Inventory data structures shared by all layers: what exists on the hosts
+// (pools, datasets, snapshots) and what we derive from it (replication
+// groups, per-replica states).
 package main
 
-// Host is one entry from the inventory config.
+import "strconv"
+
+// Host is one known host. Name (the hostname) is the sole identity — db key,
+// column label, dedup key. Everything else is access specification, parsed
+// from ssh/scp-style URLs (see parseHostSpec) and remembered in sqlite.
+// Aliasing/jump hosts are ~/.ssh/config's job, not ours.
 type Host struct {
-	Name string // inventory key, also the default ssh destination
-	Addr string // optional override for the ssh destination
+	Name string // hostname: THE identity
+	User string // ssh user; empty means root
 	Port int    // optional
-	User string // optional ssh user
-	Sudo bool   // wrap zfs/zpool in sudo
+	Pool string // optional pool restriction from the URL path (informational for now)
 	// Separate sudo-capable users for send/recv sides; empty means User.
 	SendUser string
 	RecvUser string
-	SSHOpts  []string // extra raw ssh options
 }
 
-// Dest returns the ssh destination ([user@]addr) for the host.
+// NeedSudo: ssh-ing as root needs no sudo; any other user does.
+func (h Host) NeedSudo() bool { return h.EffUser() != "root" }
+
+// EffUser is the ssh user with the root default applied.
+func (h Host) EffUser() string {
+	if h.User == "" {
+		return "root"
+	}
+	return h.User
+}
+
+// Dest returns the ssh destination (user@host).
 func (h Host) Dest() string {
-	addr := h.Addr
-	if addr == "" {
-		addr = h.Name
+	return h.EffUser() + "@" + h.Name
+}
+
+// URL reassembles the access spec for display: the short scp form
+// (user@host[:pool]) when possible, the ssh:// form when port or extra
+// options are involved.
+func (h Host) URL() string {
+	var opts []string
+	if h.SendUser != "" {
+		opts = append(opts, "send_user="+h.SendUser)
 	}
-	if h.User != "" {
-		return h.User + "@" + addr
+	if h.RecvUser != "" {
+		opts = append(opts, "recv_user="+h.RecvUser)
 	}
-	return addr
+	if h.Port == 0 && len(opts) == 0 {
+		s := h.EffUser() + "@" + h.Name
+		if h.Pool != "" {
+			s += ":" + h.Pool
+		}
+		return s
+	}
+	s := "ssh://" + h.EffUser()
+	for _, o := range opts {
+		s += ";" + o
+	}
+	s += "@" + h.Name
+	if h.Port != 0 {
+		s += ":" + strconv.Itoa(h.Port)
+	}
+	if h.Pool != "" {
+		s += "/" + h.Pool
+	}
+	return s
+}
+
+// SameAccess reports whether two specs for the same host agree.
+func (h Host) SameAccess(o Host) bool {
+	return h.EffUser() == o.EffUser() && h.Port == o.Port && h.Pool == o.Pool &&
+		h.SendUser == o.SendUser && h.RecvUser == o.RecvUser
 }
 
 // Pool is one zpool on a host.

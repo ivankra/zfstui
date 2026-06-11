@@ -74,7 +74,7 @@ func TestRefreshAndStatusEndToEnd(t *testing.T) {
 		t.Fatalf("failed hosts: %v", failed)
 	}
 
-	data, err := loadData(st)
+	data, err := loadData(st, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,18 +10,27 @@ then M4 jobs/actions). README.md has the original wishes + status.
 ```
 go build -o zfstui . && go vet ./... && go test ./...   # all must stay green
 gofmt -l .                                              # must print nothing
-./zfstui -hosts root@ws,root@cml refresh                # real ssh discovery (read-only on hosts)
-./zfstui status [-a]                                    # matrix from cache
-./zfstui                                                # TUI
+./zfstui refresh root@ws ivan@cml                       # real ssh discovery (read-only on hosts)
+./zfstui status [-a] [host...]                          # matrix from cache
+./zfstui [host-spec...]                                 # TUI
 ```
 
-Dev-mode defaults (deliberate, revert to XDG before release): config
-`./zfstui.toml`, sqlite cache `./zfstui.db` — both cwd-relative so the user
-can run and the agent can inspect the same files. `zfstui.db` is a pure,
-fully-rebuildable cache; `rm` it freely (it keeps rows for hosts no longer in
-the inventory — that's a known wart, see "forget" idea in chat history).
-The user's real fleet db may be present in cwd — `./zfstui status` works
-offline from it; never needs ssh.
+Host model (2026-06-11, "never again" bug class): the **hostname is the sole
+identity** — `root@ws` and `ws` are the same host. Specs are positional args
+(`host`, `user@host[:pool]`, `ssh://user;send_user=x;recv_user=y@host[:port]
+[/pool]` — chrome-style `;opt=value` userinfo options). Parsed/normalized
+access fields are remembered in the sqlite hosts table and replaced wholesale
+by new specs; no specs → use remembered hosts; specs → limit to them.
+Conflicting specs for one host in one invocation → error. Default user is
+root; **non-root user implies sudo** (no sudo option exists). There is **no
+config file** (TOML inventory was dropped 2026-06-11). The pool path part is
+parsed/stored/displayed, not yet enforced.
+
+Dev-mode default (deliberate, revert to XDG before release): sqlite cache
+`./zfstui.db`, cwd-relative so the user can run and the agent can inspect the
+same file. It is disposable (cache + remembered hosts); a schemaVersion bump
+in store.go wipes and recreates it — no migrations, ever. The user's real
+fleet db may be present in cwd; `./zfstui status` works offline from it.
 
 ## Hard rules (data safety — the project's #1 constraint)
 
@@ -34,8 +43,12 @@ Everything implemented so far is read-only (`zpool list`/`zfs list`).
 
 ## Code map (flat package main, one dir — user explicitly wants no subdirs)
 
-- `model.go` — types: Host, Pool, Dataset, Snapshot, HostState (per-host raw
+- `model.go` — types: Host (identity=Name + access spec; EffUser/NeedSudo/
+  Dest/URL helpers), Pool, Dataset, Snapshot, HostState (per-host raw
   inventory), Replica/Group (derived). No logic beyond tiny helpers.
+- `hostspec.go` — parseHostSpec/parseHostSpecs (ssh/scp URL forms, conflict
+  rejection, root-user normalization to "") and resolveHosts (specs → sqlite
+  memory; specs limit + replace stored access).
 - `zfsparse.go` — parsers for `-H -p` tab-separated output ("-" = absent) +
   `DiscoverCommand` (one ssh round-trip: three sections with `===ZFSTUI:*===`
   markers and per-section exit codes) + `ParseDiscovery` splitter.
@@ -72,10 +85,10 @@ Everything implemented so far is read-only (`zpool list`/`zfs list`).
   (Tab toggles; Details scrolls via `detOff`). `h` toggles hidden groups —
   NOT vim-left (user decision). Refresh runs as tea.Cmd, results via
   `refreshDoneMsg`.
-- `main.go` — flag parsing (global flags BEFORE command), command dispatch.
-  `status` must never require config/inventory; only ssh-ing commands load it.
-  Inline `-hosts user@host` → User=user, Name=host (name is identity/column
-  label; user is access-only and never displayed).
+- `main.go` — flag parsing (global flags BEFORE command), command dispatch;
+  first positional arg is the command iff it matches one, the rest are host
+  specs. `status` works from cache alone; the TUI resolves hosts from sqlite
+  so refresh always works (no "refresh disabled" states).
 
 ## Conventions & user preferences (learned, don't regress)
 
@@ -83,9 +96,10 @@ Everything implemented so far is read-only (`zpool list`/`zfs list`).
   display-related is derived from data.
 - Keep deps minimal; parse zfs output by hand; stdlib `flag`, no cobra.
 - Minimal cell markers; no master indicator; usernames not shown in table.
-- Tests: table-driven pure-function tests (see derive_test.go `fx` builder),
-  fixture text for parsers, fakeRunner for end-to-end (main_test.go). New
-  derive/planner logic must come with scenario tests.
+- Tests: table-driven pure-function tests (see derive_test.go `fx` builder,
+  hostspec_test.go for spec parsing/resolution), fixture text for parsers,
+  fakeRunner for end-to-end (main_test.go). New derive/planner logic must
+  come with scenario tests.
 - TUI can't be keyboard-tested here: pty via `script` renders one frame but
   key delivery is unreliable — verify render with
   `timeout 6 script -qec "stty rows 32 cols 120; ./zfstui" /dev/null >/tmp/t.txt`
@@ -95,9 +109,8 @@ Everything implemented so far is read-only (`zpool list`/`zfs list`).
 
 ## Known warts / next steps
 
-- Hosts table keeps stale entries (e.g. old `root@ws` names) until db wiped.
-- `status` column headers come from cached host names; user must re-refresh
-  after the user@host change to see clean names.
+- Hosts table keeps entries for hosts you stop using (and `status <typo>`
+  remembers the typo) until the db is wiped — a `forget` command may come.
 - Real-data oddity to remember: `packages` appears as two unrelated groups
   (no shared snapshot GUIDs) — correct but user may ask about re-linking
   (needs full resend; relevant for M2 messaging).

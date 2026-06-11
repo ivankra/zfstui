@@ -103,20 +103,21 @@ hackability of the tool by its user beats marginal library preferences.
 - TUI: `bubbletea` + `lipgloss` (+ `bubbles` for table/inputs where they fit).
 - sqlite: `modernc.org/sqlite` (pure Go — keeps cross-compilation and the
   single-static-binary story trivial; no cgo).
-- Config: `BurntSushi/toml`. CLI: stdlib `flag` with manual subcommand
-  dispatch — no cobra; the command surface is small.
+- CLI: stdlib `flag` with manual subcommand dispatch — no cobra; the
+  command surface is small. No config file at all (see Hosts & access).
 - Concurrency: goroutines + `errgroup` for the per-host refresh fan-out, which
   is the one genuinely concurrent part and where Go shines.
 - All `zfs`/`zpool` output parsed by hand from `-H -p` tab-separated output per
   the no-unnecessary-deps preference. Full dep list stays around: bubbletea,
-  lipgloss, modernc.org/sqlite, toml, x/sync.
+  lipgloss, modernc.org/sqlite, x/sync.
 
 ### SSH: shell out to the system `ssh` binary
 
 No ssh library. We exec `ssh [opts] host cmd`, which gives us the user's
 `~/.ssh/config`, agent, ProxyJump, ControlMaster multiplexing (we'll set up a
-ControlMaster per host for refresh speed) for free. Per-host config can add
-`user`, `addr`, `port`, extra options. Agent forwarding (`ssh -A`) is used when
+ControlMaster per host for refresh speed) for free. User/port come from the
+host's access spec; aliasing and jump hosts are `~/.ssh/config`'s job.
+Agent forwarding (`ssh -A`) is used when
 launching a job on the source host so it can open src→dest connections without
 provisioned keys; an established connection survives the agent going away
 (agent is only needed at handshake), so jobs keep running after the laptop
@@ -238,10 +239,10 @@ pruning here is interactive/explicit, not a daemon).
 - Batch: `zfstui prune <group> --keep-last N [--on host] [--dry-run]` with the
   same invariants; `--dry-run` prints the would-be destroy list.
 
-sudo: per-host `sudo = true|false` and optional separate send/recv users
-(`send_user`, `recv_user`) since those can differ per host. Commands get
-wrapped `sudo zfs ...` as configured. (`zfs allow` delegation is a documented
-alternative for avoiding sudo.)
+sudo is implied by the access user: ssh-ing as root runs commands plainly,
+any other user gets `sudo -n` wrapping — no separate option. Separate
+send/recv users (`send_user`, `recv_user` URL options) exist since those can
+differ per host. (`zfs allow` delegation is a documented alternative.)
 
 ## Remote job protocol (the keystone)
 
@@ -317,9 +318,9 @@ no-color terminals.
 ## CLI (batch mode)
 
 ```
-zfstui                                  # TUI
-zfstui refresh [--hosts a,b]            # update cache
-zfstui status [group...]                # the table, printed plain (cron-able)
+zfstui [host-spec...]                   # TUI (specs limit + override access)
+zfstui refresh [host-spec...]           # update cache
+zfstui status [host-spec...]            # the table, printed plain (cron-able)
 zfstui snap <group|dataset> [--name N] [-r]
 zfstui sync  <group|--all> [--to host[:pool]...] [--from host] [--engine raw|syncoid]
              [--dry-run] [--detach|--wait]
@@ -331,24 +332,33 @@ zfstui doctor                           # per-host tool/sudo/ssh sanity checks
 `sync --all --dry-run` is the confidence-building command: it prints every
 send|recv it *would* run, computed from a fresh refresh.
 
-## Config (TOML)
+## Hosts & access specs (no config file)
 
-```toml
-# ~/.config/zfstui/config.toml — hostnames are the only required content
-[defaults]
-engine = "auto"            # auto | raw | syncoid
+The **hostname is the sole host identity** — db key, table column, dedup key.
+`root@ws` and `ws` are the same host. Everything else is *access spec*:
 
-[hosts.dev1]
-[hosts.dev2]
-user = "ivan"
-sudo = true
-[hosts.hetzner]
-addr = "h1.example.com"
-recv_user = "zfsrecv"
+```
+host                                          # root@host implied
+[user@]host[:pool]                            # scp-style; path = zfs pool
+ssh://[user[;opt=val...]@]host[:port][/pool]  # chrome-style userinfo options
 ```
 
-`--hosts dev1,dev2` on the command line *adds to / filters* the configured
-inventory (ansible-ish); with no config file at all it *is* the inventory.
+Recognized options: `send_user=NAME`, `recv_user=NAME`. sudo is implied:
+non-root access user ⇒ `sudo -n`. The pool path component is parsed/stored/
+displayed but not yet enforced as a filter.
+
+There is **no inventory/config file**. Hosts are given as positional CLI
+args and remembered (parsed/normalized fields, not raw URLs) in the sqlite
+hosts table:
+
+- no positional specs → use all remembered hosts;
+- specs given → the command is *limited* to those hosts, and each spec
+  *replaces* the host's stored access spec wholesale;
+- two different access specs for the same host in one invocation → error;
+- the details pane reassembles the stored fields back into a display URL.
+
+The sqlite db is disposable: cache + remembered hosts, never critical (a
+schema-version bump simply drops and recreates it).
 
 ## Testing strategy
 
@@ -375,7 +385,7 @@ map and the invariants worth knowing before touching code live in
 [CLAUDE.md](CLAUDE.md); the short version of the data flow:
 
 ```
-refresh:  config → ssh (DiscoverCommand, 1 round-trip/host, errgroup×8)
+refresh:  host specs/sqlite → ssh (DiscoverCommand, 1 round-trip/host, errgroup×8)
             → ParseDiscovery → store.PutHostState (atomic per host)
 view:     store → loadData → Groups (union-find by snapshot GUID; display
             names; pairwise ahead/behind/diverged; hidden rule)
@@ -452,5 +462,13 @@ TUI is manual for now.
 - 2026-06-10: **boring prefix trimming** — display names drop leading
   components whose ancestor dataset is snapshot-less plumbing; the prefix
   moves into the cell. Convention-free `bak/`/`srv/` cleanup.
+- 2026-06-11: **hostname = identity; access is separate** — `root@ws` and
+  `ws` are the same host. Specs are positional CLI args (`-hosts` flag and
+  the whole TOML config file are gone); ssh/scp URL forms incl. chrome-style
+  `;opt=value` options for send/recv users; specs are remembered in sqlite
+  (normalized fields) and replaced wholesale by new specs; conflicting specs
+  in one invocation are rejected; root is the default user.
+- 2026-06-11: **sudo is implied** — root access user ⇒ no sudo, non-root ⇒
+  `sudo -n`. No sudo option anywhere.
 - Name: `zfstui`. Jobs dir: `~/.local/state/zfstui/jobs` (default; works
   non-root).

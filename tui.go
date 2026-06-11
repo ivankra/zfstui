@@ -60,8 +60,8 @@ func (c cell) text() string {
 }
 
 type Model struct {
-	st  *Store
-	cfg *Config // nil => refresh disabled (no inventory)
+	st    *Store
+	hosts []Host // the active inventory (resolved from cli specs / sqlite)
 
 	data    *Data
 	cols    []string             // "host:pool"
@@ -84,15 +84,12 @@ type Model struct {
 	statusErr  bool
 }
 
-func New(st *Store, cfg *Config) (*Model, error) {
-	m := &Model{st: st, cfg: cfg}
+func New(st *Store, hosts []Host) (*Model, error) {
+	m := &Model{st: st, hosts: hosts}
 	if err := m.reload(); err != nil {
 		return nil, err
 	}
 	if len(m.data.States) == 0 {
-		if cfg == nil {
-			return nil, fmt.Errorf("cache is empty and no inventory configured — run `zfstui refresh` first")
-		}
 		m.status = "cache is empty — press R to refresh"
 	}
 	return m, nil
@@ -100,7 +97,7 @@ func New(st *Store, cfg *Config) (*Model, error) {
 
 // reload re-derives everything from the cache, preserving cursor best-effort.
 func (m *Model) reload() error {
-	data, err := loadData(m.st)
+	data, err := loadData(m.st, hostNames(m.hosts))
 	if err != nil {
 		return err
 	}
@@ -246,7 +243,7 @@ func (m *Model) refreshCmd(hosts []Host) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		results := Refresh(ctx, NewSSH(), m.st, hosts)
+		results := Refresh(ctx, newSSH(), m.st, hosts)
 		return refreshDoneMsg{results: results}
 	}
 }
@@ -358,18 +355,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // startRefresh kicks off discovery for the selected host (all=false) or all hosts.
 func (m *Model) startRefresh(all bool) (tea.Model, tea.Cmd) {
-	if m.cfg == nil {
-		m.status, m.statusErr = "refresh disabled: no inventory (config file or -hosts)", true
-		return m, nil
-	}
 	if m.refreshing {
 		m.status = "refresh already running"
 		return m, nil
 	}
-	hosts := m.cfg.Hosts
+	hosts := m.hosts
 	if !all && m.curCol > 0 && m.curCol <= len(m.cols) {
 		hostName := strings.SplitN(m.cols[m.curCol-1], ":", 2)[0]
-		for _, h := range m.cfg.Hosts {
+		for _, h := range m.hosts {
 			if h.Name == hostName {
 				hosts = []Host{h}
 				break
@@ -736,15 +729,13 @@ func (m *Model) hostDetails() []string {
 	if len(lines) == 0 {
 		lines = append(lines, "host "+host)
 	}
-	if m.cfg != nil {
-		for _, h := range m.cfg.Hosts {
-			if h.Name == host {
-				extra := ""
-				if h.Sudo {
-					extra = "  (sudo)"
-				}
-				lines = append(lines, "  ssh "+h.Dest()+extra)
+	for _, h := range m.hosts {
+		if h.Name == host {
+			extra := ""
+			if h.NeedSudo() {
+				extra = "  (sudo)"
 			}
+			lines = append(lines, "  access "+h.URL()+extra)
 		}
 	}
 	for i := range m.data.States {
@@ -909,9 +900,18 @@ press any key to close`
 	return help
 }
 
+// hostNames extracts the identity names of the active hosts.
+func hostNames(hosts []Host) []string {
+	names := make([]string, len(hosts))
+	for i, h := range hosts {
+		names[i] = h.Name
+	}
+	return names
+}
+
 // Run starts the TUI.
-func runTUI(st *Store, cfg *Config) error {
-	m, err := New(st, cfg)
+func runTUI(st *Store, hosts []Host) error {
+	m, err := New(st, hosts)
 	if err != nil {
 		return err
 	}

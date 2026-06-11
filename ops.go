@@ -31,7 +31,11 @@ func Refresh(ctx context.Context, r Runner, st *Store, hosts []Host) []RefreshRe
 }
 
 func refreshHost(ctx context.Context, r Runner, st *Store, h Host) error {
-	out, err := r.Run(ctx, h, DiscoverCommand(h.Sudo))
+	// Remember the access spec used, so a bare `zfstui` works next time.
+	if err := st.UpsertHostAccess(h); err != nil {
+		return err
+	}
+	out, err := r.Run(ctx, h, DiscoverCommand(h.NeedSudo()))
 	if err == nil {
 		var hs HostState
 		if hs, err = ParseDiscovery(h.Name, string(out)); err == nil {
@@ -53,17 +57,38 @@ type Data struct {
 	SnapsByReplica map[string][]Snapshot
 }
 
-// Load reads the cache and derives groups.
-func loadData(st *Store) (*Data, error) {
+// loadData reads the cache and derives groups. A non-empty `only` list
+// limits the view to those hostnames (cached data for others is ignored).
+func loadData(st *Store, only []string) (*Data, error) {
 	states, err := st.AllHostStates()
 	if err != nil {
 		return nil, err
 	}
-	groups := Groups(states)
 	hosts, err := st.Hosts()
 	if err != nil {
 		return nil, err
 	}
+	if len(only) > 0 {
+		want := map[string]bool{}
+		for _, n := range only {
+			want[n] = true
+		}
+		var fs []HostState
+		for _, hs := range states {
+			if want[hs.Host] {
+				fs = append(fs, hs)
+			}
+		}
+		states = fs
+		var fh []HostInfo
+		for _, h := range hosts {
+			if want[h.Name] {
+				fh = append(fh, h)
+			}
+		}
+		hosts = fh
+	}
+	groups := Groups(states)
 	snaps := map[string][]Snapshot{}
 	for _, hs := range states {
 		for _, s := range hs.Snapshots {

@@ -16,9 +16,20 @@ type Store struct {
 	db *sql.DB
 }
 
+// Bump whenever the schema changes: the db is a disposable cache, so on
+// mismatch we just drop everything and start over (no migrations).
+const schemaVersion = 2
+
 const schema = `
 CREATE TABLE IF NOT EXISTS hosts (
-  name TEXT PRIMARY KEY,
+  name TEXT PRIMARY KEY,                    -- hostname: the identity
+  -- access spec (latest one given; replaced wholesale by new CLI specs)
+  user TEXT NOT NULL DEFAULT '',            -- '' = root
+  port INTEGER NOT NULL DEFAULT 0,
+  pool TEXT NOT NULL DEFAULT '',
+  send_user TEXT NOT NULL DEFAULT '',
+  recv_user TEXT NOT NULL DEFAULT '',
+  -- refresh metadata
   last_refresh INTEGER NOT NULL DEFAULT 0,  -- unix seconds; 0 = never
   reachable INTEGER NOT NULL DEFAULT 0,
   last_error TEXT NOT NULL DEFAULT ''
@@ -61,6 +72,24 @@ func openStore(path string) (*Store, error) {
 	// One connection: serializes concurrent refresh writers (no SQLITE_BUSY)
 	// and keeps ":memory:" meaning one database rather than one per pool conn.
 	db.SetMaxOpenConns(1)
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if version != schemaVersion {
+		// Stale or fresh db: it's a disposable cache, recreate from scratch.
+		for _, t := range []string{"hosts", "pools", "datasets", "snapshots", "hidden_overrides"} {
+			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
+				db.Close()
+				return nil, err
+			}
+		}
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
@@ -69,6 +98,35 @@ func openStore(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// UpsertHostAccess remembers (or replaces) a host's access spec, leaving
+// refresh metadata alone.
+func (s *Store) UpsertHostAccess(h Host) error {
+	_, err := s.db.Exec(
+		`INSERT INTO hosts (name, user, port, pool, send_user, recv_user) VALUES (?,?,?,?,?,?)
+		 ON CONFLICT(name) DO UPDATE SET user=excluded.user, port=excluded.port,
+		   pool=excluded.pool, send_user=excluded.send_user, recv_user=excluded.recv_user`,
+		h.Name, h.User, h.Port, h.Pool, h.SendUser, h.RecvUser)
+	return err
+}
+
+// StoredHosts returns the remembered inventory with access specs.
+func (s *Store) StoredHosts() ([]Host, error) {
+	rows, err := s.db.Query(`SELECT name, user, port, pool, send_user, recv_user FROM hosts ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Host
+	for rows.Next() {
+		var h Host
+		if err := rows.Scan(&h.Name, &h.User, &h.Port, &h.Pool, &h.SendUser, &h.RecvUser); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
 
 // PutHostState replaces all cached inventory for one host atomically.
 func (s *Store) PutHostState(st HostState) error {
@@ -225,3 +283,6 @@ func (s *Store) AllHostStates() ([]HostState, error) {
 	}
 	return out, nil
 }
+
+// Dev-mode default (cwd-relative for easy inspection; XDG before release).
+func defaultDBPath() string { return "zfstui.db" }

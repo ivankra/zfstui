@@ -1,6 +1,6 @@
 # zfstui
 
-## Status (2026-06-10)
+## Status (2026-06-11)
 
 **M1 (discovery + status) and M3 (read-only TUI) are done.** Next: M2 sync
 planner (`sync --dry-run` + compatibility gate), then M4 actions/jobs.
@@ -20,9 +20,12 @@ planner (`sync --dry-run` + compatibility gate), then M4 actions/jobs.
   details pane (Tab to focus/scroll), async refresh (`r` host / `R` all),
   `h` toggles hidden groups, `?` help.
 
-Try: `go build && ./zfstui -hosts host1,host2 refresh && ./zfstui`
-(or put hosts in `./zfstui.toml`; config/db default to cwd during
-development).
+Try: `go build && ./zfstui refresh root@host1 user@host2 && ./zfstui`.
+Hosts are positional specs (`host`, `user@host[:pool]`, or
+`ssh://user;send_user=x;recv_user=y@host[:port][/pool]`); the hostname is the
+identity, access info is remembered in the sqlite cache (`./zfstui.db` in cwd
+during development; disposable), so after the first run a bare `./zfstui`
+works. No config file. Non-root access user implies sudo.
 
 Docs: [DESIGN.md](DESIGN.md) — architecture, decisions log, roadmap,
 implementation notes; [CLAUDE.md](CLAUDE.md) — code map and conventions for
@@ -91,6 +94,16 @@ Wishlist/preferences/thoughts below.
   * normally, just hostname is the single critical piece of info for each host i think, we can probably zeroconfig everything from it right? but sometimes i may need to tweak stuff, like username and ssh key
   * also allow no-config-file by taking inventory from command line flag (like ansible?). database unclear - either ephemeral or the default one but with subset of hosts and add any missing i.e. inline inventory could add, rather than replace hosts?
   * maybe ansible-style investory and vars? then the very basic config could be just `[hosts]` sections and list of hostnames, very simple
+  * UPDATE (2026-06-11), superseding the above — host model notes:
+    * hostname is the *primary identifier* of a host; `root@ws` and `ws` are the same host (we had a bug where they weren't - never again!)
+    * things like `root@ws` or ssh/scp urls are *access specification*; extract the hostname out of them and key everything on it
+    * default to `root@` when no username given; non-root username implies sudo (no separate sudo option needed)
+    * no inventory/config file and no `-hosts` flag: hosts are positional args, e.g. `zfstui localhost user@dev1 user2@server`
+    * no positional args -> take hosts from sqlite (it remembers hosts i'm working with); positional args *limit* the run to those hosts and their access spec *overrides/replaces* what's stored
+    * reject if one invocation gives multiple different access urls for the same host (e.g. `root@ws user@ws`)
+    * support `ssh://[user[;option=value]@]host[:port][/path]` (chrome-style options carry extra params like send/recv users) and scp-style `[user@]host[:path]`; the path component refers to a zfs pool (for now)
+    * sqlite stores parsed/normalized fields (not raw urls); details window reassembles them into a url for display
+    * sqlite db is mostly disposable: cache + remembered hosts, never critical to keep
 * some hosts may be unreachable, ping when refreshing
 * synchronization:
   * i'm ok with using syncoid/sanoid as the lower-level synchronization tool or just raw ssh + bash or both options (sync dialog or config or flag could specify preference, maybe default to autodetecting syncoid/sanoid)

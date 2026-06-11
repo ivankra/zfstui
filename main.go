@@ -9,37 +9,42 @@ import (
 	"time"
 )
 
-const usage = `usage: zfstui [flags] [command]
+const usage = `usage: zfstui [flags] [command] [host-spec...]
 
 commands:
   (none)    open the TUI
-  refresh   ssh to all hosts and update the local inventory cache
+  refresh   ssh to hosts and update the local inventory cache
   status    print the groups × host:pool replication matrix from the cache
 
   (snap, sync, prune, jobs, doctor are not implemented yet — see DESIGN.md)
 
+host specs (the hostname is the identity; the rest is access info, which is
+remembered in the cache db and replaced when you pass a new spec for a host):
+  host                  ssh as root@host
+  user@host[:pool]      scp-style (sudo implied for non-root users)
+  ssh://user;send_user=u1;recv_user=u2@host[:port][/pool]
+
+With no specs, all hosts remembered in the cache are used; with specs, the
+command is limited to those hosts.
+
 flags (before the command):
-  -config PATH   config file (default ./zfstui.toml while in development)
-  -hosts a,b,c   inline inventory: filters configured hosts / adds unknown ones
-  -db PATH       sqlite cache (default ./zfstui.db while in development; :memory: works)
-  -a             status: also show hidden groups (those with no snapshots at all)
+  -db PATH   sqlite cache (default ./zfstui.db while in development; :memory: works)
+  -a         status: also show hidden groups (those with no snapshots at all)
 
 status cell markers:  + unsnapshotted writes  ! diverged  ~ resumable  % clone
 `
 
 func main() {
 	var (
-		configPath = flag.String("config", "", "config file path")
-		hostsFlag  = flag.String("hosts", "", "comma-separated inline host list")
-		dbPath     = flag.String("db", "", "sqlite cache path")
-		showAll    = flag.Bool("a", false, "status: show hidden (snapshot-less) groups too")
+		dbPath  = flag.String("db", "", "sqlite cache path")
+		showAll = flag.Bool("a", false, "status: show hidden (snapshot-less) groups too")
 	)
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
 
 	dbp := *dbPath
 	if dbp == "" {
-		dbp = DefaultDBPath()
+		dbp = defaultDBPath()
 	}
 	st, err := openStore(dbp)
 	if err != nil {
@@ -47,32 +52,28 @@ func main() {
 	}
 	defer st.Close()
 
-	// Only commands that ssh out need an inventory; status reads the cache.
-	mustConfig := func() *Config {
-		cfg, err := loadConfig(*configPath, splitComma(*hostsFlag))
-		if err != nil {
-			fatal(err)
-		}
-		return cfg
+	// First positional arg is the command if it matches one; the rest
+	// (or everything, for the TUI) are host specs.
+	args := flag.Args()
+	cmd := ""
+	if len(args) > 0 && (args[0] == "refresh" || args[0] == "status") {
+		cmd = args[0]
+		args = args[1:]
 	}
 
-	cmd := flag.Arg(0)
 	switch cmd {
 	case "":
-		// TUI: config is optional (without it, refresh keys are disabled).
-		cfg, cfgErr := loadConfig(*configPath, splitComma(*hostsFlag))
-		if cfgErr != nil {
-			cfg = nil
+		var hosts []Host
+		if hosts, err = resolveHosts(st, args); err == nil {
+			err = runTUI(st, hosts)
 		}
-		err = runTUI(st, cfg)
 	case "refresh":
-		err = cmdRefresh(mustConfig(), st)
+		var hosts []Host
+		if hosts, err = resolveHosts(st, args); err == nil {
+			err = cmdRefresh(hosts, st)
+		}
 	case "status":
-		err = cmdStatus(st, *showAll)
-	default:
-		fmt.Fprintf(os.Stderr, "zfstui: unknown command %q (not implemented yet?)\n\n", cmd)
-		flag.Usage()
-		os.Exit(2)
+		err = cmdStatus(st, *showAll, args)
 	}
 	if err != nil {
 		fatal(err)
@@ -84,26 +85,12 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
-func splitComma(s string) []string {
-	var out []string
-	start := 0
-	for i := 0; i <= len(s); i++ {
-		if i == len(s) || s[i] == ',' {
-			if i > start {
-				out = append(out, s[start:i])
-			}
-			start = i + 1
-		}
-	}
-	return out
-}
-
-func cmdRefresh(cfg *Config, st *Store) error {
+func cmdRefresh(hosts []Host, st *Store) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	started := time.Now()
-	results := Refresh(ctx, NewSSH(), st, cfg.Hosts)
+	results := Refresh(ctx, newSSH(), st, hosts)
 
 	ok := 0
 	for _, res := range results {
@@ -114,20 +101,31 @@ func cmdRefresh(cfg *Config, st *Store) error {
 			fmt.Printf("  %-12s UNREACHABLE: %v\n", res.Host, res.Err)
 		}
 	}
-	fmt.Printf("refresh: %d/%d hosts in %.1fs\n", ok, len(cfg.Hosts), time.Since(started).Seconds())
+	fmt.Printf("refresh: %d/%d hosts in %.1fs\n", ok, len(hosts), time.Since(started).Seconds())
 	if ok == 0 {
 		return fmt.Errorf("no hosts reachable")
 	}
 	return nil
 }
 
-func cmdStatus(st *Store, showAll bool) error {
-	data, err := loadData(st)
+func cmdStatus(st *Store, showAll bool, specs []string) error {
+	// Specs limit the view (and update remembered access info as usual).
+	var only []string
+	if len(specs) > 0 {
+		hosts, err := resolveHosts(st, specs)
+		if err != nil {
+			return err
+		}
+		for _, h := range hosts {
+			only = append(only, h.Name)
+		}
+	}
+	data, err := loadData(st, only)
 	if err != nil {
 		return err
 	}
 	if len(data.States) == 0 {
-		return fmt.Errorf("cache is empty — run `zfstui refresh` first")
+		return fmt.Errorf("cache is empty — run `zfstui refresh host...` first")
 	}
 	groups := data.Groups
 	hidden := 0
