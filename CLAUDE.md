@@ -70,17 +70,24 @@ every emitted shape — extend regexes and constructors together. The global
 ## Code map (flat package main, one dir — user explicitly wants no subdirs)
 
 - `model.go` — types: Host (identity=Name + access spec; EffUser/NeedSudo/
-  Dest/URL helpers), Pool, Dataset, Snapshot, JobInfo, HostState (per-host
-  raw inventory incl. Jobs), Replica/Group (derived).
+  Dest/URL helpers), Pool, Dataset, Snapshot, VDev (vdev-properties tree:
+  Parent links, error counters), SmartReport (verbatim smartctl), JobInfo,
+  HostState (per-host raw inventory incl. VDevs/Smart/Jobs), Replica/Group
+  (derived).
 - `hostspec.go` — parseHostSpec/parseHostSpecs (URL forms, conflict
   rejection, root normalized to "") and resolveHosts (specs ↔ sqlite memory).
 - `zfsparse.go` — discovery uses `zpool/zfs get -Hp all` (NAME\tPROP\tVALUE
   \tSOURCE lines): EVERY property is collected; typed struct fields derive
   from the prop maps in ONE place (datasetFromProps & friends, with toProps
   inverses for code-built fixtures). DiscoverCommand = ONE ssh round-trip,
-  four marker-delimited sections with per-section exit codes; 4th =
-  `jobsProbe` globbing /tmp/zfstui-job-*, also used standalone for live
-  progress polling. ParseDiscovery/ParseJobs.
+  five marker-delimited sections with per-section exit codes: pools, disks
+  (per pool: `zpool get all <pool> all-vdevs` vdev properties [OpenZFS≥2.2,
+  tolerated absent — verbatim status still surfaces] + verbatim
+  `zpool status`; then `smartctl -a` per physical disk via lsblk, 20K cap),
+  datasets, snapshots, jobs (`jobsProbe`, also used for live polling).
+  Verbatim zpool status rides on Pool.Props["_zpool-status"] (underscore =
+  synthetic key, excluded from propsDump, persisted for free).
+  ParseDiscovery/ParseDisks/ParseJobs.
 - `ssh.go` — Runner interface (Run/RunInput; everything testable offline via
   fakes); shells out to system `ssh` (BatchMode, ConnectTimeout,
   ControlMaster sockets in ~/.local/state/zfstui/cm). Never use an ssh lib.
@@ -151,7 +158,11 @@ every emitted shape — extend regexes and constructors together. The global
     (refer) +written", encryption; JOBS rows "id 51%|OK|FAIL desc" +
     SNAPSHOT/USED/REFER table), groupDetails (chips: "group X",
     "@latest (refer) +writtenSum"; REPLICAS), hostDetails (selectable ssh
-    line + POOL table + counts), poolDetails (pool line + DATASET table).
+    line + POOL table + counts), poolDetails (pool line + VDEV tree table
+    [indent via Parent, red rows on errors/non-ONLINE, Enter → vdevModal] +
+    scan:/errors: lines + DATASET table). Pool modal appends verbatim
+    `zpool status`; host modal appends all pools' statuses + per-disk
+    `smartctl -a` verbatims (appendVerbatim blocks).
   - `s` snapshot dialog, `y` sync dialog: centered dialogBox (title in the
     border) composited OVER the table via overlayCenter (ANSI-aware
     splicing). Forms: bubbles textinput + checkbox() + button(), Tab/↑↓

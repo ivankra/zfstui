@@ -8,9 +8,10 @@ execution with detached jobs and live progress (most of M4). Not yet: batch
 `snap`/`sync` CLI, prune, jobs pane, `doctor`, job-dir cleanup.
 
 - `zfstui refresh` ssh-es to all known hosts in parallel and scrapes
-  `zpool/zfs get -Hp all` (every property + source) plus `/tmp/zfstui-job-*`
-  job state into a sqlite cache (a pure cache — safe to delete any time).
-  Read-only on the hosts.
+  `zpool/zfs get -Hp all` (every property + source), disk health (vdev
+  properties per pool, verbatim `zpool status`, `smartctl -a` per physical
+  disk) plus `/tmp/zfstui-job-*` job state into a sqlite cache (a pure
+  cache — safe to delete any time). Read-only on the hosts.
 - `zfstui status` prints the groups × host:pool matrix. Replication groups
   and per-replica states (ahead/behind/diverged/resumable/clone) are derived
   from **snapshot GUIDs**, never names. Cell markers: `+` unsnapshotted
@@ -629,6 +630,12 @@ TUI is manual for now.
   (`zfs send -nP`, read-only) into ./expected and tick ./progress via
   optional pv; TUI spinner + percentage as above. Old job dirs are not yet
   pruned (manual `rm -rf /tmp/zfstui-job-*` of finished ones is safe).
+- 2026-06-12: **disk health collection** — per pool: vdev properties
+  (`zpool get all <pool> all-vdevs`, OpenZFS ≥ 2.2; gracefully absent on
+  older zfs) for a structured tree with error counters, PLUS verbatim
+  `zpool status` for humans; `smartctl -a` (SATA+NVMe) per physical disk.
+  Pool details show the vdev tree (red on errors) + scan/errors lines;
+  pool/host modals show the verbatim texts; vdev rows have full-prop modals.
 - 2026-06-12: **discovery via `get all`** — every property + source is
   collected and cached (JSON maps in sqlite, schema v4); typed fields derive
   from the maps in one place. Detail modals show the full dumps.

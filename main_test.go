@@ -26,6 +26,7 @@ func discovery(pools, datasets, snapshots string) string {
 		return mark + "\n" + body + MarkRC + "0===\n"
 	}
 	return sec(MarkPools, pools) +
+		sec(MarkDisks, "") +
 		sec(MarkDatasets, datasets) +
 		sec(MarkSnapshots, snapshots) +
 		sec(MarkJobs, "")

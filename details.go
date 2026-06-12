@@ -21,7 +21,7 @@ type detLine struct {
 	open  func(m *Model) *textModal
 }
 
-func plainLine(text string) detLine                { return detLine{text: text} }
+func plainLine(text string) detLine                { return detLine{text: text, style: styleSection} }
 func sectionLine(text string) detLine              { return detLine{text: text, style: styleSection} }
 func styled(text string, s lipgloss.Style) detLine { return detLine{text: text, style: s} }
 
@@ -100,8 +100,9 @@ func (m *Model) replicaDetails(r *Replica) ([]string, []detLine) {
 		for _, s := range snaps {
 			s := s
 			lines = append(lines, detLine{
-				text: fmt.Sprintf("  %-*s  %7s  %7s", nameW, s.Name, human(s.Used), human(s.Refer)),
-				open: func(*Model) *textModal { return snapshotModal(s) },
+				text:  fmt.Sprintf("  %-*s  %7s  %7s", nameW, s.Name, human(s.Used), human(s.Refer)),
+				style: styleDetRow,
+				open:  func(*Model) *textModal { return snapshotModal(s) },
 			})
 		}
 	} else {
@@ -152,7 +153,8 @@ func (m *Model) replicaRows(members []*Replica) []detLine {
 		lines = append(lines, detLine{
 			text: fmt.Sprintf("  %-*s  %-9s  %s%s",
 				nameW, r.Dataset.Host+":"+r.Dataset.Name, r.State, replicaBrief(r), live),
-			open: func(*Model) *textModal { return datasetModal(r.Dataset) },
+			style: styleDetRow,
+			open:  func(*Model) *textModal { return datasetModal(r.Dataset) },
 		})
 	}
 	return lines
@@ -177,7 +179,7 @@ func (m *Model) jobRows(jobs []JobInfo, limit int) []detLine {
 			desc = "snapshot " + j.Meta["dataset"] + "@" + j.Meta["snapshot"]
 		}
 		status := ""
-		st := lipgloss.NewStyle()
+		st := styleDetRow
 		switch j.State {
 		case "running":
 			status = spinnerFrames[m.spin%len(spinnerFrames)] + " "
@@ -187,11 +189,11 @@ func (m *Model) jobRows(jobs []JobInfo, limit int) []detLine {
 				status += "run"
 			}
 		case "done":
-			status = "OK" // plain white
+			status = "OK"
 		case "failed":
 			status, st = "FAIL", styleErr
 		default:
-			status, st = j.State, styleDim
+			status = j.State
 		}
 		lines = append(lines, detLine{
 			text:  fmt.Sprintf("  %-7s %-6s %s", j.ID, status, desc),
@@ -206,14 +208,12 @@ func (m *Model) hostDetails(host string) ([]string, []detLine) {
 	segs := []string{"host " + host}
 	var size, alloc, free int64
 	var pools []Pool
-	var nDatasets, nSnaps int
 	for i := range m.data.States {
 		hs := &m.data.States[i]
 		if hs.Host != host {
 			continue
 		}
 		pools = hs.Pools
-		nDatasets, nSnaps = len(hs.Datasets), len(hs.Snapshots)
 		for _, p := range hs.Pools {
 			size += p.Size
 			alloc += p.Alloc
@@ -263,11 +263,11 @@ func (m *Model) hostDetails(host string) ([]string, []detLine) {
 				text: fmt.Sprintf("  %-*s  %6s %6s %6s  %4d%% %3d%% %6s  %s",
 					nameW, p.Name, human(p.Size), human(p.Alloc), human(p.Free),
 					p.Frag, p.Cap, p.Dedup, p.Health),
-				open: func(*Model) *textModal { return poolModal(p) },
+				style: styleDetRow,
+				open:  func(*Model) *textModal { return poolModal(p) },
 			})
 		}
 	}
-	lines = append(lines, plainLine(fmt.Sprintf("%d dataset(s), %d snapshot(s) cached", nDatasets, nSnaps)))
 	return segs, lines
 }
 
@@ -297,11 +297,63 @@ func (m *Model) poolDetails(host, pool string) ([]string, []detLine) {
 	if p.Size > 0 {
 		segs = append(segs, fmt.Sprintf("%s, %d%% used, %s free", human(p.Size), p.Alloc*100/p.Size, human(p.Free)))
 	}
+	var lines []detLine
+	// scrub/errors summary first (full text in the modal); the errors bullet
+	// only appears when there ARE errors; the scrub bullet turns red with them.
 	pp := *p
-	lines := []detLine{{
-		text: fmt.Sprintf("  %-9s frag %d%%  dedup %s  guid %s", p.Health, p.Frag, p.Dedup, orDash(p.GUID)),
-		open: func(*Model) *textModal { return poolModal(pp) },
-	}}
+	for _, ln := range strings.Split(p.Props["_zpool-status"], "\n") {
+		t := strings.TrimSpace(ln)
+		open := func(*Model) *textModal { return poolModal(pp) }
+		if s, ok := strings.CutPrefix(t, "scan:"); ok {
+			st := styleSection
+			scan := strings.TrimSpace(s)
+			if strings.Contains(scan, "error") && !strings.Contains(scan, "with 0 errors") {
+				st = styleErr
+			}
+			lines = append(lines, detLine{text: "* " + scan, style: st, open: open})
+		}
+		if s, ok := strings.CutPrefix(t, "errors:"); ok {
+			if e := strings.TrimSpace(s); e != "No known data errors" {
+				lines = append(lines, detLine{text: "* errors: " + e, style: styleErr, open: open})
+			}
+		}
+	}
+	// vdev tree (vdev properties; absent on old zfs — status verbatim still
+	// available via the pool modal).
+	if vds := m.vdevsFor(host, pool); len(vds) > 0 {
+		depth := map[string]int{}
+		nameW := 4
+		for _, v := range vds {
+			d := 0
+			if v.Parent != "" {
+				d = depth[v.Parent] + 1
+			}
+			depth[v.Name] = d
+			if l := 2*d + len(displayVDevName(v, pool)); l > nameW {
+				nameW = l
+			}
+		}
+		lines = append(lines, sectionLine(fmt.Sprintf("* %-*s  %-9s %-5s %-5s %-5s  %s",
+			nameW, "VDEV", "STATE", "READ", "WRITE", "CKSUM", "SIZE")))
+		for _, v := range vds {
+			v := v
+			ind := strings.Repeat("  ", depth[v.Name])
+			sz := ""
+			if v.Size > 0 {
+				sz = human(v.Size)
+			}
+			st := styleDetRow
+			if v.State != "ONLINE" || v.RErr > 0 || v.WErr > 0 || v.CErr > 0 {
+				st = styleErr
+			}
+			lines = append(lines, detLine{
+				text: fmt.Sprintf("  %-*s  %-9s %-5d %-5d %-5d  %s",
+					nameW, ind+displayVDevName(v, pool), v.State, v.RErr, v.WErr, v.CErr, sz),
+				style: st,
+				open:  func(*Model) *textModal { return vdevModal(v) },
+			})
+		}
+	}
 	if len(dss) > 0 {
 		nameW := 7
 		for _, d := range dss {
@@ -315,7 +367,8 @@ func (m *Model) poolDetails(host, pool string) ([]string, []detLine) {
 			lines = append(lines, detLine{
 				text: fmt.Sprintf("  %-*s  %7s %7s  %s",
 					nameW, displayDSName(d), human(d.Used), human(d.Refer), orDash(d.Mountpoint)),
-				open: func(*Model) *textModal { return datasetModal(&d) },
+				style: styleDetRow,
+				open:  func(*Model) *textModal { return datasetModal(&d) },
 			})
 		}
 	}
@@ -330,6 +383,60 @@ func displayDSName(d Dataset) string {
 	return d.Name
 }
 
+// vdevsFor returns the cached vdev tree of host:pool (discovery order).
+func (m *Model) vdevsFor(host, pool string) []VDev {
+	for i := range m.data.States {
+		if m.data.States[i].Host != host {
+			continue
+		}
+		var out []VDev
+		for _, v := range m.data.States[i].VDevs {
+			if v.Pool == pool {
+				out = append(out, v)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// displayVDevName: the root vdev shows as the pool name, like zpool status.
+func displayVDevName(v VDev, pool string) string {
+	if v.Parent == "" {
+		return pool
+	}
+	return v.Name
+}
+
+func vdevModal(v VDev) *textModal {
+	lines := []string{
+		"host      " + v.Host,
+		"pool      " + v.Pool,
+		"state     " + v.State,
+		fmt.Sprintf("errors    read %d  write %d  cksum %d", v.RErr, v.WErr, v.CErr),
+	}
+	if v.Path != "" {
+		lines = append(lines, "path      "+v.Path)
+	}
+	if v.Size > 0 {
+		lines = append(lines, fmt.Sprintf("space     size %s  alloc %s  free %s  frag %d%%",
+			human(v.Size), human(v.Alloc), human(v.Free), v.Frag))
+	}
+	return &textModal{title: "vdev " + v.Pool + "/" + v.Name, lines: propsDump(lines, v.Props, v.PropSrc)}
+}
+
+// appendVerbatim adds a titled verbatim text block to modal lines.
+func appendVerbatim(lines []string, title, text string) []string {
+	if strings.TrimSpace(text) == "" {
+		return lines
+	}
+	lines = append(lines, "", "── "+title+" "+strings.Repeat("─", 30))
+	for _, ln := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		lines = append(lines, ln)
+	}
+	return lines
+}
+
 // hostModal: everything known about a host (access spec, refresh state,
 // pools, cache counts).
 func (m *Model) hostModal(host string) *textModal {
@@ -338,22 +445,25 @@ func (m *Model) hostModal(host string) *textModal {
 		if h.Name != host {
 			continue
 		}
-		lines = append(lines, "access    "+h.URL())
-		lines = append(lines, "ssh user  "+h.EffUser())
+		ssh := "ssh: " + h.URL()
 		if h.NeedSudo() {
-			lines = append(lines, "sudo      yes (implied by non-root user)")
-		}
-		if h.Port != 0 {
-			lines = append(lines, fmt.Sprintf("port      %d", h.Port))
+			ssh += " (sudo)"
 		}
 		if h.SendUser != "" {
-			lines = append(lines, "send_user "+h.SendUser)
+			ssh += "  send_user=" + h.SendUser
 		}
 		if h.RecvUser != "" {
-			lines = append(lines, "recv_user "+h.RecvUser)
+			ssh += "  recv_user=" + h.RecvUser
 		}
 		if h.Pool != "" {
-			lines = append(lines, "pool      "+h.Pool+" (from spec; not enforced yet)")
+			ssh += "  pool=" + h.Pool + " (not enforced yet)"
+		}
+		lines = append(lines, ssh)
+	}
+	var hs *HostState
+	for i := range m.data.States {
+		if m.data.States[i].Host == host {
+			hs = &m.data.States[i]
 		}
 	}
 	for _, hi := range m.data.Hosts {
@@ -361,17 +471,23 @@ func (m *Model) hostModal(host string) *textModal {
 			continue
 		}
 		when := hi.LastRefresh.Format("2006-01-02 15:04:05")
-		if hi.Reachable {
-			lines = append(lines, "refreshed "+when)
-		} else {
-			lines = append(lines, "UNREACHABLE at last refresh ("+when+"): "+hi.LastError)
+		info := "refreshed: " + when
+		if !hi.Reachable {
+			info = "UNREACHABLE at last refresh (" + when + "): " + hi.LastError
 		}
+		if hs != nil {
+			running := 0
+			for _, j := range hs.Jobs {
+				if j.State == "running" {
+					running++
+				}
+			}
+			info += fmt.Sprintf(", %d dataset(s), %d snapshot(s), %d/%d job(s) running",
+				len(hs.Datasets), len(hs.Snapshots), running, len(hs.Jobs))
+		}
+		lines = append(lines, info)
 	}
-	for i := range m.data.States {
-		hs := &m.data.States[i]
-		if hs.Host != host {
-			continue
-		}
+	if hs != nil {
 		lines = append(lines, "")
 		for _, p := range hs.Pools {
 			pct := int64(0)
@@ -381,14 +497,9 @@ func (m *Model) hostModal(host string) *textModal {
 			lines = append(lines, fmt.Sprintf("pool %-12s %-9s size %-8s alloc %s (%d%%) free %s",
 				p.Name, p.Health, human(p.Size), human(p.Alloc), pct, human(p.Free)))
 		}
-		running := 0
-		for _, j := range hs.Jobs {
-			if j.State == "running" {
-				running++
-			}
+		for _, sm := range hs.Smart {
+			lines = appendVerbatim(lines, "smartctl -a "+sm.Dev, sm.Text)
 		}
-		lines = append(lines, fmt.Sprintf("%d dataset(s), %d snapshot(s) cached; %d job dir(s), %d running",
-			len(hs.Datasets), len(hs.Snapshots), len(hs.Jobs), running))
 	}
 	return &textModal{title: "host " + host, lines: lines}
 }
@@ -415,12 +526,14 @@ func propsDump(lines []string, props, srcs map[string]string) []string {
 	if len(props) == 0 {
 		return append(lines, "", "(no full property map cached — refresh to populate)")
 	}
-	lines = append(lines, "", "properties ("+fmt.Sprint(len(props))+"):")
 	keys := make([]string, 0, len(props))
 	for k := range props {
-		keys = append(keys, k)
+		if !strings.HasPrefix(k, "_") { // synthetic verbatims rendered separately
+			keys = append(keys, k)
+		}
 	}
 	sort.Strings(keys)
+	lines = append(lines, "", "── properties ("+fmt.Sprint(len(keys))+") "+strings.Repeat("─", 30))
 	keyW := 0
 	for _, k := range keys {
 		if len(k) > keyW {
@@ -476,7 +589,9 @@ func poolModal(p Pool) *textModal {
 		fmt.Sprintf("frag      %d%%   dedup %s", p.Frag, p.Dedup),
 		"guid      " + orDash(p.GUID),
 	}
-	return &textModal{title: "pool " + p.Host + ":" + p.Name, lines: propsDump(lines, p.Props, p.PropSrc)}
+	out := appendVerbatim(lines, "zpool status "+p.Name, p.Props["_zpool-status"])
+	out = propsDump(out, p.Props, p.PropSrc)
+	return &textModal{title: "pool " + p.Host + ":" + p.Name, lines: out}
 }
 
 func jobModal(j JobInfo) *textModal {

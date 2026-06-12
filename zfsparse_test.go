@@ -148,6 +148,7 @@ func TestParseSnapshotsRejectsMissingAt(t *testing.T) {
 
 func TestParseDiscovery(t *testing.T) {
 	out := MarkPools + "\n" + poolsOut + MarkRC + "0===\n" +
+		MarkDisks + "\n" + disksOut + MarkRC + "0===\n" +
 		MarkDatasets + "\n" + datasetsOut + MarkRC + "0===\n" +
 		MarkSnapshots + "\n" + snapsOut + MarkRC + "0===\n" +
 		MarkJobs + "\n" + MarkRC + "0===\n"
@@ -231,5 +232,74 @@ func TestParseJobsEmptyAndGarbage(t *testing.T) {
 	jobs := ParseJobs("ws", "==J== /tmp/zfstui-job-x\n==M==\n==P==\n==E==\n")
 	if len(jobs) != 1 || jobs[0].State != "unknown" {
 		t.Errorf("partial: %+v", jobs)
+	}
+}
+
+// Modeled on the user's real `zpool status` + vdev-props output (raidz).
+const disksOut = `==P== ssd
+root-0	state	ONLINE	-
+root-0	parent	-	-
+raidz1-0	state	ONLINE	-
+raidz1-0	parent	root-0	-
+HG10-2JNX	state	ONLINE	-
+HG10-2JNX	parent	raidz1-0	-
+HG10-2JNX	path	/dev/disk/by-vdev/HG10-2JNX	-
+HG10-2JNX	read_errors	0	-
+HG10-2JNX	write_errors	0	-
+HG10-2JNX	checksum_errors	3	-
+HG10-2JNX	size	10995116277760	-
+==S==
+  pool: ssd
+ state: ONLINE
+  scan: scrub repaired 0B in 11:11:17 with 0 errors on Sun May 10 11:35:20 2026
+config:
+
+	NAME           STATE     READ WRITE CKSUM
+	ssd            ONLINE       0     0     0
+
+errors: No known data errors
+==SMART==
+==D== /dev/sda
+smartctl 7.4 ...
+SMART overall-health self-assessment test result: PASSED
+==D== /dev/nvme0n1
+smartctl 7.4 ...
+Critical Warning: 0x00
+`
+
+func TestParseDisks(t *testing.T) {
+	vdevs, statusTexts, smart := ParseDisks("sta", disksOut)
+	if len(vdevs) != 3 {
+		t.Fatalf("got %d vdevs: %+v", len(vdevs), vdevs)
+	}
+	disk := vdevs[2]
+	if disk.Name != "HG10-2JNX" || disk.Parent != "raidz1-0" || disk.Pool != "ssd" ||
+		disk.CErr != 3 || disk.Size != 10995116277760 || disk.State != "ONLINE" {
+		t.Errorf("disk vdev: %+v", disk)
+	}
+	if vdevs[0].Parent != "" { // root-0's "-" parent normalizes to empty
+		t.Errorf("root parent: %+v", vdevs[0])
+	}
+	if !strings.Contains(statusTexts["ssd"], "scrub repaired 0B in 11:11:17") ||
+		!strings.Contains(statusTexts["ssd"], "No known data errors") {
+		t.Errorf("status text: %q", statusTexts["ssd"])
+	}
+	if len(smart) != 2 || smart[0].Dev != "/dev/sda" ||
+		!strings.Contains(smart[0].Text, "PASSED") ||
+		!strings.Contains(smart[1].Text, "Critical Warning") {
+		t.Errorf("smart: %+v", smart)
+	}
+}
+
+// Old zfs without vdev properties: the prop table is empty but the verbatim
+// zpool status still surfaces (explicit user requirement).
+func TestParseDisksNoVdevProps(t *testing.T) {
+	out := "==P== tank\n==S==\n  pool: tank\n state: ONLINE\nerrors: No known data errors\n==SMART==\n"
+	vdevs, statusTexts, smart := ParseDisks("h", out)
+	if len(vdevs) != 0 || len(smart) != 0 {
+		t.Errorf("vdevs=%v smart=%v", vdevs, smart)
+	}
+	if !strings.Contains(statusTexts["tank"], "state: ONLINE") {
+		t.Errorf("status: %q", statusTexts["tank"])
 	}
 }

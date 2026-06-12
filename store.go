@@ -20,7 +20,7 @@ type Store struct {
 
 // Bump whenever the schema changes: the db is a disposable cache, so on
 // mismatch we just drop everything and start over (no migrations).
-const schemaVersion = 4
+const schemaVersion = 5
 
 const schema = `
 CREATE TABLE IF NOT EXISTS hosts (
@@ -54,6 +54,16 @@ CREATE TABLE IF NOT EXISTS snapshots (
   props TEXT NOT NULL DEFAULT '{}', srcs TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (host, dataset, name)
 );
+CREATE TABLE IF NOT EXISTS vdevs (
+  host TEXT NOT NULL, pool TEXT NOT NULL, name TEXT NOT NULL,
+  ord INTEGER NOT NULL DEFAULT 0,           -- preserve tree order
+  props TEXT NOT NULL DEFAULT '{}', srcs TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (host, pool, name)
+);
+CREATE TABLE IF NOT EXISTS smart (
+  host TEXT NOT NULL, dev TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (host, dev)
+);
 CREATE TABLE IF NOT EXISTS jobs (
   host TEXT NOT NULL, id TEXT NOT NULL, dir TEXT NOT NULL,
   kind TEXT, state TEXT, status TEXT, meta TEXT,
@@ -83,7 +93,7 @@ func openStore(path string) (*Store, error) {
 	}
 	if version != schemaVersion {
 		// Stale or fresh db: it's a disposable cache, recreate from scratch.
-		for _, t := range []string{"hosts", "pools", "datasets", "snapshots", "jobs", "hidden_overrides"} {
+		for _, t := range []string{"hosts", "pools", "datasets", "snapshots", "vdevs", "smart", "jobs", "hidden_overrides"} {
 			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 				db.Close()
 				return nil, err
@@ -139,7 +149,7 @@ func (s *Store) PutHostState(st HostState) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"pools", "datasets", "snapshots", "jobs"} {
+	for _, table := range []string{"pools", "datasets", "snapshots", "vdevs", "smart", "jobs"} {
 		if _, err := tx.Exec("DELETE FROM "+table+" WHERE host = ?", st.Host); err != nil {
 			return err
 		}
@@ -169,6 +179,20 @@ func (s *Store) PutHostState(st HostState) error {
 		if _, err := tx.Exec(
 			`INSERT INTO snapshots (host,dataset,name,props,srcs) VALUES (?,?,?,?,?)`,
 			sn.Host, sn.Dataset, sn.Name, mj(sn.toProps()), mj(sn.PropSrc)); err != nil {
+			return err
+		}
+	}
+	for i, v := range st.VDevs {
+		if _, err := tx.Exec(
+			`INSERT INTO vdevs (host,pool,name,ord,props,srcs) VALUES (?,?,?,?,?,?)`,
+			v.Host, v.Pool, v.Name, i, mj(v.toProps()), mj(v.PropSrc)); err != nil {
+			return err
+		}
+	}
+	for _, sm := range st.Smart {
+		if _, err := tx.Exec(
+			`INSERT INTO smart (host,dev,text) VALUES (?,?,?)`,
+			sm.Host, sm.Dev, sm.Text); err != nil {
 			return err
 		}
 	}
@@ -273,6 +297,36 @@ func (s *Store) AllHostStates() ([]HostState, error) {
 		}
 		st := get(host)
 		st.Datasets = append(st.Datasets, datasetFromProps(host, name, unm(props), unm(srcs)))
+	}
+	rows.Close()
+
+	rows, err = s.db.Query(`SELECT host,pool,name,props,srcs FROM vdevs ORDER BY host,pool,ord`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var host, pool, name, props, srcs string
+		if err := rows.Scan(&host, &pool, &name, &props, &srcs); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		st := get(host)
+		st.VDevs = append(st.VDevs, vdevFromProps(host, pool, name, unm(props), unm(srcs)))
+	}
+	rows.Close()
+
+	rows, err = s.db.Query(`SELECT host,dev,text FROM smart ORDER BY host,dev`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var sm SmartReport
+		if err := rows.Scan(&sm.Host, &sm.Dev, &sm.Text); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		st := get(sm.Host)
+		st.Smart = append(st.Smart, sm)
 	}
 	rows.Close()
 

@@ -157,12 +157,41 @@ type Snapshot struct {
 	PropSrc   map[string]string
 }
 
+// VDev is one vdev (root, raidz/mirror group, disk) from `zpool get all
+// <pool> all-vdevs` (OpenZFS ≥ 2.2 vdev properties).
+type VDev struct {
+	Host    string
+	Pool    string
+	Name    string // vdev name: "root-0", "raidz1-0", "nvme0n1p1", …
+	Parent  string // parent vdev name ("" for the root)
+	State   string
+	Path    string // /dev path for leaf disks
+	Size    int64
+	Alloc   int64
+	Free    int64
+	Frag    int64
+	RErr    int64 // read_errors
+	WErr    int64 // write_errors
+	CErr    int64 // checksum_errors
+	Props   map[string]string
+	PropSrc map[string]string
+}
+
+// SmartReport is the verbatim `smartctl -a` output for one physical disk.
+type SmartReport struct {
+	Host string
+	Dev  string // /dev/sda, /dev/nvme0n1, …
+	Text string
+}
+
 // HostState is everything discovered on one host in one refresh.
 type HostState struct {
 	Host      string
 	Pools     []Pool
 	Datasets  []Dataset
 	Snapshots []Snapshot
+	VDevs     []VDev
+	Smart     []SmartReport
 	Jobs      []JobInfo
 }
 

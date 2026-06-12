@@ -31,7 +31,8 @@ var (
 	stylePaneActive = lipgloss.NewStyle().Foreground(lipgloss.Color("7")).Underline(true)
 	rowGuideBG      = lipgloss.Color("238")
 	styleRowGuide   = lipgloss.NewStyle().Background(rowGuideBG)
-	styleSection    = lipgloss.NewStyle().Foreground(lipgloss.Color("14")) // light cyan: details table headers
+	styleSection    = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))  // bright white: details headers/high-prio
+	styleDetRow     = lipgloss.NewStyle().Foreground(lipgloss.Color("248")) // mid gray: details data rows
 	styleStatus     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleStatusMsg  = lipgloss.NewStyle().Foreground(lipgloss.Color("14")) // light cyan: status/action messages
 	styleErr        = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))

@@ -169,6 +169,7 @@ func snapshotFromProps(host, ds, name string, vals, srcs map[string]string) Snap
 // Section markers used to batch all discovery commands into one ssh round trip.
 const (
 	MarkPools     = "===ZFSTUI:pools==="
+	MarkDisks     = "===ZFSTUI:disks==="
 	MarkDatasets  = "===ZFSTUI:datasets==="
 	MarkSnapshots = "===ZFSTUI:snapshots==="
 	MarkJobs      = "===ZFSTUI:jobs==="
@@ -194,8 +195,19 @@ func DiscoverCommand(sudo bool) string {
 	section := func(mark, cmd string) string {
 		return fmt.Sprintf("echo '%s'; %s%s; echo '%s'$?'==='", mark, pfx, cmd, MarkRC)
 	}
+	// Disks: per pool, vdev properties (OpenZFS ≥ 2.2; tolerated if absent)
+	// + verbatim `zpool status`; then SMART for every physical disk
+	// (smartctl handles SATA and NVMe; skipped if not installed).
+	disksProbe := `for p in $(` + pfx + `zpool list -H -o name); do ` +
+		`echo "==P== $p"; ` + pfx + `zpool get -Hp all "$p" all-vdevs 2>/dev/null; ` +
+		`echo "==S=="; ` + pfx + `zpool status "$p" 2>/dev/null; done; ` +
+		`echo "==SMART=="; if command -v smartctl >/dev/null 2>&1; then ` +
+		`for d in $(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do ` +
+		`echo "==D== /dev/$d"; ` + pfx + `smartctl -a "/dev/$d" 2>&1 | head -c 20000; echo; done; ` +
+		`else echo "==NOSMART== smartctl not installed"; fi; true`
 	return strings.Join([]string{
 		section(MarkPools, "zpool get -Hp all"),
+		fmt.Sprintf("echo '%s'; %s; echo '%s'$?'==='", MarkDisks, disksProbe, MarkRC),
 		section(MarkDatasets, "zfs get -Hp -t filesystem,volume all"),
 		section(MarkSnapshots, "zfs get -Hp -t snapshot all"),
 		// Jobs need no sudo: dirs are owned by the ssh user that made them.
@@ -212,7 +224,7 @@ func ParseDiscovery(host, out string) (HostState, error) {
 	for _, line := range strings.Split(out, "\n") {
 		trimmed := strings.TrimSpace(line)
 		switch {
-		case trimmed == MarkPools || trimmed == MarkDatasets || trimmed == MarkSnapshots || trimmed == MarkJobs:
+		case trimmed == MarkPools || trimmed == MarkDisks || trimmed == MarkDatasets || trimmed == MarkSnapshots || trimmed == MarkJobs:
 			curMark = trimmed
 			cur = &strings.Builder{}
 			sections[curMark] = cur
@@ -227,7 +239,7 @@ func ParseDiscovery(host, out string) (HostState, error) {
 			cur.WriteString("\n")
 		}
 	}
-	for _, mark := range []string{MarkPools, MarkDatasets, MarkSnapshots, MarkJobs} {
+	for _, mark := range []string{MarkPools, MarkDisks, MarkDatasets, MarkSnapshots, MarkJobs} {
 		if sections[mark] == nil {
 			return st, fmt.Errorf("%s: discovery output missing section %s", host, mark)
 		}
@@ -243,7 +255,129 @@ func ParseDiscovery(host, out string) (HostState, error) {
 		return st, err
 	}
 	st.Jobs = ParseJobs(host, sections[MarkJobs].String())
+	var statusTexts map[string]string
+	st.VDevs, statusTexts, st.Smart = ParseDisks(host, sections[MarkDisks].String())
+	// Attach verbatim `zpool status` to the pool as a synthetic property
+	// (underscore prefix: excluded from generic dumps, persists for free).
+	for i := range st.Pools {
+		if txt := statusTexts[st.Pools[i].Name]; txt != "" {
+			if st.Pools[i].Props == nil {
+				st.Pools[i].Props = map[string]string{}
+			}
+			st.Pools[i].Props["_zpool-status"] = txt
+		}
+	}
 	return st, nil
+}
+
+// vdevStateNames: `zpool get -Hp` reports vdev state numerically (the
+// vdev_state enum); map it back to the familiar words.
+var vdevStateNames = map[string]string{
+	"0": "UNKNOWN", "1": "CLOSED", "2": "OFFLINE", "3": "REMOVED",
+	"4": "CANT_OPEN", "5": "FAULTED", "6": "DEGRADED", "7": "ONLINE",
+}
+
+// vdevFromProps derives typed vdev fields (shared with the store).
+func vdevFromProps(host, pool, name string, vals, srcs map[string]string) VDev {
+	p := props(vals)
+	state := p.str("state")
+	if s, ok := vdevStateNames[state]; ok {
+		state = s
+	}
+	return VDev{
+		Host: host, Pool: pool, Name: name,
+		Parent: p.str("parent"), State: state, Path: p.str("path"),
+		Size: p.num("size"), Alloc: p.num("allocated"), Free: p.num("free"),
+		Frag: p.num("fragmentation"),
+		RErr: p.num("read_errors"), WErr: p.num("write_errors"), CErr: p.num("checksum_errors"),
+		Props: vals, PropSrc: srcs,
+	}
+}
+
+func (v VDev) toProps() map[string]string {
+	if v.Props != nil {
+		return v.Props
+	}
+	return map[string]string{
+		"parent": v.Parent, "state": v.State, "path": v.Path,
+		"size": fmt.Sprint(v.Size), "allocated": fmt.Sprint(v.Alloc),
+		"free": fmt.Sprint(v.Free), "fragmentation": fmt.Sprint(v.Frag),
+		"read_errors": fmt.Sprint(v.RErr), "write_errors": fmt.Sprint(v.WErr),
+		"checksum_errors": fmt.Sprint(v.CErr),
+	}
+}
+
+// ParseDisks parses the disks discovery section: per-pool vdev property
+// tables and verbatim zpool status, then per-disk SMART reports.
+func ParseDisks(host, out string) (vdevs []VDev, statusTexts map[string]string, smart []SmartReport) {
+	statusTexts = map[string]string{}
+	pool := ""
+	mode := "" // vdevs | status | smart
+	var buf strings.Builder
+	var propBuf strings.Builder
+	var smartDev string
+	flushPool := func() {
+		if pool == "" {
+			return
+		}
+		if t, err := parsePropTable(propBuf.String()); err == nil {
+			for _, name := range t.order {
+				vdevs = append(vdevs, vdevFromProps(host, pool, name, t.vals[name], t.srcs[name]))
+			}
+		}
+		if s := strings.TrimSpace(buf.String()); s != "" {
+			statusTexts[pool] = s
+		}
+		pool = ""
+		propBuf.Reset()
+		buf.Reset()
+	}
+	flushSmart := func() {
+		if smartDev == "" {
+			return
+		}
+		if s := strings.TrimSpace(buf.String()); s != "" {
+			smart = append(smart, SmartReport{Host: host, Dev: smartDev, Text: s})
+		}
+		smartDev = ""
+		buf.Reset()
+	}
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "==P== "):
+			flushPool()
+			flushSmart()
+			pool = strings.TrimSpace(strings.TrimPrefix(line, "==P== "))
+			mode = "vdevs"
+		case line == "==S==":
+			mode = "status"
+		case line == "==SMART==":
+			flushPool()
+			mode = "smart"
+		case strings.HasPrefix(line, "==D== "):
+			flushSmart()
+			smartDev = strings.TrimSpace(strings.TrimPrefix(line, "==D== "))
+		case strings.HasPrefix(line, "==NOSMART=="):
+			// informational only
+		default:
+			switch mode {
+			case "vdevs":
+				propBuf.WriteString(line)
+				propBuf.WriteString("\n")
+			case "status":
+				buf.WriteString(line)
+				buf.WriteString("\n")
+			case "smart":
+				if smartDev != "" {
+					buf.WriteString(line)
+					buf.WriteString("\n")
+				}
+			}
+		}
+	}
+	flushPool()
+	flushSmart()
+	return vdevs, statusTexts, smart
 }
 
 // ParseJobs parses jobsProbe output. Malformed entries are skipped — job

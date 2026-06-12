@@ -435,7 +435,7 @@ func TestEnterOpensDetailModals(t *testing.T) {
 	if m.modal == nil || !strings.Contains(m.modal.title, "host ") {
 		t.Fatalf("host modal expected, got %+v", m.modal)
 	}
-	if !strings.Contains(strings.Join(m.modal.lines, "\n"), "access") {
+	if !strings.Contains(strings.Join(m.modal.lines, "\n"), "ssh:") {
 		t.Errorf("host modal content:\n%s", strings.Join(m.modal.lines, "\n"))
 	}
 	m.Update(key("esc"))
@@ -444,5 +444,76 @@ func TestEnterOpensDetailModals(t *testing.T) {
 	m.Update(key("enter"))
 	if m.modal != nil || m.focus != 1 {
 		t.Fatalf("group row should jump to details: modal=%v focus=%d", m.modal, m.focus)
+	}
+}
+
+func TestDiskDataFlow(t *testing.T) {
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	hs := HostState{
+		Host: "sta",
+		Pools: []Pool{{Host: "sta", Name: "sta-tank", Size: 100, Alloc: 40, Free: 60, Health: "ONLINE",
+			Props: map[string]string{"size": "100", "allocated": "40", "free": "60", "health": "ONLINE",
+				"_zpool-status": "  pool: sta-tank\n state: ONLINE\n  scan: scrub repaired 0B in 11:11:17 with 0 errors\nerrors: No known data errors"}}},
+		Datasets:  []Dataset{{Host: "sta", Name: "sta-tank/bak/git", Type: "filesystem", GUID: "d1"}},
+		Snapshots: []Snapshot{{Host: "sta", Dataset: "sta-tank/bak/git", Name: "s", GUID: "g1", Creation: 1}},
+		VDevs: []VDev{
+			{Host: "sta", Pool: "sta-tank", Name: "root-0", State: "ONLINE"},
+			{Host: "sta", Pool: "sta-tank", Name: "raidz1-0", Parent: "root-0", State: "ONLINE"},
+			{Host: "sta", Pool: "sta-tank", Name: "HG10-2JNX", Parent: "raidz1-0", State: "ONLINE", CErr: 3, Size: 1 << 40},
+		},
+		Smart: []SmartReport{{Host: "sta", Dev: "/dev/sda", Text: "SMART overall-health: PASSED"}},
+	}
+	if err := st.PutHostState(hs); err != nil {
+		t.Fatal(err)
+	}
+	m, err := New(st, []Host{{Name: "sta"}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.width, m.height = 110, 30
+
+	// Pool view: vdev tree with error highlighted disk + scan line.
+	m.curRow, m.curCol = -1, 1
+	m.clampCursor()
+	view := m.View()
+	for _, want := range []string{"VDEV", "raidz1-0", "HG10-2JNX", "* scrub repaired"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("pool view missing %q:\n%s", want, view)
+		}
+	}
+	// Enter on pool header → pool modal with verbatim status.
+	m.Update(key("enter"))
+	if m.modal == nil || !strings.Contains(strings.Join(m.modal.lines, "\n"), "scrub repaired 0B in 11:11:17") {
+		t.Fatalf("pool modal verbatim missing: %+v", m.modal)
+	}
+	m.Update(key("esc"))
+
+	// Host modal: ssh+refresh summary and SMART (no zpool status here).
+	m.curRow = -2
+	m.clampCursor()
+	m.Update(key("enter"))
+	content := strings.Join(m.modal.lines, "\n")
+	for _, want := range []string{"ssh: root@sta", "job(s) running", "smartctl -a /dev/sda", "PASSED"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("host modal missing %q:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, "zpool status") {
+		t.Error("host modal should not include zpool status verbatims")
+	}
+	m.Update(key("esc"))
+
+	// Vdev row Enter → vdev modal (navigate into details on pool view).
+	m.curRow = -1
+	m.clampCursor()
+	m.Update(key("tab"))
+	m.Update(key("j")) // pool line -> first vdev row
+	m.Update(key("enter"))
+	if m.modal == nil || !strings.Contains(m.modal.title, "vdev sta-tank/") {
+		t.Fatalf("vdev modal expected: %+v", m.modal)
 	}
 }
