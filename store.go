@@ -60,9 +60,10 @@ CREATE TABLE IF NOT EXISTS vdevs (
   props TEXT NOT NULL DEFAULT '{}', srcs TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (host, pool, name)
 );
-CREATE TABLE IF NOT EXISTS smart (
-  host TEXT NOT NULL, dev TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (host, dev)
+CREATE TABLE IF NOT EXISTS disks (
+  host TEXT NOT NULL, id TEXT NOT NULL,
+  props TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (host, id)
 );
 CREATE TABLE IF NOT EXISTS jobs (
   host TEXT NOT NULL, id TEXT NOT NULL, dir TEXT NOT NULL,
@@ -149,7 +150,7 @@ func (s *Store) PutHostState(st HostState) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"pools", "datasets", "snapshots", "vdevs", "smart", "jobs"} {
+	for _, table := range []string{"pools", "datasets", "snapshots", "vdevs", "disks", "jobs"} {
 		if _, err := tx.Exec("DELETE FROM "+table+" WHERE host = ?", st.Host); err != nil {
 			return err
 		}
@@ -189,10 +190,10 @@ func (s *Store) PutHostState(st HostState) error {
 			return err
 		}
 	}
-	for _, sm := range st.Smart {
+	for _, d := range st.Disks {
 		if _, err := tx.Exec(
-			`INSERT INTO smart (host,dev,text) VALUES (?,?,?)`,
-			sm.Host, sm.Dev, sm.Text); err != nil {
+			`INSERT INTO disks (host,id,props) VALUES (?,?,?)`,
+			d.Host, d.ID, mj(d.toProps())); err != nil {
 			return err
 		}
 	}
@@ -315,18 +316,25 @@ func (s *Store) AllHostStates() ([]HostState, error) {
 	}
 	rows.Close()
 
-	rows, err = s.db.Query(`SELECT host,dev,text FROM smart ORDER BY host,dev`)
+	rows, err = s.db.Query(`SELECT host,id,props FROM disks ORDER BY host,id`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var sm SmartReport
-		if err := rows.Scan(&sm.Host, &sm.Dev, &sm.Text); err != nil {
+		var host, id, props string
+		if err := rows.Scan(&host, &id, &props); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		st := get(sm.Host)
-		st.Smart = append(st.Smart, sm)
+		st := get(host)
+		d := diskFromProps(host, unm(props))
+		if d.ID == "" {
+			d.ID = id
+		}
+		if isPseudoDiskName(firstNonEmpty(d.KName, baseName(d.Dev))) {
+			continue
+		}
+		st.Disks = append(st.Disks, d)
 	}
 	rows.Close()
 
@@ -376,6 +384,7 @@ func (s *Store) AllHostStates() ([]HostState, error) {
 			}
 			return x.CreateTXG < y.CreateTXG
 		})
+		attachDiskIDsToVDevs(st.VDevs, diskAliasesFromDisks(st.Disks))
 	}
 
 	var out []HostState

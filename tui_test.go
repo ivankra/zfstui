@@ -463,9 +463,11 @@ func TestDiskDataFlow(t *testing.T) {
 		VDevs: []VDev{
 			{Host: "sta", Pool: "sta-tank", Name: "root-0", State: "ONLINE"},
 			{Host: "sta", Pool: "sta-tank", Name: "raidz1-0", Parent: "root-0", State: "ONLINE"},
-			{Host: "sta", Pool: "sta-tank", Name: "HG10-2JNX", Parent: "raidz1-0", State: "ONLINE", CErr: 3, Size: 1 << 40},
+			{Host: "sta", Pool: "sta-tank", Name: "HG10-2JNX", Parent: "raidz1-0", DiskID: "serial:E4GG2JNX", State: "ONLINE", CErr: 3, Size: 1 << 40},
 		},
-		Smart: []SmartReport{{Host: "sta", Dev: "/dev/sda", Text: "SMART overall-health: PASSED"}},
+		Disks: []Disk{{Host: "sta", ID: "serial:E4GG2JNX", Dev: "/dev/sda", KName: "sda",
+			Model: "HGST HUH721010ALE600", Serial: "E4GG2JNX", Size: 10 << 40,
+			Transport: "sata", Rotational: true, Smart: "SMART overall-health: PASSED"}},
 	}
 	if err := st.PutHostState(hs); err != nil {
 		t.Fatal(err)
@@ -480,10 +482,13 @@ func TestDiskDataFlow(t *testing.T) {
 	m.curRow, m.curCol = -1, 1
 	m.clampCursor()
 	view := m.View()
-	for _, want := range []string{"VDEV", "raidz1-0", "HG10-2JNX", "* scrub repaired"} {
+	for _, want := range []string{"VDEV", "DISK", "HG10-2JNX", "/dev/sda", "* scrub repaired"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("pool view missing %q:\n%s", want, view)
 		}
+	}
+	if strings.Contains(view, "raidz1-0") {
+		t.Errorf("pool view should show leaf vdev rows only:\n%s", view)
 	}
 	// Enter on pool header → pool modal with verbatim status.
 	m.Update(key("enter"))
@@ -492,18 +497,18 @@ func TestDiskDataFlow(t *testing.T) {
 	}
 	m.Update(key("esc"))
 
-	// Host modal: ssh+refresh summary and SMART (no zpool status here).
+	// Host modal: ssh+refresh summary and disk inventory (SMART opens on disk).
 	m.curRow = -2
 	m.clampCursor()
 	m.Update(key("enter"))
 	content := strings.Join(m.modal.lines, "\n")
-	for _, want := range []string{"ssh: root@sta", "job(s) running", "smartctl -a /dev/sda", "PASSED"} {
+	for _, want := range []string{"ssh: root@sta", "job(s) running", "disk /dev/sda", "E4GG2JNX", "sata hdd"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("host modal missing %q:\n%s", want, content)
 		}
 	}
-	if strings.Contains(content, "zpool status") {
-		t.Error("host modal should not include zpool status verbatims")
+	if strings.Contains(content, "zpool status") || strings.Contains(content, "smartctl -a") {
+		t.Error("host modal should not include pool or SMART verbatims")
 	}
 	m.Update(key("esc"))
 
@@ -515,5 +520,123 @@ func TestDiskDataFlow(t *testing.T) {
 	m.Update(key("enter"))
 	if m.modal == nil || !strings.Contains(m.modal.title, "vdev sta-tank/") {
 		t.Fatalf("vdev modal expected: %+v", m.modal)
+	}
+	m.Update(key("esc"))
+
+	// Host details disk row Enter -> disk modal with SMART.
+	m.curRow = -2
+	m.clampCursor()
+	m.focus = 1
+	m.detCur, m.detOff = 0, 0
+	m.detSnap()
+	for i := 0; i < 6 && (m.modal == nil || !strings.Contains(m.modal.title, "disk ")); i++ {
+		m.Update(key("j"))
+		m.Update(key("enter"))
+		if m.modal == nil || !strings.Contains(m.modal.title, "disk ") {
+			m.Update(key("esc"))
+		}
+	}
+	if m.modal == nil || !strings.Contains(strings.Join(m.modal.lines, "\n"), "smartctl -a /dev/sda") {
+		t.Fatalf("disk modal expected: %+v", m.modal)
+	}
+}
+
+func TestMainTableStyling(t *testing.T) {
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	hs1 := HostState{
+		Host:  "src",
+		Pools: []Pool{{Host: "src", Name: "tank", Health: "ONLINE"}},
+		Datasets: []Dataset{
+			{Host: "src", Name: "tank/git", Type: "filesystem", GUID: "src-git"},
+		},
+		Snapshots: []Snapshot{
+			{Host: "src", Dataset: "tank/git", Name: "old", GUID: "g1", Creation: 1},
+			{Host: "src", Dataset: "tank/git", Name: "new", GUID: "g2", Creation: 2},
+		},
+	}
+	hs2 := HostState{
+		Host: "dst",
+		Pools: []Pool{{Host: "dst", Name: "tank", Health: "ONLINE",
+			Props: map[string]string{"health": "ONLINE", "_zpool-status": "errors: No known data errors"}}},
+		Datasets: []Dataset{
+			{Host: "dst", Name: "tank/git", Type: "filesystem", GUID: "dst-git"},
+		},
+		Snapshots: []Snapshot{
+			{Host: "dst", Dataset: "tank/git", Name: "old", GUID: "g1", Creation: 1},
+		},
+		VDevs: []VDev{{Host: "dst", Pool: "tank", Name: "sda1", State: "ONLINE", CErr: 1}},
+	}
+	if err := st.PutHostState(hs1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutHostState(hs2); err != nil {
+		t.Fatal(err)
+	}
+	m, err := New(st, []Host{{Name: "src"}, {Name: "dst"}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.width, m.height = 100, 24
+	view := m.View()
+	if strings.Contains(view, "Datasets") {
+		t.Fatalf("main pane title should be gone:\n%s", view)
+	}
+	if !strings.Contains(view, styleDetRow.Render("old")) {
+		t.Fatalf("behind replica should render gray:\n%s", view)
+	}
+	if !strings.Contains(view, styleErr.Render("tank")) {
+		t.Fatalf("pool header with vdev errors should render red:\n%s", view)
+	}
+	if !poolProblem(nil, &Pool{Health: "DEGRADED"}) {
+		t.Fatal("degraded pool should be treated as a problem")
+	}
+}
+
+func TestTitleFillStyles(t *testing.T) {
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	m := &Model{st: st, width: 80}
+	title := m.paneTitle([]string{"Details"}, true)
+	if !strings.Contains(title, stylePaneActive.Render("  Details  ")) {
+		t.Fatalf("active pane title should use filled style: %q", title)
+	}
+	if strings.Contains(title, "[ Details ]") {
+		t.Fatalf("active pane title should drop brackets: %q", title)
+	}
+	box := dialogBox("Dialog", strings.Repeat("body ", 20))
+	if !strings.Contains(box, styleDialogTitle.Render(" Dialog ")) {
+		t.Fatalf("dialog title should use filled style: %q", box)
+	}
+}
+
+func TestPropsDumpLayout(t *testing.T) {
+	lines := propsDump([]string{"host      cml"}, map[string]string{
+		"guid":   "123",
+		"health": "ONLINE",
+	}, map[string]string{"guid": "default"})
+	var foundHeader, foundGuid bool
+	for _, ln := range lines {
+		if strings.HasPrefix(ln, "── properties ") {
+			foundHeader = true
+		}
+		if strings.HasPrefix(ln, "guid") {
+			foundGuid = true
+			if strings.HasPrefix(ln, "  ") {
+				t.Fatalf("property rows should not be indented: %q", ln)
+			}
+		}
+	}
+	if !foundHeader {
+		t.Fatalf("missing properties header: %v", lines)
+	}
+	if !foundGuid {
+		t.Fatalf("missing guid row: %v", lines)
 	}
 }

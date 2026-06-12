@@ -28,7 +28,7 @@ var (
 	styleDim        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleCursor     = lipgloss.NewStyle().Reverse(true)
 	stylePaneTitle  = lipgloss.NewStyle().Foreground(lipgloss.Color("7")) // plain white
-	stylePaneActive = lipgloss.NewStyle().Foreground(lipgloss.Color("7")).Underline(true)
+	stylePaneActive = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8"))
 	rowGuideBG      = lipgloss.Color("238")
 	styleRowGuide   = lipgloss.NewStyle().Background(rowGuideBG)
 	styleSection    = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))  // bright white: details headers/high-prio
@@ -38,7 +38,7 @@ var (
 	styleErr        = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
 
-// cellStyle: white = normal (in sync or merely behind — the @names speak),
+// cellStyle: white = normal, gray = behind (stale but compatible),
 // green = has snapshots not yet synced elsewhere, orange = unsnapshotted
 // local writes ("+"); red/cyan/dim keep flagging diverged/resumable/clone.
 func cellStyle(r *Replica) lipgloss.Style {
@@ -49,6 +49,8 @@ func cellStyle(r *Replica) lipgloss.Style {
 		return styleResume
 	case StateClone:
 		return styleClone
+	case StateBehind:
+		return styleDetRow
 	}
 	if r.Written > 0 {
 		return styleWritten
@@ -243,6 +245,60 @@ func (m *Model) clampCursor() {
 
 func (m *Model) hostOfCol(ci int) string {
 	return strings.SplitN(m.cols[ci], ":", 2)[0]
+}
+
+func (m *Model) poolByCol(ci int) (*HostState, *Pool) {
+	if ci < 0 || ci >= len(m.cols) {
+		return nil, nil
+	}
+	parts := strings.SplitN(m.cols[ci], ":", 2)
+	for i := range m.data.States {
+		hs := &m.data.States[i]
+		if hs.Host != parts[0] {
+			continue
+		}
+		for j := range hs.Pools {
+			if hs.Pools[j].Name == parts[1] {
+				return hs, &hs.Pools[j]
+			}
+		}
+	}
+	return nil, nil
+}
+
+func poolProblem(hs *HostState, p *Pool) bool {
+	if p == nil {
+		return false
+	}
+	health := strings.ToUpper(p.Health)
+	if health != "" && health != "ONLINE" {
+		return true
+	}
+	status := p.Props["_zpool-status"]
+	for _, ln := range strings.Split(status, "\n") {
+		t := strings.TrimSpace(ln)
+		if s, ok := strings.CutPrefix(t, "errors:"); ok {
+			errs := strings.TrimSpace(s)
+			if errs != "" && errs != "No known data errors" {
+				return true
+			}
+			break
+		}
+	}
+	if hs != nil {
+		for _, v := range hs.VDevs {
+			if v.Pool != p.Name {
+				continue
+			}
+			if v.State != "" && v.State != "ONLINE" {
+				return true
+			}
+			if v.RErr > 0 || v.WErr > 0 || v.CErr > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hostSpan returns the [start, end) column range sharing ci's host.
@@ -496,7 +552,7 @@ const (
 
 // tableBodyH is the table pane height including its two header lines.
 func (m *Model) tableBodyH() int {
-	h := m.height - 1 - 1 - detailsBodyH - 1 // two pane titles, footer
+	h := m.height - 1 - detailsBodyH - 1 // details title + footer
 	if h < 4 {
 		h = 4
 	}
@@ -512,7 +568,6 @@ func (m *Model) View() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(m.paneTitle([]string{"Datasets"}, m.focus == 0))
 	b.WriteString(m.tableView(m.tableBodyH()))
 	detSegs, _ := m.detailsContent()
 	b.WriteString(m.paneTitle(detSegs, m.focus == 1))
@@ -667,7 +722,7 @@ func overlayCenter(base, box string, w, h int) string {
 }
 
 // paneTitle renders segmented titles: ──[ seg ]──[ seg ]──…; the active
-// pane's first segment gets ▶ ◀ cursor markers.
+// pane's first segment is filled with the border color.
 func (m *Model) paneTitle(segs []string, active bool) string {
 	var b strings.Builder
 	used := 0
@@ -681,11 +736,13 @@ func (m *Model) paneTitle(segs []string, active bool) string {
 		if active && i == 0 {
 			st = stylePaneActive
 		}
-		write("[", styleDim)
-		write(" ", stylePaneTitle)
-		write(seg, st)
-		write(" ", stylePaneTitle)
-		write("]", styleDim)
+		if active && i == 0 {
+			write("  "+seg+"  ", st)
+		} else {
+			write("[", styleDim)
+			write(" "+seg+" ", st)
+			write("]", styleDim)
+		}
 		write("──", styleDim)
 	}
 	if fill := m.width - used; fill > 0 {
@@ -850,8 +907,8 @@ func (m *Model) tableView(h int) string {
 	}
 	b.WriteString("\n")
 
-	// Header line 2: pool names (selectable: cursor row -1). Bold only —
-	// underline is the host row's.
+	// Header line 2: pool names (selectable: cursor row -1). Problem pools
+	// are red unless the cursor is on them.
 	b.WriteString(pad("", nameW))
 	for ci := m.colOff; ci < end; ci++ {
 		b.WriteString("  ")
@@ -861,6 +918,8 @@ func (m *Model) tableView(h int) string {
 			b.WriteString(styleCursor.Render(hdr))
 		case m.unreach[hostOf(m.cols[ci])]:
 			b.WriteString(styleDim.Render(hdr))
+		case poolProblem(m.poolByCol(ci)):
+			b.WriteString(styleErr.Render(hdr))
 		default:
 			b.WriteString(styleName.Render(hdr))
 		}
@@ -1201,9 +1260,9 @@ var (
 	styleDialogBox = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("6")).
-			Padding(1, 3)
+			Padding(1, 2)
 	styleDialogBorder = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-	styleDialogTitle  = lipgloss.NewStyle().Foreground(lipgloss.Color("7")) // plain white
+	styleDialogTitle  = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("6"))
 	styleFieldLabel   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleButton       = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("7"))
 	styleButtonFocus  = lipgloss.NewStyle().Padding(0, 1).Reverse(true).Bold(true)
@@ -1227,8 +1286,8 @@ func dialogBox(title, content string) string {
 	if fill < 0 {
 		fill = 0
 	}
-	lines[0] = styleDialogBorder.Render("╭─ ") + styleDialogTitle.Render(title) +
-		styleDialogBorder.Render(" "+strings.Repeat("─", fill)+"╮")
+	lines[0] = styleDialogBorder.Render("╭─") + styleDialogTitle.Render(" "+title+" ") +
+		styleDialogBorder.Render(strings.Repeat("─", fill)+"╮")
 	return strings.Join(lines, "\n")
 }
 

@@ -20,6 +20,12 @@ func sample(host string) HostState {
 			{Host: host, Dataset: "ssd/srv/git", Name: "20260601", GUID: "s1", Creation: 100},
 			{Host: host, Dataset: "ssd/srv/git", Name: "20260610", GUID: "s2", Creation: 200},
 		},
+		VDevs: []VDev{
+			{Host: host, Pool: "ssd", Name: "sda1", DiskID: "serial:abc", State: "ONLINE", Size: 100},
+		},
+		Disks: []Disk{
+			{Host: host, ID: "serial:abc", Dev: "/dev/sda", KName: "sda", Model: "model", Serial: "abc", Size: 1000, Smart: "PASSED"},
+		},
 	}
 }
 
@@ -49,12 +55,16 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("got %d host states", len(states))
 	}
 	st := states[0]
-	if len(st.Pools) != 1 || len(st.Datasets) != 1 || len(st.Snapshots) != 2 {
+	if len(st.Pools) != 1 || len(st.Datasets) != 1 || len(st.Snapshots) != 2 ||
+		len(st.VDevs) != 1 || len(st.Disks) != 1 {
 		t.Fatalf("bad counts: %+v", st)
 	}
 	d := st.Datasets[0]
 	if !d.Mounted || d.Written != 4096 || d.Encryption != "aes-256-gcm" {
 		t.Errorf("dataset round trip: %+v", d)
+	}
+	if st.VDevs[0].DiskID != "serial:abc" || st.Disks[0].Smart != "PASSED" {
+		t.Errorf("disk round trip: %+v / %+v", st.VDevs[0], st.Disks[0])
 	}
 
 	hosts, err := s.Hosts()

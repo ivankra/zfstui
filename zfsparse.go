@@ -196,13 +196,14 @@ func DiscoverCommand(sudo bool) string {
 		return fmt.Sprintf("echo '%s'; %s%s; echo '%s'$?'==='", mark, pfx, cmd, MarkRC)
 	}
 	// Disks: per pool, vdev properties (OpenZFS ≥ 2.2; tolerated if absent)
-	// + verbatim `zpool status`; then SMART for every physical disk
-	// (smartctl handles SATA and NVMe; skipped if not installed).
+	// + verbatim `zpool status`; then lsblk physical-disk inventory and SMART
+	// for every real disk (smartctl handles SATA and NVMe; skipped if absent).
 	disksProbe := `for p in $(` + pfx + `zpool list -H -o name); do ` +
 		`echo "==P== $p"; ` + pfx + `zpool get -Hp all "$p" all-vdevs 2>/dev/null; ` +
 		`echo "==S=="; ` + pfx + `zpool status "$p" 2>/dev/null; done; ` +
+		`echo "==LSBLK=="; lsblk -b -P -o NAME,KNAME,TYPE,PKNAME,PATH,SIZE,MODEL,SERIAL,WWN,TRAN,ROTA,PARTLABEL,PARTUUID 2>/dev/null; ` +
 		`echo "==SMART=="; if command -v smartctl >/dev/null 2>&1; then ` +
-		`for d in $(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do ` +
+		`for d in $(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 !~ /^zd[0-9]+$/ {print $1}'); do ` +
 		`echo "==D== /dev/$d"; ` + pfx + `smartctl -a "/dev/$d" 2>&1 | head -c 20000; echo; done; ` +
 		`else echo "==NOSMART== smartctl not installed"; fi; true`
 	return strings.Join([]string{
@@ -256,7 +257,7 @@ func ParseDiscovery(host, out string) (HostState, error) {
 	}
 	st.Jobs = ParseJobs(host, sections[MarkJobs].String())
 	var statusTexts map[string]string
-	st.VDevs, statusTexts, st.Smart = ParseDisks(host, sections[MarkDisks].String())
+	st.VDevs, statusTexts, st.Disks = ParseDisks(host, sections[MarkDisks].String())
 	// Attach verbatim `zpool status` to the pool as a synthetic property
 	// (underscore prefix: excluded from generic dumps, persists for free).
 	for i := range st.Pools {
@@ -284,10 +285,17 @@ func vdevFromProps(host, pool, name string, vals, srcs map[string]string) VDev {
 	if s, ok := vdevStateNames[state]; ok {
 		state = s
 	}
+	size := p.num("size")
+	if size == 0 {
+		size = p.num("psize")
+	}
+	if size == 0 {
+		size = p.num("asize")
+	}
 	return VDev{
 		Host: host, Pool: pool, Name: name,
-		Parent: p.str("parent"), State: state, Path: p.str("path"),
-		Size: p.num("size"), Alloc: p.num("allocated"), Free: p.num("free"),
+		Parent: p.str("parent"), DiskID: p.str("_disk_id"), State: state, Path: p.str("path"),
+		Size: size, Alloc: p.num("allocated"), Free: p.num("free"),
 		Frag: p.num("fragmentation"),
 		RErr: p.num("read_errors"), WErr: p.num("write_errors"), CErr: p.num("checksum_errors"),
 		Props: vals, PropSrc: srcs,
@@ -299,7 +307,7 @@ func (v VDev) toProps() map[string]string {
 		return v.Props
 	}
 	return map[string]string{
-		"parent": v.Parent, "state": v.State, "path": v.Path,
+		"parent": v.Parent, "_disk_id": v.DiskID, "state": v.State, "path": v.Path,
 		"size": fmt.Sprint(v.Size), "allocated": fmt.Sprint(v.Alloc),
 		"free": fmt.Sprint(v.Free), "fragmentation": fmt.Sprint(v.Frag),
 		"read_errors": fmt.Sprint(v.RErr), "write_errors": fmt.Sprint(v.WErr),
@@ -308,14 +316,16 @@ func (v VDev) toProps() map[string]string {
 }
 
 // ParseDisks parses the disks discovery section: per-pool vdev property
-// tables and verbatim zpool status, then per-disk SMART reports.
-func ParseDisks(host, out string) (vdevs []VDev, statusTexts map[string]string, smart []SmartReport) {
+// tables and verbatim zpool status, then lsblk/smartctl physical disks.
+func ParseDisks(host, out string) (vdevs []VDev, statusTexts map[string]string, disks []Disk) {
 	statusTexts = map[string]string{}
 	pool := ""
-	mode := "" // vdevs | status | smart
+	mode := "" // vdevs | status | lsblk | smart
 	var buf strings.Builder
 	var propBuf strings.Builder
 	var smartDev string
+	var lsblkRows []map[string]string
+	smartTexts := map[string]string{}
 	flushPool := func() {
 		if pool == "" {
 			return
@@ -337,7 +347,7 @@ func ParseDisks(host, out string) (vdevs []VDev, statusTexts map[string]string, 
 			return
 		}
 		if s := strings.TrimSpace(buf.String()); s != "" {
-			smart = append(smart, SmartReport{Host: host, Dev: smartDev, Text: s})
+			smartTexts[smartDev] = s
 		}
 		smartDev = ""
 		buf.Reset()
@@ -354,6 +364,10 @@ func ParseDisks(host, out string) (vdevs []VDev, statusTexts map[string]string, 
 		case line == "==SMART==":
 			flushPool()
 			mode = "smart"
+		case line == "==LSBLK==":
+			flushPool()
+			flushSmart()
+			mode = "lsblk"
 		case strings.HasPrefix(line, "==D== "):
 			flushSmart()
 			smartDev = strings.TrimSpace(strings.TrimPrefix(line, "==D== "))
@@ -372,12 +386,253 @@ func ParseDisks(host, out string) (vdevs []VDev, statusTexts map[string]string, 
 					buf.WriteString(line)
 					buf.WriteString("\n")
 				}
+			case "lsblk":
+				if kv := parseKeyValueLine(line); len(kv) > 0 {
+					lsblkRows = append(lsblkRows, kv)
+				}
 			}
 		}
 	}
 	flushPool()
 	flushSmart()
-	return vdevs, statusTexts, smart
+	disks, aliases := disksFromLSBLK(host, lsblkRows, smartTexts)
+	attachDiskIDsToVDevs(vdevs, aliases)
+	return vdevs, statusTexts, disks
+}
+
+func parseKeyValueLine(line string) map[string]string {
+	out := map[string]string{}
+	for i := 0; i < len(line); {
+		for i < len(line) && line[i] == ' ' {
+			i++
+		}
+		start := i
+		for i < len(line) && line[i] != '=' {
+			i++
+		}
+		if i >= len(line) || start == i {
+			break
+		}
+		key := line[start:i]
+		i++
+		if i >= len(line) || line[i] != '"' {
+			break
+		}
+		i++
+		var b strings.Builder
+		for i < len(line) {
+			if line[i] == '"' {
+				i++
+				break
+			}
+			if line[i] == '\\' && i+1 < len(line) {
+				i++
+			}
+			b.WriteByte(line[i])
+			i++
+		}
+		out[key] = b.String()
+	}
+	return out
+}
+
+func diskFromProps(host string, vals map[string]string) Disk {
+	p := props(vals)
+	d := Disk{
+		Host: host,
+		Dev:  p.str("PATH"), KName: p.str("KNAME"),
+		Model: p.str("MODEL"), Serial: p.str("SERIAL"), WWN: p.str("WWN"),
+		Size: p.num("SIZE"), Transport: p.str("TRAN"),
+		Rotational: vals["ROTA"] == "1",
+		Smart:      p.str("_smart"),
+		Props:      vals,
+	}
+	if d.Dev == "" && d.KName != "" {
+		d.Dev = "/dev/" + d.KName
+	}
+	d.ID = p.str("_id")
+	if d.ID == "" {
+		d.ID = stableDiskID(d)
+	}
+	return d
+}
+
+func (d Disk) toProps() map[string]string {
+	if d.Props != nil {
+		return d.Props
+	}
+	rota := "0"
+	if d.Rotational {
+		rota = "1"
+	}
+	return map[string]string{
+		"_id": d.ID, "_smart": d.Smart,
+		"PATH": d.Dev, "KNAME": d.KName, "TYPE": "disk",
+		"MODEL": d.Model, "SERIAL": d.Serial, "WWN": d.WWN,
+		"SIZE": fmt.Sprint(d.Size), "TRAN": d.Transport, "ROTA": rota,
+	}
+}
+
+func disksFromLSBLK(host string, rows []map[string]string, smartTexts map[string]string) ([]Disk, map[string]string) {
+	var disks []Disk
+	diskByKName := map[string]string{}
+	indexByID := map[string]int{}
+	aliases := map[string]string{}
+	addAlias := func(alias, id string) {
+		if alias != "" && alias != "-" && id != "" {
+			aliases[alias] = id
+		}
+	}
+	for _, row := range rows {
+		if row["TYPE"] != "disk" {
+			continue
+		}
+		if isPseudoDiskName(firstNonEmpty(row["KNAME"], row["NAME"])) {
+			continue
+		}
+		d := diskFromProps(host, row)
+		if d.ID == "" {
+			continue
+		}
+		indexByID[d.ID] = len(disks)
+		disks = append(disks, d)
+		if d.KName != "" {
+			diskByKName[d.KName] = d.ID
+		}
+		if name := row["NAME"]; name != "" {
+			diskByKName[name] = d.ID
+		}
+	}
+	for _, row := range rows {
+		id := ""
+		if row["TYPE"] == "disk" {
+			id = diskByKName[firstNonEmpty(row["KNAME"], row["NAME"])]
+		} else if pk := row["PKNAME"]; pk != "" && pk != "-" {
+			id = diskByKName[pk]
+		}
+		if id == "" {
+			continue
+		}
+		addAlias(row["NAME"], id)
+		addAlias(row["KNAME"], id)
+		addAlias(row["PATH"], id)
+		addAlias("/dev/"+row["NAME"], id)
+		addAlias("/dev/"+row["KNAME"], id)
+		if pl := row["PARTLABEL"]; pl != "" && pl != "-" {
+			addAlias(pl, id)
+			addAlias("/dev/disk/by-partlabel/"+pl, id)
+		}
+	}
+	for dev, text := range smartTexts {
+		if id := aliases[dev]; id != "" {
+			if idx, ok := indexByID[id]; ok {
+				disks[idx].Smart = text
+				if disks[idx].Props != nil {
+					disks[idx].Props["_smart"] = text
+					disks[idx].Props["_id"] = disks[idx].ID
+				}
+			}
+			continue
+		}
+	}
+	return disks, aliases
+}
+
+func isPseudoDiskName(name string) bool {
+	if !strings.HasPrefix(name, "zd") || len(name) == 2 {
+		return false
+	}
+	for _, r := range name[2:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func diskAliasesFromDisks(disks []Disk) map[string]string {
+	aliases := map[string]string{}
+	add := func(alias, id string) {
+		if alias != "" && alias != "-" && id != "" {
+			aliases[alias] = id
+		}
+	}
+	for _, d := range disks {
+		add(d.ID, d.ID)
+		add(d.Dev, d.ID)
+		add(d.KName, d.ID)
+		add(baseName(d.Dev), d.ID)
+		if d.KName != "" {
+			add("/dev/"+d.KName, d.ID)
+		}
+	}
+	return aliases
+}
+
+func attachDiskIDsToVDevs(vdevs []VDev, diskAliases map[string]string) {
+	for i := range vdevs {
+		v := &vdevs[i]
+		for _, a := range append(vdevAliases(v.Path), vdevAliases(v.Name)...) {
+			if id := diskAliases[a]; id != "" {
+				v.DiskID = id
+				break
+			}
+		}
+		if v.Props != nil {
+			if v.DiskID != "" {
+				v.Props["_disk_id"] = v.DiskID
+			}
+		}
+	}
+}
+
+func vdevAliases(s string) []string {
+	if s == "" || s == "-" {
+		return nil
+	}
+	out := []string{s}
+	if b := baseName(s); b != "" && b != s {
+		out = append(out, b)
+	}
+	const byPartLabel = "/dev/disk/by-partlabel/"
+	if strings.HasPrefix(s, byPartLabel) {
+		out = append(out, strings.TrimPrefix(s, byPartLabel))
+	}
+	return out
+}
+
+func stableDiskID(d Disk) string {
+	if d.WWN != "" && d.WWN != "-" {
+		return "wwn:" + compactID(d.WWN)
+	}
+	if d.Serial != "" && d.Serial != "-" {
+		return "serial:" + compactID(d.Serial)
+	}
+	if d.Dev != "" {
+		return "dev:" + compactID(baseName(d.Dev))
+	}
+	return ""
+}
+
+func compactID(s string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(s)), "_")
+}
+
+func baseName(s string) string {
+	s = strings.TrimRight(s, "/")
+	if i := strings.LastIndexByte(s, '/'); i >= 0 {
+		return s[i+1:]
+	}
+	return s
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" && v != "-" {
+			return v
+		}
+	}
+	return ""
 }
 
 // ParseJobs parses jobsProbe output. Malformed entries are skipped — job

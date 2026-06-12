@@ -9,9 +9,10 @@ execution with detached jobs and live progress (most of M4). Not yet: batch
 
 - `zfstui refresh` ssh-es to all known hosts in parallel and scrapes
   `zpool/zfs get -Hp all` (every property + source), disk health (vdev
-  properties per pool, verbatim `zpool status`, `smartctl -a` per physical
-  disk) plus `/tmp/zfstui-job-*` job state into a sqlite cache (a pure
-  cache — safe to delete any time). Read-only on the hosts.
+  properties per pool, verbatim `zpool status`, `lsblk -b -P` physical disk
+  inventory, `smartctl -a` per physical disk) plus `/tmp/zfstui-job-*` job
+  state into a sqlite cache (a pure cache — safe to delete any time).
+  Read-only on the hosts.
 - `zfstui status` prints the groups × host:pool matrix. Replication groups
   and per-replica states (ahead/behind/diverged/resumable/clone) are derived
   from **snapshot GUIDs**, never names. Cell markers: `+` unsnapshotted
@@ -21,9 +22,10 @@ execution with detached jobs and live progress (most of M4). Not yet: batch
   into cells — all convention-free, derived from the data.
 - bare `./zfstui` opens the TUI: scrollable matrix with a two-level
   host/pool header (both navigable; hosts show "(53%/38T)" capacity when the
-  column is wide enough), color-coded cells, row guide on the cursor's row,
-  async refresh (`r` host / `R` all), `h` toggles hidden groups, `?` help.
-  The Details pane is interactive: segmented title chips
+  column is wide enough), color-coded cells (behind replicas gray; unhealthy
+  pools red), row guide on the cursor's row, async refresh (`r` host / `R`
+  all), `h` toggles hidden groups, `?` help. The main table has no title
+  line. The Details pane is interactive: segmented title chips
   (`──[ ws:tank/srv/git (/) ]──[ 21.8G used, @20260612 (10.3G) +22K ]──`),
   per-view tables (JOBS + SNAPSHOT for a dataset, POOL for a host, DATASET
   for a pool, REPLICAS for a group); Tab focuses it, ↑↓ move a row cursor,
@@ -392,9 +394,14 @@ progress    pv machine-readable output (bytes done / total), if pv available
 
 ## TUI (as built)
 
-Single screen, two panes (Datasets table, interactive Details) plus modal
-dialogs/popups composited over the table. Segmented pane titles:
-`──[ id ]──[ info chips ]──`; the focused pane's first segment is underlined.
+Single screen, a main datasets table plus interactive Details and modal
+dialogs/popups composited over the table. The main table has no pane title.
+Details keeps segmented pane titles: `──[ id ]──[ info chips ]──`; the
+focused pane's first segment is filled white-on-dark-border, including the
+padding spaces inside the chip. Modal dialog titles use the same filled
+title treatment. Modal bodies use 2-space horizontal padding; the cached
+property dump sections render as plain `── properties ─...` headers with
+unindented key rows.
 
 ```
 ┌ Datasets ──────────────────────────────────────────────────────────────┐
@@ -433,10 +440,11 @@ Keyboard scheme (mnemonic letters, consistent everywhere):
   cancel; in -dry-run, action buttons say "(dry run)" and show a scrollable
   plan modal instead of executing
 
-Colors: white normal/behind, green unsynced snapshots (ahead), bright yellow
-unsnapshotted writes (`+`), red diverged, cyan resumable + section headers +
-status messages, dim clone/unreachable. Markers carry the same info without
-color. Planned, not yet built: `d` prune dialog, a jobs pane, `x` job cancel.
+Colors: white normal, gray behind/stale, green unsynced snapshots (ahead),
+bright yellow unsnapshotted writes (`+`), red diverged and unhealthy/error
+pool headers, cyan resumable + section headers + status messages, dim
+clone/unreachable. Markers carry the same info without color. Planned, not
+yet built: `d` prune dialog, a jobs pane, `x` job cancel.
 
 ## CLI (batch mode)
 
@@ -632,10 +640,20 @@ TUI is manual for now.
   pruned (manual `rm -rf /tmp/zfstui-job-*` of finished ones is safe).
 - 2026-06-12: **disk health collection** — per pool: vdev properties
   (`zpool get all <pool> all-vdevs`, OpenZFS ≥ 2.2; gracefully absent on
-  older zfs) for a structured tree with error counters, PLUS verbatim
-  `zpool status` for humans; `smartctl -a` (SATA+NVMe) per physical disk.
-  Pool details show the vdev tree (red on errors) + scan/errors lines;
-  pool/host modals show the verbatim texts; vdev rows have full-prop modals.
+  older zfs) for leaf vdev error counters, PLUS verbatim `zpool status`
+  for humans; `lsblk -b -P` for physical disk identity and `smartctl -a`
+  (SATA+NVMe) per physical disk. Pool details show leaf vdev rows (red on
+  errors) + scan/errors lines; pool modals show zpool status; host details
+  show physical disks only; disk modals own SMART verbatims. Intentional
+  model split: a ZFS vdev row is a
+  pool member/path/partition with IO error counters, while a Disk is a
+  physical host device with model/serial/WWN/SMART. Do not try to rebuild
+  hierarchy in the details pane; `zpool status` is the topology display.
+  Current caveats: zvol pseudo-disks (`zdN`) are filtered; vdev→disk mapping
+  knows lsblk path/name and by-partlabel aliases, but by-id/by-path pools may
+  need explicit alias collection later. SMART reports that cannot be mapped
+  to a Disk are intentionally dropped during prototyping rather than shown as
+  fallback pseudo-disks.
 - 2026-06-12: **discovery via `get all`** — every property + source is
   collected and cached (JSON maps in sqlite, schema v4); typed fields derive
   from the maps in one place. Detail modals show the full dumps.
@@ -717,4 +735,3 @@ Wishlist/preferences/thoughts below.
 * working names ideas for the tool: zfstui, zfsman, syncoid-tui (to emphasise syncoid? maybe we'll market it as that but it should still supported general ssh/bash fallack)
 * not all 100% of above have to be implemented. this is a starting point of roughly what i'd like in a tool. deviation possible, especially for consistency, practicality, simplicity, rationality, common sense welcome.
 * make sure to edit this file often enough as you work (add design, notes, project status etc). Frequent update more important, don't keep me in the dark! You can always keep refining your thoughts here later.
-

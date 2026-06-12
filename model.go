@@ -164,6 +164,7 @@ type VDev struct {
 	Pool    string
 	Name    string // vdev name: "root-0", "raidz1-0", "nvme0n1p1", …
 	Parent  string // parent vdev name ("" for the root)
+	DiskID  string // stable physical disk ID for leaf vdevs, when known
 	State   string
 	Path    string // /dev path for leaf disks
 	Size    int64
@@ -177,11 +178,21 @@ type VDev struct {
 	PropSrc map[string]string
 }
 
-// SmartReport is the verbatim `smartctl -a` output for one physical disk.
-type SmartReport struct {
-	Host string
-	Dev  string // /dev/sda, /dev/nvme0n1, …
-	Text string
+// Disk is one physical block device on a host. Partition/path vdevs point
+// back to DiskID when discovery can map them through lsblk.
+type Disk struct {
+	Host       string
+	ID         string // stable: prefer WWN, then serial, then last-resort dev
+	Dev        string // /dev/sda, /dev/nvme0n1, …
+	KName      string // kernel name, e.g. sda
+	Model      string
+	Serial     string
+	WWN        string
+	Size       int64
+	Transport  string
+	Rotational bool
+	Smart      string            // verbatim smartctl -a output
+	Props      map[string]string // full lsblk -P row
 }
 
 // HostState is everything discovered on one host in one refresh.
@@ -191,7 +202,7 @@ type HostState struct {
 	Datasets  []Dataset
 	Snapshots []Snapshot
 	VDevs     []VDev
-	Smart     []SmartReport
+	Disks     []Disk
 	Jobs      []JobInfo
 }
 

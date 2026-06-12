@@ -241,13 +241,15 @@ root-0	state	ONLINE	-
 root-0	parent	-	-
 raidz1-0	state	ONLINE	-
 raidz1-0	parent	root-0	-
+raidz1-0	children	/dev/disk/by-partlabel/HG10-2JNX	-
 HG10-2JNX	state	ONLINE	-
-HG10-2JNX	parent	raidz1-0	-
-HG10-2JNX	path	/dev/disk/by-vdev/HG10-2JNX	-
+HG10-2JNX	parent	raidz-0	-
+HG10-2JNX	path	/dev/disk/by-partlabel/HG10-2JNX	-
 HG10-2JNX	read_errors	0	-
 HG10-2JNX	write_errors	0	-
 HG10-2JNX	checksum_errors	3	-
-HG10-2JNX	size	10995116277760	-
+HG10-2JNX	size	0	-
+HG10-2JNX	psize	10000829251584	-
 ==S==
   pool: ssd
  state: ONLINE
@@ -258,6 +260,11 @@ config:
 	ssd            ONLINE       0     0     0
 
 errors: No known data errors
+==LSBLK==
+NAME="sda" KNAME="sda" TYPE="disk" PKNAME="" PATH="/dev/sda" SIZE="10000831348736" MODEL="HGST HUH721010ALE600" SERIAL="E4GG2JNX" WWN="0x5000cca268c666b8" TRAN="sata" ROTA="1" PARTLABEL="" PARTUUID=""
+NAME="sda1" KNAME="sda1" TYPE="part" PKNAME="sda" PATH="/dev/sda1" SIZE="10000829251584" MODEL="" SERIAL="" WWN="" TRAN="" ROTA="1" PARTLABEL="HG10-2JNX" PARTUUID="part-a"
+NAME="nvme0n1" KNAME="nvme0n1" TYPE="disk" PKNAME="" PATH="/dev/nvme0n1" SIZE="2000398934016" MODEL="Samsung SSD 970 EVO Plus 2TB" SERIAL="S4J4NJ0N805480Y" WWN="eui.0025385801400001" TRAN="nvme" ROTA="0" PARTLABEL="" PARTUUID=""
+NAME="zd0" KNAME="zd0" TYPE="disk" PKNAME="" PATH="/dev/zd0" SIZE="10737418240" MODEL="" SERIAL="" WWN="" TRAN="" ROTA="0" PARTLABEL="" PARTUUID=""
 ==SMART==
 ==D== /dev/sda
 smartctl 7.4 ...
@@ -268,13 +275,14 @@ Critical Warning: 0x00
 `
 
 func TestParseDisks(t *testing.T) {
-	vdevs, statusTexts, smart := ParseDisks("sta", disksOut)
+	vdevs, statusTexts, disks := ParseDisks("sta", disksOut)
 	if len(vdevs) != 3 {
 		t.Fatalf("got %d vdevs: %+v", len(vdevs), vdevs)
 	}
 	disk := vdevs[2]
-	if disk.Name != "HG10-2JNX" || disk.Parent != "raidz1-0" || disk.Pool != "ssd" ||
-		disk.CErr != 3 || disk.Size != 10995116277760 || disk.State != "ONLINE" {
+	if disk.Name != "HG10-2JNX" || disk.Parent != "raidz-0" || disk.Pool != "ssd" ||
+		disk.CErr != 3 || disk.Size != 10000829251584 || disk.State != "ONLINE" ||
+		disk.DiskID != "wwn:0x5000cca268c666b8" {
 		t.Errorf("disk vdev: %+v", disk)
 	}
 	if vdevs[0].Parent != "" { // root-0's "-" parent normalizes to empty
@@ -284,10 +292,14 @@ func TestParseDisks(t *testing.T) {
 		!strings.Contains(statusTexts["ssd"], "No known data errors") {
 		t.Errorf("status text: %q", statusTexts["ssd"])
 	}
-	if len(smart) != 2 || smart[0].Dev != "/dev/sda" ||
-		!strings.Contains(smart[0].Text, "PASSED") ||
-		!strings.Contains(smart[1].Text, "Critical Warning") {
-		t.Errorf("smart: %+v", smart)
+	if len(disks) != 2 || disks[0].Dev != "/dev/sda" ||
+		disks[0].ID != "wwn:0x5000cca268c666b8" ||
+		!strings.Contains(disks[0].Smart, "PASSED") ||
+		!strings.Contains(disks[1].Smart, "Critical Warning") {
+		t.Errorf("disks: %+v", disks)
+	}
+	if isPseudoDiskName("zdata") || !isPseudoDiskName("zd0") {
+		t.Error("pseudo disk filter should only match zd followed by digits")
 	}
 }
 
@@ -295,9 +307,9 @@ func TestParseDisks(t *testing.T) {
 // zpool status still surfaces (explicit user requirement).
 func TestParseDisksNoVdevProps(t *testing.T) {
 	out := "==P== tank\n==S==\n  pool: tank\n state: ONLINE\nerrors: No known data errors\n==SMART==\n"
-	vdevs, statusTexts, smart := ParseDisks("h", out)
-	if len(vdevs) != 0 || len(smart) != 0 {
-		t.Errorf("vdevs=%v smart=%v", vdevs, smart)
+	vdevs, statusTexts, disks := ParseDisks("h", out)
+	if len(vdevs) != 0 || len(disks) != 0 {
+		t.Errorf("vdevs=%v disks=%v", vdevs, disks)
 	}
 	if !strings.Contains(statusTexts["tank"], "state: ONLINE") {
 		t.Errorf("status: %q", statusTexts["tank"])

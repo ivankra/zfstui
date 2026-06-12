@@ -25,6 +25,37 @@ func plainLine(text string) detLine                { return detLine{text: text, 
 func sectionLine(text string) detLine              { return detLine{text: text, style: styleSection} }
 func styled(text string, s lipgloss.Style) detLine { return detLine{text: text, style: s} }
 
+func colWidths(headers []string, rows [][]string) []int {
+	ws := make([]int, len(headers))
+	for i, h := range headers {
+		ws[i] = len(h)
+	}
+	for _, row := range rows {
+		for i, cell := range row {
+			if i < len(ws) && len(cell) > ws[i] {
+				ws[i] = len(cell)
+			}
+		}
+	}
+	return ws
+}
+
+func tableLine(prefix string, ws []int, cells []string, right map[int]bool) string {
+	var b strings.Builder
+	b.WriteString(prefix)
+	for i, cell := range cells {
+		if i > 0 {
+			b.WriteString("  ")
+		}
+		if right[i] {
+			fmt.Fprintf(&b, "%*s", ws[i], cell)
+		} else {
+			fmt.Fprintf(&b, "%-*s", ws[i], cell)
+		}
+	}
+	return b.String()
+}
+
 // detailsContent builds the pane for the current selection.
 func (m *Model) detailsContent() (segs []string, lines []detLine) {
 	g, c := m.selected()
@@ -207,13 +238,13 @@ func (m *Model) jobRows(jobs []JobInfo, limit int) []detLine {
 func (m *Model) hostDetails(host string) ([]string, []detLine) {
 	segs := []string{"host " + host}
 	var size, alloc, free int64
-	var pools []Pool
+	var disks []Disk
 	for i := range m.data.States {
 		hs := &m.data.States[i]
 		if hs.Host != host {
 			continue
 		}
-		pools = hs.Pools
+		disks = hs.Disks
 		for _, p := range hs.Pools {
 			size += p.Size
 			alloc += p.Alloc
@@ -248,25 +279,8 @@ func (m *Model) hostDetails(host string) ([]string, []detLine) {
 				style: styleErr, open: func(m *Model) *textModal { return m.hostModal(host) }})
 		}
 	}
-	if len(pools) > 0 {
-		nameW := 4
-		for _, p := range pools {
-			if len(p.Name) > nameW {
-				nameW = len(p.Name)
-			}
-		}
-		lines = append(lines, sectionLine(fmt.Sprintf("* %-*s  %6s %6s %6s  %5s %4s %6s  %s",
-			nameW, "POOL", "SIZE", "ALLOC", "FREE", "FRAG", "CAP", "DEDUP", "HEALTH")))
-		for _, p := range pools {
-			p := p
-			lines = append(lines, detLine{
-				text: fmt.Sprintf("  %-*s  %6s %6s %6s  %4d%% %3d%% %6s  %s",
-					nameW, p.Name, human(p.Size), human(p.Alloc), human(p.Free),
-					p.Frag, p.Cap, p.Dedup, p.Health),
-				style: styleDetRow,
-				open:  func(*Model) *textModal { return poolModal(p) },
-			})
-		}
+	if len(disks) > 0 {
+		lines = append(lines, diskTableLines(disks)...)
 	}
 	return segs, lines
 }
@@ -318,41 +332,10 @@ func (m *Model) poolDetails(host, pool string) ([]string, []detLine) {
 			}
 		}
 	}
-	// vdev tree (vdev properties; absent on old zfs — status verbatim still
-	// available via the pool modal).
+	// Leaf vdevs only. The full topology remains available via verbatim
+	// `zpool status` in the pool modal.
 	if vds := m.vdevsFor(host, pool); len(vds) > 0 {
-		depth := map[string]int{}
-		nameW := 4
-		for _, v := range vds {
-			d := 0
-			if v.Parent != "" {
-				d = depth[v.Parent] + 1
-			}
-			depth[v.Name] = d
-			if l := 2*d + len(displayVDevName(v, pool)); l > nameW {
-				nameW = l
-			}
-		}
-		lines = append(lines, sectionLine(fmt.Sprintf("* %-*s  %-9s %-5s %-5s %-5s  %s",
-			nameW, "VDEV", "STATE", "READ", "WRITE", "CKSUM", "SIZE")))
-		for _, v := range vds {
-			v := v
-			ind := strings.Repeat("  ", depth[v.Name])
-			sz := ""
-			if v.Size > 0 {
-				sz = human(v.Size)
-			}
-			st := styleDetRow
-			if v.State != "ONLINE" || v.RErr > 0 || v.WErr > 0 || v.CErr > 0 {
-				st = styleErr
-			}
-			lines = append(lines, detLine{
-				text: fmt.Sprintf("  %-*s  %-9s %-5d %-5d %-5d  %s",
-					nameW, ind+displayVDevName(v, pool), v.State, v.RErr, v.WErr, v.CErr, sz),
-				style: st,
-				open:  func(*Model) *textModal { return vdevModal(v) },
-			})
-		}
+		lines = append(lines, m.vdevTableLines(host, vds, false)...)
 	}
 	if len(dss) > 0 {
 		nameW := 7
@@ -383,7 +366,81 @@ func displayDSName(d Dataset) string {
 	return d.Name
 }
 
-// vdevsFor returns the cached vdev tree of host:pool (discovery order).
+func diskTableLines(disks []Disk) []detLine {
+	disks = append([]Disk(nil), disks...)
+	sort.SliceStable(disks, func(i, j int) bool {
+		if disks[i].Dev != disks[j].Dev {
+			return disks[i].Dev < disks[j].Dev
+		}
+		return disks[i].ID < disks[j].ID
+	})
+	headers := []string{"DISK", "MODEL", "SERIAL", "SIZE", "TYPE", "SMART"}
+	var rows [][]string
+	for _, d := range disks {
+		rows = append(rows, diskRow(d))
+	}
+	ws := colWidths(headers, rows)
+	right := map[int]bool{3: true}
+	lines := []detLine{sectionLine(tableLine("* ", ws, headers, right))}
+	for i, d := range disks {
+		d := d
+		st := styleDetRow
+		if h := diskHealth(d); h == "WARN" || h == "FAIL" {
+			st = styleErr
+		}
+		lines = append(lines, detLine{text: tableLine("  ", ws, rows[i], right), style: st,
+			open: func(*Model) *textModal { return diskModal(d) }})
+	}
+	return lines
+}
+
+func diskRow(d Disk) []string {
+	return []string{d.Dev, orDash(d.Model), orDash(d.Serial), human(d.Size), diskType(d), diskHealth(d)}
+}
+
+func (m *Model) vdevTableLines(host string, vdevs []VDev, showPool bool) []detLine {
+	headers := []string{"VDEV", "STATE", "READ", "WRITE", "CKSUM", "SIZE", "DISK"}
+	if showPool {
+		headers = []string{"VDEV", "POOL", "STATE", "READ", "WRITE", "CKSUM", "SIZE", "DISK"}
+	}
+	var rows [][]string
+	for _, v := range vdevs {
+		rows = append(rows, m.vdevRow(host, v, showPool))
+	}
+	ws := colWidths(headers, rows)
+	right := map[int]bool{2: true, 3: true, 4: true, 5: true}
+	if showPool {
+		right = map[int]bool{3: true, 4: true, 5: true, 6: true}
+	}
+	lines := []detLine{sectionLine(tableLine("* ", ws, headers, right))}
+	for i, v := range vdevs {
+		v := v
+		st := styleDetRow
+		if v.State != "ONLINE" || v.RErr > 0 || v.WErr > 0 || v.CErr > 0 {
+			st = styleErr
+		}
+		lines = append(lines, detLine{text: tableLine("  ", ws, rows[i], right), style: st,
+			open: func(m *Model) *textModal { return m.vdevModal(host, v) }})
+	}
+	return lines
+}
+
+func (m *Model) vdevRow(host string, v VDev, showPool bool) []string {
+	if showPool {
+		return []string{
+			v.Name, v.Pool, v.State,
+			fmt.Sprint(v.RErr), fmt.Sprint(v.WErr), fmt.Sprint(v.CErr),
+			vdevSize(v), m.vdevDiskLabel(host, v),
+		}
+	}
+	return []string{
+		v.Name, v.State,
+		fmt.Sprint(v.RErr), fmt.Sprint(v.WErr), fmt.Sprint(v.CErr),
+		vdevSize(v), m.vdevDiskLabel(host, v),
+	}
+}
+
+// vdevsFor returns the cached leaf vdevs of host:pool (discovery order).
 func (m *Model) vdevsFor(host, pool string) []VDev {
 	for i := range m.data.States {
 		if m.data.States[i].Host != host {
@@ -391,7 +448,7 @@ func (m *Model) vdevsFor(host, pool string) []VDev {
 		}
 		var out []VDev
 		for _, v := range m.data.States[i].VDevs {
-			if v.Pool == pool {
+			if v.Pool == pool && isLeafVDev(v) {
 				out = append(out, v)
 			}
 		}
@@ -400,20 +457,58 @@ func (m *Model) vdevsFor(host, pool string) []VDev {
 	return nil
 }
 
-// displayVDevName: the root vdev shows as the pool name, like zpool status.
-func displayVDevName(v VDev, pool string) string {
-	if v.Parent == "" {
-		return pool
+func isLeafVDev(v VDev) bool {
+	if v.Props != nil {
+		p := props(v.Props)
+		if children := p.str("children"); children != "" {
+			return children == "-"
+		}
+		if p.num("numchildren") > 0 {
+			return false
+		}
 	}
-	return v.Name
+	return v.Path != "" || v.Size > 0
 }
 
-func vdevModal(v VDev) *textModal {
+func vdevSize(v VDev) string {
+	if v.Size > 0 {
+		return human(v.Size)
+	}
+	return "-"
+}
+
+func (m *Model) vdevDiskLabel(host string, v VDev) string {
+	if v.DiskID != "" {
+		for i := range m.data.States {
+			hs := &m.data.States[i]
+			if hs.Host != host {
+				continue
+			}
+			for _, d := range hs.Disks {
+				if d.ID == v.DiskID && d.Dev != "" {
+					return d.Dev
+				}
+			}
+		}
+	}
+	if v.Path != "" {
+		return v.Path
+	}
+	return "-"
+}
+
+func (m *Model) vdevModal(host string, v VDev) *textModal {
 	lines := []string{
 		"host      " + v.Host,
 		"pool      " + v.Pool,
 		"state     " + v.State,
 		fmt.Sprintf("errors    read %d  write %d  cksum %d", v.RErr, v.WErr, v.CErr),
+	}
+	if disk := m.vdevDiskLabel(host, v); disk != "-" {
+		lines = append(lines, "disk      "+disk)
+	}
+	if v.DiskID != "" {
+		lines = append(lines, "disk id   "+v.DiskID)
 	}
 	if v.Path != "" {
 		lines = append(lines, "path      "+v.Path)
@@ -497,8 +592,19 @@ func (m *Model) hostModal(host string) *textModal {
 			lines = append(lines, fmt.Sprintf("pool %-12s %-9s size %-8s alloc %s (%d%%) free %s",
 				p.Name, p.Health, human(p.Size), human(p.Alloc), pct, human(p.Free)))
 		}
-		for _, sm := range hs.Smart {
-			lines = appendVerbatim(lines, "smartctl -a "+sm.Dev, sm.Text)
+		if len(hs.Disks) > 0 {
+			lines = append(lines, "")
+			for _, d := range hs.Disks {
+				lines = append(lines, fmt.Sprintf("disk %-9s %-6s %-7s %-12s %s",
+					d.Dev, diskHealth(d), human(d.Size), orDash(d.Serial), d.Model))
+				if d.Serial != "" {
+					lines = append(lines, "  serial "+d.Serial)
+				}
+				if d.WWN != "" {
+					lines = append(lines, "  wwn    "+d.WWN)
+				}
+				lines = append(lines, "  type   "+diskType(d))
+			}
 		}
 	}
 	return &textModal{title: "host " + host, lines: lines}
@@ -533,7 +639,7 @@ func propsDump(lines []string, props, srcs map[string]string) []string {
 		}
 	}
 	sort.Strings(keys)
-	lines = append(lines, "", "── properties ("+fmt.Sprint(len(keys))+") "+strings.Repeat("─", 30))
+	lines = append(lines, "", "── properties "+strings.Repeat("─", 30))
 	keyW := 0
 	for _, k := range keys {
 		if len(k) > keyW {
@@ -541,7 +647,7 @@ func propsDump(lines []string, props, srcs map[string]string) []string {
 		}
 	}
 	for _, k := range keys {
-		l := fmt.Sprintf("  %-*s  %s", keyW, k, props[k])
+		l := fmt.Sprintf("%-*s  %s", keyW, k, props[k])
 		if s := srcs[k]; s != "" && s != "local" {
 			l += "  (" + s + ")"
 		}
@@ -592,6 +698,58 @@ func poolModal(p Pool) *textModal {
 	out := appendVerbatim(lines, "zpool status "+p.Name, p.Props["_zpool-status"])
 	out = propsDump(out, p.Props, p.PropSrc)
 	return &textModal{title: "pool " + p.Host + ":" + p.Name, lines: out}
+}
+
+func diskModal(d Disk) *textModal {
+	rota := "solid-state"
+	if d.Rotational {
+		rota = "rotational"
+	}
+	lines := []string{
+		"host      " + d.Host,
+		"id        " + d.ID,
+		"dev       " + d.Dev,
+		"model     " + orDash(d.Model),
+		"serial    " + orDash(d.Serial),
+		"wwn       " + orDash(d.WWN),
+		fmt.Sprintf("space     size %s  media %s  transport %s", human(d.Size), rota, orDash(d.Transport)),
+		"smart     " + diskHealth(d),
+	}
+	out := appendVerbatim(lines, "smartctl -a "+d.Dev, d.Smart)
+	out = propsDump(out, d.Props, nil)
+	return &textModal{title: "disk " + d.Host + ":" + baseName(d.Dev), lines: out}
+}
+
+func diskHealth(d Disk) string {
+	t := d.Smart
+	switch {
+	case strings.TrimSpace(t) == "":
+		return "-"
+	case strings.Contains(t, "SMART overall-health self-assessment test result: PASSED"),
+		strings.Contains(t, "SMART Health Status: OK"),
+		strings.Contains(t, "SMART overall-health: PASSED"),
+		strings.Contains(t, "Critical Warning:                   0x00"),
+		strings.Contains(t, "Critical Warning: 0x00"):
+		return "OK"
+	case strings.Contains(t, "FAILED"),
+		strings.Contains(t, "Critical Warning:") && !strings.Contains(t, "Critical Warning:                   0x00") && !strings.Contains(t, "Critical Warning: 0x00"):
+		return "FAIL"
+	case strings.Contains(t, "Unable to detect device type"):
+		return "-"
+	default:
+		return "SMART"
+	}
+}
+
+func diskType(d Disk) string {
+	media := "ssd"
+	if d.Rotational {
+		media = "hdd"
+	}
+	if d.Transport == "" {
+		return media
+	}
+	return d.Transport + " " + media
 }
 
 func jobModal(j JobInfo) *textModal {

@@ -70,10 +70,10 @@ every emitted shape — extend regexes and constructors together. The global
 ## Code map (flat package main, one dir — user explicitly wants no subdirs)
 
 - `model.go` — types: Host (identity=Name + access spec; EffUser/NeedSudo/
-  Dest/URL helpers), Pool, Dataset, Snapshot, VDev (vdev-properties tree:
-  Parent links, error counters), SmartReport (verbatim smartctl), JobInfo,
-  HostState (per-host raw inventory incl. VDevs/Smart/Jobs), Replica/Group
-  (derived).
+  Dest/URL helpers), Pool, Dataset, Snapshot, VDev (leaf/topology objects
+  from vdev properties, error counters, optional DiskID), Disk (physical
+  disk identity + lsblk props + verbatim smartctl), JobInfo, HostState
+  (per-host raw inventory incl. VDevs/Disks/Jobs), Replica/Group (derived).
 - `hostspec.go` — parseHostSpec/parseHostSpecs (URL forms, conflict
   rejection, root normalized to "") and resolveHosts (specs ↔ sqlite memory).
 - `zfsparse.go` — discovery uses `zpool/zfs get -Hp all` (NAME\tPROP\tVALUE
@@ -83,11 +83,15 @@ every emitted shape — extend regexes and constructors together. The global
   five marker-delimited sections with per-section exit codes: pools, disks
   (per pool: `zpool get all <pool> all-vdevs` vdev properties [OpenZFS≥2.2,
   tolerated absent — verbatim status still surfaces] + verbatim
-  `zpool status`; then `smartctl -a` per physical disk via lsblk, 20K cap),
+  `zpool status`; then `lsblk -b -P` physical disks and `smartctl -a` per
+  disk, 20K cap),
   datasets, snapshots, jobs (`jobsProbe`, also used for live polling).
   Verbatim zpool status rides on Pool.Props["_zpool-status"] (underscore =
   synthetic key, excluded from propsDump, persisted for free).
-  ParseDiscovery/ParseDisks/ParseJobs.
+  ParseDiscovery/ParseDisks/ParseJobs. Mental model: ZFS leaf vdevs are
+  pool membership/error-counter objects, often partitions or by-partlabel
+  paths; Disks are host-level physical devices with stable identity (WWN,
+  serial, else dev), model/size/transport/media, and SMART text.
 - `ssh.go` — Runner interface (Run/RunInput; everything testable offline via
   fakes); shells out to system `ssh` (BatchMode, ConnectTimeout,
   ControlMaster sockets in ~/.local/state/zfstui/cm). Never use an ssh lib.
@@ -139,13 +143,18 @@ every emitted shape — extend regexes and constructors together. The global
   - cursor: curRow -2 = host header (←→ jump host-to-host), -1 = pool
     header, 0.. = group rows; curCol 0 = name column, 1..N = sorted
     "host:pool" columns. Row guide: cursor's row gets bg tint 238 always.
-  - colors: white normal/behind, green unsynced snapshots (ahead), bright
-    yellow 226 unsnapshotted writes (+), red diverged, cyan 14 resumable /
-    section headers / status messages, dim clone / unreachable-host columns.
-    Done jobs plain white. The user picks colors by feel — expect tweaks.
-  - panes: Datasets / Details. Pane titles are SEGMENTED: ──[ id ]──[ info
-    chips ]── (text plain white, brackets/rules dim); the ACTIVE pane's
-    first segment text is UNDERLINED (only the text, not padding). Host
+  - colors: white normal, gray behind/stale, green unsynced snapshots
+    (ahead), bright yellow 226 unsnapshotted writes (+), red diverged and
+    unhealthy/error pool headers, cyan 14 resumable / section headers /
+    status messages, dim clone / unreachable-host columns. Done jobs plain
+    white. The user picks colors by feel — expect tweaks.
+  - panes: the Datasets/main table has no pane title line; Details keeps a
+    segmented title: ──[ id ]──[ info chips ]── (inactive text plain white,
+    brackets/rules dim). The active/focused title chip is white-on-dark
+    border fill, including its padding spaces; modal dialog titles use the
+    same filled title treatment. Host
+    modal bodies use 2-space horizontal padding; property sections render as
+    plain `── properties ─...` headers with unindented rows.
     header spans append "(53%/38T)" when the span is wide enough. Details
     (details.go) is structured: detLine rows; selectable ones (snapshots/
     jobs/pools/datasets/replicas) get a white-bg row cursor when focused
@@ -158,11 +167,13 @@ every emitted shape — extend regexes and constructors together. The global
     (refer) +written", encryption; JOBS rows "id 51%|OK|FAIL desc" +
     SNAPSHOT/USED/REFER table), groupDetails (chips: "group X",
     "@latest (refer) +writtenSum"; REPLICAS), hostDetails (selectable ssh
-    line + POOL table + counts), poolDetails (pool line + VDEV tree table
-    [indent via Parent, red rows on errors/non-ONLINE, Enter → vdevModal] +
-    scan:/errors: lines + DATASET table). Pool modal appends verbatim
-    `zpool status`; host modal appends all pools' statuses + per-disk
-    `smartctl -a` verbatims (appendVerbatim blocks).
+    line + DISK table + capacity chips/counts),
+    poolDetails (pool line + leaf VDEV table [red rows on errors/non-ONLINE,
+    Enter → vdevModal] + scan:/errors: lines + DATASET table). VDEV topology
+    is NOT reconstructed in details; `zpool status` in pool modal is the
+    human topology view. Disk rows open disk modals with lsblk props and
+    `smartctl -a` verbatim. Details tables use measured column widths; avoid
+    fixed `%6s`-style columns that break on values like `1022.5G`.
   - `s` snapshot dialog, `y` sync dialog: centered dialogBox (title in the
     border) composited OVER the table via overlayCenter (ANSI-aware
     splicing). Forms: bubbles textinput + checkbox() + button(), Tab/↑↓
@@ -223,6 +234,13 @@ every emitted shape — extend regexes and constructors together. The global
   over "in-sync".
 - Pool part of host specs (user@host:pool) is stored/displayed but doesn't
   filter anything yet.
+- Disk/vdev discovery follow-ups: `zd*` zvol pseudo-disks are filtered; the
+  filter should stay precise (`zd` + digits). Vdev→disk mapping currently
+  uses lsblk NAME/KNAME/PATH and by-partlabel aliases; pools using by-id or
+  by-path may need explicit alias discovery (`readlink -f /dev/disk/by-*/*`
+  or lsblk JSON). SMART output that cannot be mapped to a Disk is dropped by
+  design during prototyping; if SMART unexpectedly shows `-`, inspect alias
+  mapping before adding fallbacks.
 - Next candidates: prune dialog (`d`, DESIGN "Snapshot pruning" — destroy
   snapshots with pairwise-common-base locking), batch `snap`/`sync` CLI,
   jobs pane, `doctor`, job-dir cleanup, XDG paths before release.
