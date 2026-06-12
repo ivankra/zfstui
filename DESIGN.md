@@ -8,9 +8,9 @@ execution with detached jobs and live progress (most of M4). Not yet: batch
 `snap`/`sync` CLI, prune, jobs pane, `doctor`, job-dir cleanup.
 
 - `zfstui refresh` ssh-es to all known hosts in parallel and scrapes
-  `zpool list`/`zfs list -H -p` plus `/tmp/zfstui-job-*` job state into a
-  sqlite cache (a pure cache — safe to delete any time). Read-only on the
-  hosts.
+  `zpool/zfs get -Hp all` (every property + source) plus `/tmp/zfstui-job-*`
+  job state into a sqlite cache (a pure cache — safe to delete any time).
+  Read-only on the hosts.
 - `zfstui status` prints the groups × host:pool matrix. Replication groups
   and per-replica states (ahead/behind/diverged/resumable/clone) are derived
   from **snapshot GUIDs**, never names. Cell markers: `+` unsnapshotted
@@ -19,9 +19,17 @@ execution with detached jobs and live progress (most of M4). Not yet: batch
   and boring `bak/`/`srv/`-style prefixes are auto-trimmed from row names
   into cells — all convention-free, derived from the data.
 - bare `./zfstui` opens the TUI: scrollable matrix with a two-level
-  host/pool header (both navigable, with details), color-coded cells, a
-  details pane (Tab to focus/scroll), async refresh (`r` host / `R` all),
-  `h` toggles hidden groups, `?` help.
+  host/pool header (both navigable; hosts show "(53%/38T)" capacity when the
+  column is wide enough), color-coded cells, row guide on the cursor's row,
+  async refresh (`r` host / `R` all), `h` toggles hidden groups, `?` help.
+  The Details pane is interactive: segmented title chips
+  (`──[ ws:tank/srv/git (/) ]──[ 21.8G used, @20260612 (10.3G) +22K ]──`),
+  per-view tables (JOBS + SNAPSHOT for a dataset, POOL for a host, DATASET
+  for a pool, REPLICAS for a group); Tab focuses it, ↑↓ move a row cursor,
+  and Enter (there or directly on a table cell/header) opens a modal with
+  EVERYTHING known about the object — the full `get all` property map with
+  sources for datasets/snapshots/pools, access+pools for hosts, meta+command
+  for jobs.
 - **sync (the core!)**: `y` opens the sync dialog for the selected dataset:
   destinations in its group that need syncing are pre-checked (up-to-date
   skipped; diverged/dirty/clone listed disabled with reasons), intermediate
@@ -204,11 +212,17 @@ sleeps — see job protocol below for the failure/resume story.
 One ssh invocation per host running a small command batch:
 
 ```
-zpool list -H -p -o name,size,alloc,free,health,guid
-zfs list -H -p -t filesystem,volume -o name,guid,used,avail,refer,creation,createtxg,written,origin,encryption,keystatus,keylocation,mounted,canmount,mountpoint,readonly,receive_resume_token,compression,recordsize
-zfs list -H -p -t snapshot -o name,guid,used,creation,createtxg
+zpool get -Hp all
+zfs get -Hp -t filesystem,volume all
+zfs get -Hp -t snapshot all
 glob+dump of /tmp/zfstui-job-* (status, meta.json, progress, expected)
 ```
+
+`get all` (2026-06-12, replacing the earlier `list -o <columns>`): every
+property is collected including its source, so detail views can show
+everything and adding a displayed field never touches the protocol or
+schema. Typed fields derive from the property maps in one place
+(zfsparse.go fromProps); sqlite stores the maps as JSON.
 
 Unreachable hosts (short connect timeout) are marked stale in the UI with the
 last-seen time; their cached data is kept and shown dimmed.
@@ -375,9 +389,11 @@ progress    pv machine-readable output (bytes done / total), if pv available
   finished transfers it never started.
 - Old job dirs are pruned by age/count during refresh.
 
-## TUI
+## TUI (as built)
 
-Single screen, three regions; `Tab` cycles focus. Modal dialogs on top.
+Single screen, two panes (Datasets table, interactive Details) plus modal
+dialogs/popups composited over the table. Segmented pane titles:
+`──[ id ]──[ info chips ]──`; the focused pane's first segment is underlined.
 
 ```
 ┌ Datasets ──────────────────────────────────────────────────────────────┐
@@ -397,26 +413,29 @@ Single screen, three regions; `Tab` cycles focus. Modal dialogs on top.
 
 Keyboard scheme (mnemonic letters, consistent everywhere):
 
-- `q` quit, `?` help overlay, `Tab`/`Shift-Tab` switch pane
-- arrows / `hjkl`: move cursor; table cursor selects a *cell* (replica) or a
-  *row* (group, when in the name column); details pane follows the cursor
-- `r` refresh hosts relevant to selection, `R` refresh all
-- `s` snapshot dialog: name (default today's `YYYYMMDD`), recursive y/n,
-  replicas to snap on (default: the ahead replica; the selected cell if the
-  group is in sync)
-- `c` copy/sync dialog: source (default: the ahead replica; must be chosen
-  explicitly if none), destinations (default: all *compatible* replicas of
-  the group; incompatible ones greyed out with the reason), engine, recursive,
-  dry-run toggle, "run from" (default: source host)
-- `d` prune dialog (destroy snapshots) for the selected group/replica
+- `q` quit, `?` help overlay, `Tab` switch pane focus
+- arrows / `jk`: move cursor (NOT vim h/l — `h` is the hidden toggle);
+  ↑ past the first row selects a pool, ↑ again a host (←→ jump host-to-host)
+- `Enter`: detail modal for the selection (dataset cell, host or pool
+  header); group rows drill into Details instead. In focused Details, ↑↓
+  move between selectable rows (snapshots/jobs/pools/datasets/replicas),
+  Enter opens that object's modal
+- `r` refresh the selected host, `R` refresh all (async; spinner + live
+  progress polling while jobs run)
+- `s` snapshot dialog: name input (default `YYYYMMDD`), recursive checkbox,
+  live command preview; Create acts immediately (no confirm screen)
+- `y` sync dialog: member checkboxes pre-checked iff they need syncing,
+  disabled rows show reasons, free-form "new dest" editbox (full send),
+  `-I` intermediate default-on
 - `h` toggle showing hidden (snapshot-less) groups
-- in Jobs pane: `Enter` opens job's log in the Log pane, `x` cancel (kills pid)
-- dialogs: `Enter` confirm, `Esc` cancel
-- function-key aliases for the F-key inclined: `F5`=copy, `F2`=snapshot
+- dialogs: Tab/↑↓ cycle focus, Space toggles, Enter = default action, Esc
+  cancel; in -dry-run, action buttons say "(dry run)" and show a scrollable
+  plan modal instead of executing
 
-Color: green in-sync, bold ahead, yellow behind, red diverged/error, cyan
-resumable, dim unreachable-host columns. Suffix codes carry the same info for
-no-color terminals.
+Colors: white normal/behind, green unsynced snapshots (ahead), bright yellow
+unsnapshotted writes (`+`), red diverged, cyan resumable + section headers +
+status messages, dim clone/unreachable. Markers carry the same info without
+color. Planned, not yet built: `d` prune dialog, a jobs pane, `x` job cancel.
 
 ## CLI (batch mode)
 
@@ -481,7 +500,7 @@ schema-version bump simply drops and recreates it).
 - Later: integration harness — a VM/container with a few file-backed zpools
   and ssh-to-localhost simulating multiple "hosts".
 
-## Implementation notes (as of M3, 2026-06-10)
+## Implementation notes (as of 2026-06-12)
 
 Flat `package main`, one directory (user preference — keep it flat). File
 map and the invariants worth knowing before touching code live in
@@ -506,8 +525,14 @@ Non-obvious implementation decisions, with reasons:
 - The TUI cursor uses negative rows for the header (−2 host, −1 pool); the
   name column is `curCol == 0`, data columns are 1-based into the sorted
   `host:pool` column list. Left/right on the host row jumps host-to-host.
-- Cell text logic is shared (`cellText`) between CLI and TUI; the TUI adds
+- Cell text logic is shared (`CellText`) between CLI and TUI; the TUI adds
   color on top, the CLI relies on markers alone.
+- Discovery is `get -Hp all`: typed struct fields derive from the property
+  maps in one place (zfsparse.go fromProps/toProps); sqlite stores the maps
+  as JSON; detail modals dump them fully, with property sources.
+- Details pane content is a list of `detLine`s (details.go); selectable ones
+  carry an `open` closure returning the object's modal. Scrolling pulls up
+  to 3 non-selectable context lines (section headers) into view.
 - The "ahead" state intentionally has **no marker/asterisk** in cells: the
   newest `@name` in the row identifies the source (user preference).
 - Display-name pipeline: name-in-pool → `trimBoring` (drop leading
@@ -604,6 +629,13 @@ TUI is manual for now.
   (`zfs send -nP`, read-only) into ./expected and tick ./progress via
   optional pv; TUI spinner + percentage as above. Old job dirs are not yet
   pruned (manual `rm -rf /tmp/zfstui-job-*` of finished ones is safe).
+- 2026-06-12: **discovery via `get all`** — every property + source is
+  collected and cached (JSON maps in sqlite, schema v4); typed fields derive
+  from the maps in one place. Detail modals show the full dumps.
+- 2026-06-12: **interactive Details pane** — segmented title chips, per-view
+  tables with a row cursor, Enter-opens-modal everywhere (incl. directly
+  from table cells/headers). State display renamed "in-sync" → "synced".
+  Docs merged: README.md folded into DESIGN.md (user edit).
 - Name: `zfstui`.
 
 ## Initial wishes

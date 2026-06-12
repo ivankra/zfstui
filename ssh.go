@@ -61,7 +61,6 @@ func (s *SSH) Args(host Host, extra []string, cmd string) []string {
 	if host.Port != 0 {
 		args = append(args, "-p", strconv.Itoa(host.Port))
 	}
-	args = append(args, extra...)
 	args = append(args, host.Dest(), cmd)
 	return args
 }

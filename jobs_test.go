@@ -38,14 +38,20 @@ func TestSSHArgsExtraFirst(t *testing.T) {
 	if args[0] != "-A" || args[1] != "-o" || args[2] != "ControlPath=none" {
 		t.Errorf("extras not first: %v", args)
 	}
-	found := false
+	found, overrideCount := false, 0
 	for _, a := range args[3:] {
 		if strings.HasPrefix(a, "ControlPath=") && a != "ControlPath=none" {
 			found = true
 		}
+		if a == "ControlPath=none" {
+			overrideCount++
+		}
 	}
 	if !found {
 		t.Errorf("multiplexed ControlPath should still follow: %v", args)
+	}
+	if overrideCount != 0 {
+		t.Errorf("extra ControlPath override repeated after defaults: %v", args)
 	}
 }
 

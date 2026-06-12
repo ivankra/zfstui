@@ -5,8 +5,23 @@ import (
 	"testing"
 )
 
-const poolsOut = "ssd\t512110190592\t256055095296\t256055095296\tONLINE\t1111\n" +
-	"tank\t4000787030016\t2000393515008\t2000393515008\tDEGRADED\t2222\n"
+// prop builds one `get -Hp all` line.
+func prop(name, k, v, src string) string {
+	return name + "\t" + k + "\t" + v + "\t" + src + "\n"
+}
+
+var poolsOut = prop("ssd", "size", "512110190592", "-") +
+	prop("ssd", "allocated", "256055095296", "-") +
+	prop("ssd", "free", "256055095296", "-") +
+	prop("ssd", "capacity", "50", "-") +
+	prop("ssd", "fragmentation", "20", "-") +
+	prop("ssd", "dedupratio", "1.00", "-") +
+	prop("ssd", "health", "ONLINE", "-") +
+	prop("ssd", "guid", "1111", "-") +
+	prop("ssd", "feature@encryption", "active", "local") +
+	prop("tank", "size", "4000787030016", "-") +
+	prop("tank", "health", "DEGRADED", "-") +
+	prop("tank", "guid", "2222", "-")
 
 func TestParsePools(t *testing.T) {
 	pools, err := ParsePools("dev1", poolsOut)
@@ -17,25 +32,50 @@ func TestParsePools(t *testing.T) {
 		t.Fatalf("got %d pools", len(pools))
 	}
 	p := pools[0]
-	if p.Host != "dev1" || p.Name != "ssd" || p.Size != 512110190592 || p.GUID != "1111" {
+	if p.Host != "dev1" || p.Name != "ssd" || p.Size != 512110190592 || p.GUID != "1111" ||
+		p.Cap != 50 || p.Frag != 20 || p.Dedup != "1.00" {
 		t.Errorf("bad pool: %+v", p)
+	}
+	if p.Props["feature@encryption"] != "active" || p.PropSrc["feature@encryption"] != "local" {
+		t.Errorf("full props not kept: %+v", p.Props)
 	}
 	if pools[1].Health != "DEGRADED" {
 		t.Errorf("bad health: %+v", pools[1])
 	}
 }
 
-func TestParsePoolsBadColumns(t *testing.T) {
-	if _, err := ParsePools("dev1", "ssd\t123\n"); err == nil {
-		t.Fatal("want error on wrong column count")
+func TestParsePoolsMalformed(t *testing.T) {
+	if _, err := ParsePools("dev1", "just one field\n"); err == nil {
+		t.Fatal("want error on malformed line")
 	}
 }
 
-// One encrypted mounted dataset, one bak (unmounted, resume token), in -H -p form.
-const datasetsOut = "ssd/srv/git\tfilesystem\t777\t1000\t2000\t900\t1700000000\t100\t4096\t-\t" +
-	"aes-256-gcm\tavailable\tfile:///k\tyes\ton\t/srv/git\toff\t-\tzstd\t131072\n" +
-	"tank/bak/git\tfilesystem\t888\t1000\t2000\t900\t1700000001\t101\t0\t-\t" +
-	"aes-256-gcm\tunavailable\t-\tno\toff\t-\toff\t1-abc-def\tzstd\t131072\n"
+func datasetProps(name string, over map[string]string) string {
+	base := map[string]string{
+		"type": "filesystem", "guid": "777",
+		"used": "1000", "available": "2000", "referenced": "900",
+		"creation": "1700000000", "createtxg": "100", "written": "4096",
+		"origin": "-", "encryption": "aes-256-gcm", "keystatus": "available",
+		"keylocation": "file:///k", "mounted": "yes", "canmount": "on",
+		"mountpoint": "/srv/git", "readonly": "off",
+		"receive_resume_token": "-", "compression": "zstd", "recordsize": "131072",
+	}
+	for k, v := range over {
+		base[k] = v
+	}
+	var b strings.Builder
+	for k, v := range base {
+		b.WriteString(prop(name, k, v, "local"))
+	}
+	return b.String()
+}
+
+var datasetsOut = datasetProps("ssd/srv/git", nil) +
+	datasetProps("tank/bak/git", map[string]string{
+		"guid": "888", "written": "0", "keystatus": "unavailable", "keylocation": "-",
+		"mounted": "no", "canmount": "off", "mountpoint": "-",
+		"receive_resume_token": "1-abc-def",
+	})
 
 func TestParseDatasets(t *testing.T) {
 	dss, err := ParseDatasets("dev1", datasetsOut)
@@ -45,7 +85,14 @@ func TestParseDatasets(t *testing.T) {
 	if len(dss) != 2 {
 		t.Fatalf("got %d datasets", len(dss))
 	}
-	d := dss[0]
+	var d, b Dataset
+	for _, x := range dss {
+		if x.Name == "ssd/srv/git" {
+			d = x
+		} else {
+			b = x
+		}
+	}
 	if d.Name != "ssd/srv/git" || !d.Encrypted() || !d.Mounted || d.Written != 4096 {
 		t.Errorf("bad dataset: %+v", d)
 	}
@@ -55,14 +102,24 @@ func TestParseDatasets(t *testing.T) {
 	if d.Origin != "" || d.ResumeToken != "" {
 		t.Errorf("'-' should map to empty: %+v", d)
 	}
-	b := dss[1]
+	if d.Props["compression"] != "zstd" || d.PropSrc["compression"] != "local" {
+		t.Errorf("props/source not kept: %v %v", d.Props, d.PropSrc)
+	}
 	if b.Mounted || b.ResumeToken != "1-abc-def" || b.KeyLocation != "" {
 		t.Errorf("bad bak dataset: %+v", b)
 	}
 }
 
-const snapsOut = "ssd/srv/git@20260601\tabc1\t1024\t1764547200\t500\n" +
-	"ssd/srv/git@20260610\tabc2\t0\t1765324800\t600\n"
+func snapProps(full, guid, used, refer, creation, txg string) string {
+	return prop(full, "guid", guid, "-") +
+		prop(full, "used", used, "-") +
+		prop(full, "referenced", refer, "-") +
+		prop(full, "creation", creation, "-") +
+		prop(full, "createtxg", txg, "-")
+}
+
+var snapsOut = snapProps("ssd/srv/git@20260601", "abc1", "1024", "850", "1764547200", "500") +
+	snapProps("ssd/srv/git@20260610", "abc2", "0", "900", "1765324800", "600")
 
 func TestParseSnapshots(t *testing.T) {
 	snaps, err := ParseSnapshots("dev1", snapsOut)
@@ -72,14 +129,19 @@ func TestParseSnapshots(t *testing.T) {
 	if len(snaps) != 2 {
 		t.Fatalf("got %d snapshots", len(snaps))
 	}
-	s := snaps[0]
-	if s.Dataset != "ssd/srv/git" || s.Name != "20260601" || s.GUID != "abc1" || s.Creation != 1764547200 {
+	var s Snapshot
+	for _, x := range snaps {
+		if x.Name == "20260601" {
+			s = x
+		}
+	}
+	if s.Dataset != "ssd/srv/git" || s.GUID != "abc1" || s.Creation != 1764547200 || s.Refer != 850 {
 		t.Errorf("bad snapshot: %+v", s)
 	}
 }
 
 func TestParseSnapshotsRejectsMissingAt(t *testing.T) {
-	if _, err := ParseSnapshots("dev1", "ssd/srv/git\tabc\t0\t1\t2\n"); err == nil {
+	if _, err := ParseSnapshots("dev1", prop("ssd/srv/git", "guid", "abc", "-")); err == nil {
 		t.Fatal("want error for snapshot without @")
 	}
 }
@@ -116,7 +178,7 @@ func TestParseDiscoveryMissingSection(t *testing.T) {
 
 func TestDiscoverCommandSudo(t *testing.T) {
 	cmd := DiscoverCommand(true)
-	if !strings.Contains(cmd, "sudo -n zpool list") || !strings.Contains(cmd, "sudo -n zfs list") {
+	if !strings.Contains(cmd, "sudo -n zpool get") || !strings.Contains(cmd, "sudo -n zfs get") {
 		t.Errorf("sudo missing: %s", cmd)
 	}
 	if strings.Contains(DiscoverCommand(false), "sudo") {
@@ -124,11 +186,11 @@ func TestDiscoverCommandSudo(t *testing.T) {
 	}
 }
 
-const jobsOut = `==J== /tmp/zfstui-job-20260611T100000Z-aa11
+const jobsOut = `==J== /tmp/zfstui-job-aa11Qx
 running 4242 2026-06-11T10:00:01Z
 ==M==
 {
-  "id": "20260611T100000Z-aa11",
+  "id": "aa11Qx",
   "kind": "sync",
   "src": "ws:tank/srv/git",
   "dest": "cml:root/bak/git"
@@ -137,10 +199,10 @@ running 4242 2026-06-11T10:00:01Z
 123456789
 ==E==
 1000000000
-==J== /tmp/zfstui-job-20260610T090000Z-bb22
+==J== /tmp/zfstui-job-bb22Zy
 done 2026-06-10T09:05:00Z
 ==M==
-{"id": "20260610T090000Z-bb22", "kind": "snapshot", "dataset": "tank/srv/git", "snapshot": "x"}
+{"id": "bb22Zy", "kind": "snapshot", "dataset": "tank/srv/git", "snapshot": "x"}
 ==P==
 ==E==
 `
@@ -151,7 +213,7 @@ func TestParseJobs(t *testing.T) {
 		t.Fatalf("got %d jobs", len(jobs))
 	}
 	j := jobs[0]
-	if j.ID != "20260611T100000Z-aa11" || j.Kind != "sync" || j.State != "running" ||
+	if j.ID != "aa11Qx" || j.Kind != "sync" || j.State != "running" ||
 		j.Progress != 123456789 || j.Expected != 1000000000 ||
 		j.Meta["dest"] != "cml:root/bak/git" {
 		t.Errorf("job0: %+v", j)

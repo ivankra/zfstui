@@ -73,15 +73,21 @@ func (h Host) SameAccess(o Host) bool {
 		h.SendUser == o.SendUser && h.RecvUser == o.RecvUser
 }
 
-// Pool is one zpool on a host.
+// Pool is one zpool on a host. Typed fields are parsed out of Props
+// (`zpool get -Hp all`); Props/PropSrc carry everything for detail views.
 type Pool struct {
-	Host   string
-	Name   string
-	GUID   string
-	Size   int64
-	Alloc  int64
-	Free   int64
-	Health string
+	Host    string
+	Name    string
+	GUID    string
+	Size    int64
+	Alloc   int64
+	Free    int64
+	Cap     int64  // capacity %
+	Frag    int64  // fragmentation %
+	Dedup   string // dedupratio
+	Health  string
+	Props   map[string]string
+	PropSrc map[string]string
 }
 
 // Dataset is a filesystem or volume on a host. Snapshots live separately.
@@ -107,6 +113,8 @@ type Dataset struct {
 	ResumeToken string // receive_resume_token; non-empty => interrupted recv
 	Compression string
 	RecordSize  int64
+	Props       map[string]string // full `zfs get all` map (display)
+	PropSrc     map[string]string // property sources (local/inherited/...)
 }
 
 // Pool returns the pool component of the dataset name.
@@ -142,8 +150,11 @@ type Snapshot struct {
 	Name      string // snapshot part only (after "@")
 	GUID      string // preserved across send/recv: the cross-host identity
 	Used      int64
+	Refer     int64
 	Creation  int64 // unix seconds
 	CreateTXG int64
+	Props     map[string]string
+	PropSrc   map[string]string
 }
 
 // HostState is everything discovered on one host in one refresh.
@@ -172,7 +183,7 @@ type JobInfo struct {
 type ReplicaState string
 
 const (
-	StateInSync    ReplicaState = "in-sync"
+	StateInSync    ReplicaState = "synced"
 	StateAhead     ReplicaState = "ahead"
 	StateBehind    ReplicaState = "behind"
 	StateDiverged  ReplicaState = "diverged"

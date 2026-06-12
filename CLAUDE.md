@@ -1,8 +1,9 @@
 # zfstui — agent notes
 
 TUI/CLI for managing ZFS dataset replication across ssh-reachable hosts.
-READ DESIGN.md first: architecture, decisions log (dated, explains *why*),
-roadmap. README.md has the user's original wishes + a status summary.
+READ DESIGN.md first: it is THE doc now (status, architecture, dated
+decisions log explaining *why*, roadmap, and the user's original wishes at
+the bottom — README.md was merged into it and deleted).
 
 State as of 2026-06-12: discovery/status (M1), read-only TUI (M3), sync
 planner (M2 core), and most of M4 (snapshot + sync dialogs, detached jobs,
@@ -73,15 +74,19 @@ every emitted shape — extend regexes and constructors together. The global
   raw inventory incl. Jobs), Replica/Group (derived).
 - `hostspec.go` — parseHostSpec/parseHostSpecs (URL forms, conflict
   rejection, root normalized to "") and resolveHosts (specs ↔ sqlite memory).
-- `zfsparse.go` — hand parsers for `-H -p` tab-separated output ("-" =
-  absent) + DiscoverCommand (ONE ssh round-trip, four marker-delimited
-  sections with per-section exit codes; 4th = `jobsProbe` globbing
-  /tmp/zfstui-job-*, also used standalone for live progress polling) +
-  ParseDiscovery/ParseJobs.
+- `zfsparse.go` — discovery uses `zpool/zfs get -Hp all` (NAME\tPROP\tVALUE
+  \tSOURCE lines): EVERY property is collected; typed struct fields derive
+  from the prop maps in ONE place (datasetFromProps & friends, with toProps
+  inverses for code-built fixtures). DiscoverCommand = ONE ssh round-trip,
+  four marker-delimited sections with per-section exit codes; 4th =
+  `jobsProbe` globbing /tmp/zfstui-job-*, also used standalone for live
+  progress polling. ParseDiscovery/ParseJobs.
 - `ssh.go` — Runner interface (Run/RunInput; everything testable offline via
   fakes); shells out to system `ssh` (BatchMode, ConnectTimeout,
   ControlMaster sockets in ~/.local/state/zfstui/cm). Never use an ssh lib.
-- `store.go` — sqlite cache (modernc.org/sqlite). `db.SetMaxOpenConns(1)` is
+- `store.go` — sqlite cache (modernc.org/sqlite). Inventory rows store the
+  full property maps as JSON (props+srcs); typed fields are re-derived on
+  load via the same fromProps mappings. `db.SetMaxOpenConns(1)` is
   load-bearing (SQLITE_BUSY under parallel refresh; `:memory:` per-conn DBs).
   schemaVersion mismatch drops all tables.
 - `derive.go` — THE core; pure functions of inventory:
@@ -127,13 +132,26 @@ every emitted shape — extend regexes and constructors together. The global
   - cursor: curRow -2 = host header (←→ jump host-to-host), -1 = pool
     header, 0.. = group rows; curCol 0 = name column, 1..N = sorted
     "host:pool" columns. Row guide: cursor's row gets bg tint 238 always.
-  - colors: white normal/behind, green unsynced snapshots (ahead), orange
-    214 unsnapshotted writes (+), red diverged, cyan resumable, dim clone /
-    unreachable-host columns.
-  - panes: Datasets / Details, Tab switches focus (Details scrolls via
-    detOff). Pane titles plain white, active gets [ brackets ]; Details
-    title IS the selection identity ("group anki", "host cml",
-    "pool ws:tank", "ws:tank/srv/git") and content is unindented.
+  - colors: white normal/behind, green unsynced snapshots (ahead), bright
+    yellow 226 unsnapshotted writes (+), red diverged, cyan 14 resumable /
+    section headers / status messages, dim clone / unreachable-host columns.
+    Done jobs plain white. The user picks colors by feel — expect tweaks.
+  - panes: Datasets / Details. Pane titles are SEGMENTED: ──[ id ]──[ info
+    chips ]── (text plain white, brackets/rules dim); the ACTIVE pane's
+    first segment text is UNDERLINED (only the text, not padding). Host
+    header spans append "(53%/38T)" when the span is wide enough. Details
+    (details.go) is structured: detLine rows; selectable ones (snapshots/
+    jobs/pools/datasets/replicas) get a white-bg row cursor when focused
+    (Tab or Enter-from-group-row; ↑↓ move — scrolling pulls section headers
+    back into view; Enter opens a textModal with ALL properties incl.
+    sources — the get-all payoff). Enter in the MAIN table opens modals
+    directly: dataset cell → datasetModal, host header → hostModal, pool
+    header → poolModal; group rows drill into Details. Per-view layouts:
+    replicaDetails (chips: "host:ds (mountpoint)", "Xg used, @latest
+    (refer) +written", encryption; JOBS rows "id 51%|OK|FAIL desc" +
+    SNAPSHOT/USED/REFER table), groupDetails (chips: "group X",
+    "@latest (refer) +writtenSum"; REPLICAS), hostDetails (selectable ssh
+    line + POOL table + counts), poolDetails (pool line + DATASET table).
   - `s` snapshot dialog, `y` sync dialog: centered dialogBox (title in the
     border) composited OVER the table via overlayCenter (ANSI-aware
     splicing). Forms: bubbles textinput + checkbox() + button(), Tab/↑↓
@@ -176,8 +194,11 @@ every emitted shape — extend regexes and constructors together. The global
   one frame works).
 - BEWARE silent no-op python str.replace doc/code edits — verify with grep
   after batch edits (bit us twice).
+- ALWAYS finish a change by rebuilding the binary the user runs:
+  `go build -o zfstui .` (explicit user requirement — they test immediately).
 - The user commits; the agent cannot (`.git` is read-only here). Keep
-  README.md and DESIGN.md updated as you work — explicit user requirement.
+  DESIGN.md updated as you work — explicit user requirement (README.md no
+  longer exists; everything lives in DESIGN.md).
 
 ## Known warts / next steps
 
@@ -187,6 +208,8 @@ every emitted shape — extend regexes and constructors together. The global
   remembers the typo) until the db is wiped — a `forget` command may come.
 - Real-data oddity: `packages` shows as two unrelated groups (no shared
   GUIDs) — correct; re-linking would need a full resend.
+- State display string is "synced" (constant StateInSync) — user prefers it
+  over "in-sync".
 - Pool part of host specs (user@host:pool) is stored/displayed but doesn't
   filter anything yet.
 - Next candidates: prune dialog (`d`, DESIGN "Snapshot pruning" — destroy

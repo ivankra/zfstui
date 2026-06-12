@@ -17,21 +17,24 @@ import (
 )
 
 var (
-	styleHeader    = lipgloss.NewStyle().Bold(true).Underline(true)
-	styleName      = lipgloss.NewStyle().Bold(true)
-	styleNormal    = lipgloss.NewStyle()
-	styleNewSnaps  = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))   // green: unsynced snapshots
-	styleWritten   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // orange: unsnapshotted writes (+)
-	styleDiverged  = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))   // red
-	styleResume    = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))   // cyan
-	styleClone     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))   // dim
-	styleDim       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	styleCursor    = lipgloss.NewStyle().Reverse(true)
-	stylePaneTitle = lipgloss.NewStyle().Foreground(lipgloss.Color("7")) // plain white
-	rowGuideBG     = lipgloss.Color("238")
-	styleRowGuide  = lipgloss.NewStyle().Background(rowGuideBG)
-	styleStatus    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	styleErr       = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	styleHeader     = lipgloss.NewStyle().Bold(true).Underline(true)
+	styleName       = lipgloss.NewStyle().Bold(true)
+	styleNormal     = lipgloss.NewStyle()
+	styleNewSnaps   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))   // green: unsynced snapshots
+	styleWritten    = lipgloss.NewStyle().Foreground(lipgloss.Color("226")) // bright yellow: unsnapshotted writes (+)
+	styleDiverged   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))   // red
+	styleResume     = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))   // cyan
+	styleClone      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))   // dim
+	styleDim        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleCursor     = lipgloss.NewStyle().Reverse(true)
+	stylePaneTitle  = lipgloss.NewStyle().Foreground(lipgloss.Color("7")) // plain white
+	stylePaneActive = lipgloss.NewStyle().Foreground(lipgloss.Color("7")).Underline(true)
+	rowGuideBG      = lipgloss.Color("238")
+	styleRowGuide   = lipgloss.NewStyle().Background(rowGuideBG)
+	styleSection    = lipgloss.NewStyle().Foreground(lipgloss.Color("14")) // light cyan: details table headers
+	styleStatus     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleStatusMsg  = lipgloss.NewStyle().Foreground(lipgloss.Color("14")) // light cyan: status/action messages
+	styleErr        = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
 
 // cellStyle: white = normal (in sync or merely behind — the @names speak),
@@ -85,6 +88,7 @@ type Model struct {
 
 	focus  int // 0 = Datasets pane, 1 = Details pane
 	detOff int // Details scroll offset
+	detCur int // Details row cursor (selectable lines)
 
 	showHidden bool
 	showHelp   bool
@@ -364,19 +368,43 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showHelp = true
 		case "tab", "shift+tab":
 			m.focus = 1 - m.focus
+			if m.focus == 1 {
+				m.detSnap()
+			}
 		case "up", "k":
 			if m.focus == 1 {
-				m.detOff--
+				m.detMove(-1)
 			} else {
 				m.curRow--
-				m.detOff = 0
+				m.detOff, m.detCur = 0, 0
 			}
 		case "down", "j":
 			if m.focus == 1 {
-				m.detOff++
+				m.detMove(1)
 			} else {
 				m.curRow++
-				m.detOff = 0
+				m.detOff, m.detCur = 0, 0
+			}
+		case "enter":
+			if m.focus == 1 {
+				m.detOpen()
+				return m, nil
+			}
+			// Main table: Enter opens the detail modal for the selection.
+			switch {
+			case m.curRow == -2 && m.curCol >= 1 && m.curCol <= len(m.cols):
+				m.modal = m.hostModal(m.hostOfCol(m.curCol - 1))
+			case m.curRow == -1 && m.curCol >= 1 && m.curCol <= len(m.cols):
+				parts := strings.SplitN(m.cols[m.curCol-1], ":", 2)
+				m.modal = m.poolModalFor(parts[0], parts[1])
+			default:
+				if _, c := m.selected(); c != nil && len(c.replicas) == 1 {
+					m.modal = datasetModal(c.replicas[0].Dataset)
+				} else {
+					// group row / multi-replica cell: drill into Details.
+					m.focus = 1
+					m.detSnap()
+				}
 			}
 		case "left":
 			if m.focus == 1 {
@@ -387,7 +415,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.curCol--
 			}
-			m.detOff = 0
+			m.detOff, m.detCur = 0, 0
 		case "right":
 			if m.focus == 1 {
 				break
@@ -397,7 +425,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.curCol++
 			}
-			m.detOff = 0
+			m.detOff, m.detCur = 0, 0
 		case "h": // toggle hidden groups, not vim-left: arrows move horizontally
 			m.showHidden = !m.showHidden
 			if err := m.reload(); err != nil {
@@ -405,13 +433,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "g", "home":
 			if m.focus == 1 {
-				m.detOff = 0
+				m.detOff, m.detCur = 0, 0
+				m.detSnap()
 			} else {
 				m.curRow = 0
 			}
 		case "G", "end":
 			if m.focus == 1 {
-				m.detOff = 1 << 30 // clamped to bottom at render
+				m.detCur = 1 << 30
+				m.detSnap()
+				m.detOff = m.detCur - detailsBodyH + 1
 			} else {
 				m.curRow = len(m.rows) - 1
 			}
@@ -480,9 +511,10 @@ func (m *Model) View() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(m.paneTitle("Datasets", m.focus == 0))
+	b.WriteString(m.paneTitle([]string{"Datasets"}, m.focus == 0))
 	b.WriteString(m.tableView(m.tableBodyH()))
-	b.WriteString(m.paneTitle(m.detailsTitle(), m.focus == 1))
+	detSegs, _ := m.detailsContent()
+	b.WriteString(m.paneTitle(detSegs, m.focus == 1))
 	b.WriteString(m.detailsBody())
 	b.WriteString(m.footerView())
 	if m.dialog != nil {
@@ -633,19 +665,32 @@ func overlayCenter(base, box string, w, h int) string {
 	return strings.Join(baseLines, "\n")
 }
 
-// paneTitle renders "── Name ───…" — plain white title text (readable
-// against the dim border), with [ ] markers around the focused pane's name.
-func (m *Model) paneTitle(name string, active bool) string {
-	label := " " + name + " "
-	if active {
-		label = " [ " + name + " ] "
+// paneTitle renders segmented titles: ──[ seg ]──[ seg ]──…; the active
+// pane's first segment gets ▶ ◀ cursor markers.
+func (m *Model) paneTitle(segs []string, active bool) string {
+	var b strings.Builder
+	used := 0
+	write := func(t string, st lipgloss.Style) {
+		b.WriteString(st.Render(t))
+		used += lipgloss.Width(t)
 	}
-	fill := m.width - 2 - lipgloss.Width(label)
-	if fill < 0 {
-		fill = 0
+	write("──", styleDim)
+	for i, seg := range segs {
+		st := stylePaneTitle
+		if active && i == 0 {
+			st = stylePaneActive
+		}
+		write("[", styleDim)
+		write(" ", stylePaneTitle)
+		write(seg, st)
+		write(" ", stylePaneTitle)
+		write("]", styleDim)
+		write("──", styleDim)
 	}
-	return styleDim.Render("──") + stylePaneTitle.Render(label) +
-		styleDim.Render(strings.Repeat("─", fill)) + "\n"
+	if fill := m.width - used; fill > 0 {
+		b.WriteString(styleDim.Render(strings.Repeat("─", fill)))
+	}
+	return b.String() + "\n"
 }
 
 // cellTextLive is the table cell text plus a spinner when a job touching
@@ -755,6 +800,24 @@ func (m *Model) tableView(h int) string {
 	hostOf := func(col string) string { return strings.SplitN(col, ":", 2)[0] }
 	poolOf := func(col string) string { return strings.SplitN(col, ":", 2)[1] }
 
+	// "(37T/53%)" capacity label for a host header, shown only when it fits.
+	hostInfo := func(host string) string {
+		var size, alloc int64
+		for i := range m.data.States {
+			if m.data.States[i].Host != host {
+				continue
+			}
+			for _, p := range m.data.States[i].Pools {
+				size += p.Size
+				alloc += p.Alloc
+			}
+		}
+		if size == 0 {
+			return ""
+		}
+		return fmt.Sprintf("(%d%%/%s)", alloc*100/size, human(size))
+	}
+
 	var b strings.Builder
 	// Header line 1: hosts, spanning their (consecutive, sorted) pool
 	// columns. Selectable: cursor row -2 highlights the whole span.
@@ -768,7 +831,12 @@ func (m *Model) tableView(h int) string {
 			cj++
 		}
 		b.WriteString("  ")
-		hdr := pad(host, span-2)
+		label := host
+		if info := hostInfo(host); info != "" &&
+			lipgloss.Width(host)+1+lipgloss.Width(info) <= span-2 {
+			label = host + " " + info
+		}
+		hdr := pad(label, span-2)
 		switch {
 		case m.curRow == -2 && m.curCol-1 >= ci && m.curCol-1 < cj:
 			b.WriteString(styleCursor.Render(hdr))
@@ -873,224 +941,6 @@ func human(n int64) string {
 	return fmt.Sprintf("%.1f%c", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// detailsTitle names the Details pane after the selection: the first line
-// of content used to repeat this — now the title carries the identity.
-func (m *Model) detailsTitle() string {
-	g, c := m.selected()
-	switch {
-	case m.curRow == -2:
-		if m.curCol >= 1 && m.curCol <= len(m.cols) {
-			return "host " + m.hostOfCol(m.curCol-1)
-		}
-	case m.curRow == -1:
-		if m.curCol >= 1 && m.curCol <= len(m.cols) {
-			return "pool " + m.cols[m.curCol-1]
-		}
-	case g != nil && m.curCol == 0:
-		return "group " + g.DisplayName
-	case g != nil && c != nil && len(c.replicas) > 0:
-		return c.replicas[0].Dataset.Host + ":" + c.replicas[0].Dataset.Name
-	}
-	return "Details"
-}
-
-// detailLines builds the full (unscrolled) Details pane content.
-func (m *Model) detailLines() []string {
-	var lines []string
-	g, c := m.selected()
-	switch {
-	case m.curRow == -2:
-		lines = m.hostDetails()
-	case m.curRow == -1:
-		lines = m.poolDetails()
-	case g == nil:
-		lines = append(lines, "nothing selected")
-	case m.curCol == 0:
-		// Name column: group-level summary, columns aligned (identity is in
-		// the pane title).
-		lines = append(lines, fmt.Sprintf("%d replica(s) · latest @%s",
-			len(g.Members), orDash(g.LatestName)))
-		nameW := 0
-		for _, r := range g.Members {
-			if l := len(r.Dataset.Host + ":" + r.Dataset.Name); l > nameW {
-				nameW = l
-			}
-		}
-		for _, r := range g.Members {
-			live := ""
-			if j := m.runningJobFor(r); j != nil {
-				live = "  " + spinnerFrames[m.spin%len(spinnerFrames)] + " " + jobProgressLine(j)
-			}
-			lines = append(lines, fmt.Sprintf("%-*s  %-9s  %s%s",
-				nameW, r.Dataset.Host+":"+r.Dataset.Name, r.State, replicaBrief(r), live))
-		}
-	case c == nil || len(c.replicas) == 0:
-		// Empty cell: this group has no replica in this host:pool.
-	default:
-		for ri, r := range c.replicas {
-			d := r.Dataset
-			enc := d.Encryption
-			if enc == "" {
-				enc = "off"
-			}
-			if len(c.replicas) > 1 && ri > 0 {
-				lines = append(lines, "")
-			}
-			if len(c.replicas) > 1 {
-				lines = append(lines, d.Host+":"+d.Name)
-			}
-			lines = append(lines,
-				fmt.Sprintf("%-9s  used %s  refer %s  written %s  encryption %s  mounted %v (%s)",
-					r.State, human(d.Used), human(d.Refer), human(d.Written), enc, d.Mounted, orDash(d.Mountpoint)))
-			if d.Origin != "" {
-				lines = append(lines, "clone of "+d.Origin)
-			}
-			if d.ResumeToken != "" {
-				lines = append(lines, "interrupted recv (resume token present)")
-			}
-			snaps := m.data.SnapsByReplica[d.Host+":"+d.Name]
-			lines = append(lines, "snapshots: "+snapList(snaps, 6))
-			lines = append(lines, m.jobDetailLines(r)...)
-		}
-	}
-	return lines
-}
-
-// detailsBody renders detailsBodyH lines of detail content at m.detOff,
-// with ↑/↓ markers when content is scrolled out of view.
-func (m *Model) detailsBody() string {
-	lines := m.detailLines()
-	maxOff := len(lines) - detailsBodyH
-	if maxOff < 0 {
-		maxOff = 0
-	}
-	if m.detOff > maxOff {
-		m.detOff = maxOff
-	}
-	if m.detOff < 0 {
-		m.detOff = 0
-	}
-	var b strings.Builder
-	for i := 0; i < detailsBodyH; i++ {
-		idx := m.detOff + i
-		if idx < len(lines) {
-			txt := pad(lines[idx], m.width-2)
-			switch {
-			case i == 0 && m.detOff > 0:
-				txt += styleDim.Render(" ↑")
-			case i == detailsBodyH-1 && idx < len(lines)-1:
-				txt += styleDim.Render(" ↓")
-			}
-			b.WriteString(txt)
-		}
-		b.WriteString("\n")
-	}
-	return b.String()
-}
-
-// hostDetails describes the host of the selected header column.
-func (m *Model) hostDetails() []string {
-	if m.curCol < 1 || m.curCol > len(m.cols) {
-		return nil
-	}
-	host := m.hostOfCol(m.curCol - 1)
-	var lines []string
-	for _, h := range m.data.Hosts {
-		if h.Name != host {
-			continue
-		}
-		when := h.LastRefresh.Format("2006-01-02 15:04:05")
-		if h.Reachable {
-			lines = append(lines, "refreshed "+when)
-		} else {
-			lines = append(lines, fmt.Sprintf("UNREACHABLE at last refresh (%s): %s", when, h.LastError))
-		}
-	}
-	for _, h := range m.hosts {
-		if h.Name == host {
-			extra := ""
-			if h.NeedSudo() {
-				extra = "  (sudo)"
-			}
-			lines = append(lines, "access "+h.URL()+extra)
-		}
-	}
-	for i := range m.data.States {
-		hs := &m.data.States[i]
-		if hs.Host != host {
-			continue
-		}
-		for _, p := range hs.Pools {
-			pct := ""
-			if p.Size > 0 {
-				pct = fmt.Sprintf(" (%d%%)", p.Alloc*100/p.Size)
-			}
-			lines = append(lines, fmt.Sprintf("pool %-12s %-9s size %-8s alloc %s%s free %s",
-				p.Name, p.Health, human(p.Size), human(p.Alloc), pct, human(p.Free)))
-		}
-		lines = append(lines, fmt.Sprintf("%d dataset(s), %d snapshot(s) cached",
-			len(hs.Datasets), len(hs.Snapshots)))
-	}
-	return lines
-}
-
-// poolDetails describes the pool of the selected header column.
-func (m *Model) poolDetails() []string {
-	if m.curCol < 1 || m.curCol > len(m.cols) {
-		return nil
-	}
-	parts := strings.SplitN(m.cols[m.curCol-1], ":", 2)
-	host, pool := parts[0], parts[1]
-	var p *Pool
-	nDatasets, nSnaps := 0, 0
-	for i := range m.data.States {
-		hs := &m.data.States[i]
-		if hs.Host != host {
-			continue
-		}
-		for j := range hs.Pools {
-			if hs.Pools[j].Name == pool {
-				p = &hs.Pools[j]
-			}
-		}
-		for _, d := range hs.Datasets {
-			if d.Pool() == pool {
-				nDatasets++
-			}
-		}
-		for _, s := range hs.Snapshots {
-			dsPool, _, _ := strings.Cut(s.Dataset, "/")
-			if dsPool == pool {
-				nSnaps++
-			}
-		}
-	}
-	if p == nil {
-		return []string{"not in cache"}
-	}
-	usedPct := ""
-	if p.Size > 0 {
-		usedPct = fmt.Sprintf(" (%d%%)", p.Alloc*100/p.Size)
-	}
-	lines := []string{
-		fmt.Sprintf("%-9s  size %s  alloc %s%s  free %s  guid %s",
-			p.Health, human(p.Size), human(p.Alloc), usedPct, human(p.Free), orDash(p.GUID)),
-		fmt.Sprintf("%d dataset(s), %d snapshot(s) cached", nDatasets, nSnaps),
-	}
-	for _, h := range m.data.Hosts {
-		if h.Name == host {
-			when := h.LastRefresh.Format("2006-01-02 15:04:05")
-			if !h.Reachable {
-				lines = append(lines, styleErr.Render(
-					fmt.Sprintf("host unreachable at last refresh (%s): %s", when, h.LastError)))
-			} else {
-				lines = append(lines, "host refreshed "+when)
-			}
-		}
-	}
-	return lines
-}
-
 func orDash(s string) string {
 	if s == "" {
 		return "-"
@@ -1151,7 +1001,7 @@ func (m *Model) footerView() string {
 	if m.statusErr {
 		line += styleErr.Render(right)
 	} else {
-		line += styleStatus.Render(right)
+		line += styleStatusMsg.Render(right)
 	}
 	return line
 }
@@ -1161,7 +1011,9 @@ func (m *Model) helpView() string {
 
   ←↓↑→ / jk     move cursor (name column selects the whole group; ↑ past the
                  first row selects a pool, ↑ again a host — details follow)
-  Tab            switch focus between Datasets and Details (jk/↑↓ scroll there)
+  Tab            switch focus to Details: ↑↓/jk move between rows (snapshots,
+                 jobs, pools, datasets, replicas); Enter opens a modal with
+                 everything known about the selected object
   s              snapshot the selected dataset (dialog: name, recursive)
   y              sync: incrementally send the selected dataset to other
                  replicas in its group (skips up-to-date and incompatible)

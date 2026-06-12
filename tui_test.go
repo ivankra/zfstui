@@ -369,10 +369,21 @@ func TestJobProgressInTUI(t *testing.T) {
 	if !strings.Contains(view, spinnerFrames[0]) {
 		t.Error("table should show a spinner on the receiving cell")
 	}
-	// Details show progress with percentage.
-	if !strings.Contains(view, "500B / 1000B (50%)") {
-		t.Errorf("details should show progress:\n%s", view)
+	// Details show the job row with its percentage.
+	if !strings.Contains(view, "50%") || !strings.Contains(view, "20260611T100000Z-aa11") {
+		t.Errorf("details should show the running job row:\n%s", view)
 	}
+	// Enter on the job row (details focused) opens the job modal with full progress.
+	m.Update(key("tab")) // focus details; snaps to first selectable row (the job)
+	m.Update(key("enter"))
+	if m.modal == nil {
+		t.Fatal("Enter should open the job modal")
+	}
+	if !strings.Contains(strings.Join(m.modal.lines, "\n"), "500B / 1000B (50%)") {
+		t.Errorf("job modal missing progress:\n%s", strings.Join(m.modal.lines, "\n"))
+	}
+	m.Update(key("esc"))
+	m.Update(key("tab")) // back to table focus
 	// Ticker machinery engages.
 	if hosts := m.runningJobHosts(); len(hosts) != 1 || hosts[0] != "ws" {
 		t.Errorf("runningJobHosts: %v", hosts)
@@ -405,5 +416,33 @@ func TestReloadWithHeaderCursor(t *testing.T) {
 			t.Errorf("header cursor not preserved: %d -> %d", row, m.curRow)
 		}
 		_ = m.View() // and render fine
+	}
+}
+
+func TestEnterOpensDetailModals(t *testing.T) {
+	m := syncTestModel(t)
+	// Cell with one replica → dataset modal.
+	m.moveCursorToCol(t, "ws:tank")
+	m.Update(key("enter"))
+	if m.modal == nil || !strings.Contains(m.modal.title, "ws:tank/srv/git") {
+		t.Fatalf("dataset modal expected, got %+v", m.modal)
+	}
+	m.Update(key("esc"))
+	// Host header row → host modal.
+	m.curRow = -2
+	m.clampCursor()
+	m.Update(key("enter"))
+	if m.modal == nil || !strings.Contains(m.modal.title, "host ") {
+		t.Fatalf("host modal expected, got %+v", m.modal)
+	}
+	if !strings.Contains(strings.Join(m.modal.lines, "\n"), "access") {
+		t.Errorf("host modal content:\n%s", strings.Join(m.modal.lines, "\n"))
+	}
+	m.Update(key("esc"))
+	// Group row → focus jump (no single modal).
+	m.curRow, m.curCol = 0, 0
+	m.Update(key("enter"))
+	if m.modal != nil || m.focus != 1 {
+		t.Fatalf("group row should jump to details: modal=%v focus=%d", m.modal, m.focus)
 	}
 }

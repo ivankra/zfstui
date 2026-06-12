@@ -32,18 +32,45 @@ func discovery(pools, datasets, snapshots string) string {
 }
 
 func dsLine(name string, written int64) string {
-	return fmt.Sprintf("%s\tfilesystem\t%s-guid\t10\t20\t5\t1700000000\t1\t%d\t-\t"+
-		"aes-256-gcm\tavailable\t-\tno\toff\t-\toff\t-\tzstd\t131072\n",
-		name, name, written)
+	var b strings.Builder
+	for _, kv := range [][2]string{
+		{"type", "filesystem"}, {"guid", name + "-guid"},
+		{"used", "10"}, {"available", "20"}, {"referenced", "5"},
+		{"creation", "1700000000"}, {"createtxg", "1"},
+		{"written", fmt.Sprint(written)},
+		{"encryption", "aes-256-gcm"}, {"keystatus", "available"},
+		{"canmount", "off"}, {"compression", "zstd"}, {"recordsize", "131072"},
+	} {
+		fmt.Fprintf(&b, "%s\t%s\t%s\t-\n", name, kv[0], kv[1])
+	}
+	return b.String()
 }
 
 func snapLine(ds, name, guid string, creation int64) string {
-	return fmt.Sprintf("%s@%s\t%s\t0\t%d\t1\n", ds, name, guid, creation)
+	full := ds + "@" + name
+	var b strings.Builder
+	for _, kv := range [][2]string{
+		{"guid", guid}, {"used", "0"}, {"referenced", "7"},
+		{"creation", fmt.Sprint(creation)}, {"createtxg", "1"},
+	} {
+		fmt.Fprintf(&b, "%s\t%s\t%s\t-\n", full, kv[0], kv[1])
+	}
+	return b.String()
 }
 
 func TestRefreshAndStatusEndToEnd(t *testing.T) {
-	pools1 := "ssd\t100\t40\t60\tONLINE\t1\n"
-	pools2 := "ssd\t100\t40\t60\tONLINE\t2\ntank\t900\t100\t800\tONLINE\t3\n"
+	poolProps := func(name, guid string) string {
+		var b strings.Builder
+		for _, kv := range [][2]string{
+			{"size", "100"}, {"allocated", "40"}, {"free", "60"},
+			{"health", "ONLINE"}, {"guid", guid},
+		} {
+			fmt.Fprintf(&b, "%s\t%s\t%s\t-\n", name, kv[0], kv[1])
+		}
+		return b.String()
+	}
+	pools1 := poolProps("ssd", "1")
+	pools2 := poolProps("ssd", "2") + poolProps("tank", "3")
 
 	runner := &fakeRunner{out: map[string]string{
 		"dev1": discovery(pools1,

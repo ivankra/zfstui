@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -19,7 +20,7 @@ type Store struct {
 
 // Bump whenever the schema changes: the db is a disposable cache, so on
 // mismatch we just drop everything and start over (no migrations).
-const schemaVersion = 3
+const schemaVersion = 4
 
 const schema = `
 CREATE TABLE IF NOT EXISTS hosts (
@@ -35,28 +36,24 @@ CREATE TABLE IF NOT EXISTS hosts (
   reachable INTEGER NOT NULL DEFAULT 0,
   last_error TEXT NOT NULL DEFAULT ''
 );
+-- Inventory objects are stored as their full property maps (JSON, from
+-- "zpool/zfs get -Hp all"); typed fields are re-derived on load via the
+-- same fromProps mapping the parser uses.
 CREATE TABLE IF NOT EXISTS pools (
-  host TEXT NOT NULL, name TEXT NOT NULL, guid TEXT NOT NULL DEFAULT '',
-  size INTEGER, alloc INTEGER, free INTEGER, health TEXT,
+  host TEXT NOT NULL, name TEXT NOT NULL,
+  props TEXT NOT NULL DEFAULT '{}', srcs TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (host, name)
 );
 CREATE TABLE IF NOT EXISTS datasets (
-  host TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL,
-  guid TEXT NOT NULL DEFAULT '',
-  used INTEGER, avail INTEGER, refer INTEGER,
-  creation INTEGER, createtxg INTEGER, written INTEGER,
-  origin TEXT, encryption TEXT, keystatus TEXT, keylocation TEXT,
-  mounted INTEGER, canmount TEXT, mountpoint TEXT, readonly INTEGER,
-  resume_token TEXT, compression TEXT, recordsize INTEGER,
+  host TEXT NOT NULL, name TEXT NOT NULL,
+  props TEXT NOT NULL DEFAULT '{}', srcs TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (host, name)
 );
 CREATE TABLE IF NOT EXISTS snapshots (
   host TEXT NOT NULL, dataset TEXT NOT NULL, name TEXT NOT NULL,
-  guid TEXT NOT NULL DEFAULT '',
-  used INTEGER, creation INTEGER, createtxg INTEGER,
+  props TEXT NOT NULL DEFAULT '{}', srcs TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (host, dataset, name)
 );
-CREATE INDEX IF NOT EXISTS snapshots_guid ON snapshots (guid);
 CREATE TABLE IF NOT EXISTS jobs (
   host TEXT NOT NULL, id TEXT NOT NULL, dir TEXT NOT NULL,
   kind TEXT, state TEXT, status TEXT, meta TEXT,
@@ -147,29 +144,31 @@ func (s *Store) PutHostState(st HostState) error {
 			return err
 		}
 	}
+	mj := func(m map[string]string) string {
+		if m == nil {
+			m = map[string]string{}
+		}
+		b, _ := json.Marshal(m)
+		return string(b)
+	}
 	for _, p := range st.Pools {
 		if _, err := tx.Exec(
-			`INSERT INTO pools (host,name,guid,size,alloc,free,health) VALUES (?,?,?,?,?,?,?)`,
-			p.Host, p.Name, p.GUID, p.Size, p.Alloc, p.Free, p.Health); err != nil {
+			`INSERT INTO pools (host,name,props,srcs) VALUES (?,?,?,?)`,
+			p.Host, p.Name, mj(p.toProps()), mj(p.PropSrc)); err != nil {
 			return err
 		}
 	}
 	for _, d := range st.Datasets {
 		if _, err := tx.Exec(
-			`INSERT INTO datasets (host,name,type,guid,used,avail,refer,creation,createtxg,written,
-			   origin,encryption,keystatus,keylocation,mounted,canmount,mountpoint,readonly,
-			   resume_token,compression,recordsize)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			d.Host, d.Name, d.Type, d.GUID, d.Used, d.Avail, d.Refer, d.Creation, d.CreateTXG,
-			d.Written, d.Origin, d.Encryption, d.KeyStatus, d.KeyLocation, d.Mounted, d.CanMount,
-			d.Mountpoint, d.ReadOnly, d.ResumeToken, d.Compression, d.RecordSize); err != nil {
+			`INSERT INTO datasets (host,name,props,srcs) VALUES (?,?,?,?)`,
+			d.Host, d.Name, mj(d.toProps()), mj(d.PropSrc)); err != nil {
 			return err
 		}
 	}
 	for _, sn := range st.Snapshots {
 		if _, err := tx.Exec(
-			`INSERT INTO snapshots (host,dataset,name,guid,used,creation,createtxg) VALUES (?,?,?,?,?,?,?)`,
-			sn.Host, sn.Dataset, sn.Name, sn.GUID, sn.Used, sn.Creation, sn.CreateTXG); err != nil {
+			`INSERT INTO snapshots (host,dataset,name,props,srcs) VALUES (?,?,?,?,?)`,
+			sn.Host, sn.Dataset, sn.Name, mj(sn.toProps()), mj(sn.PropSrc)); err != nil {
 			return err
 		}
 	}
@@ -242,38 +241,38 @@ func (s *Store) AllHostStates() ([]HostState, error) {
 		return st
 	}
 
-	rows, err := s.db.Query(`SELECT host,name,guid,size,alloc,free,health FROM pools ORDER BY host,name`)
+	unm := func(s string) map[string]string {
+		m := map[string]string{}
+		_ = json.Unmarshal([]byte(s), &m)
+		return m
+	}
+	rows, err := s.db.Query(`SELECT host,name,props,srcs FROM pools ORDER BY host,name`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var p Pool
-		if err := rows.Scan(&p.Host, &p.Name, &p.GUID, &p.Size, &p.Alloc, &p.Free, &p.Health); err != nil {
+		var host, name, props, srcs string
+		if err := rows.Scan(&host, &name, &props, &srcs); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		st := get(p.Host)
-		st.Pools = append(st.Pools, p)
+		st := get(host)
+		st.Pools = append(st.Pools, poolFromProps(host, name, unm(props), unm(srcs)))
 	}
 	rows.Close()
 
-	rows, err = s.db.Query(`SELECT host,name,type,guid,used,avail,refer,creation,createtxg,written,
-		origin,encryption,keystatus,keylocation,mounted,canmount,mountpoint,readonly,
-		resume_token,compression,recordsize FROM datasets ORDER BY host,name`)
+	rows, err = s.db.Query(`SELECT host,name,props,srcs FROM datasets ORDER BY host,name`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var d Dataset
-		if err := rows.Scan(&d.Host, &d.Name, &d.Type, &d.GUID, &d.Used, &d.Avail, &d.Refer,
-			&d.Creation, &d.CreateTXG, &d.Written, &d.Origin, &d.Encryption, &d.KeyStatus,
-			&d.KeyLocation, &d.Mounted, &d.CanMount, &d.Mountpoint, &d.ReadOnly,
-			&d.ResumeToken, &d.Compression, &d.RecordSize); err != nil {
+		var host, name, props, srcs string
+		if err := rows.Scan(&host, &name, &props, &srcs); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		st := get(d.Host)
-		st.Datasets = append(st.Datasets, d)
+		st := get(host)
+		st.Datasets = append(st.Datasets, datasetFromProps(host, name, unm(props), unm(srcs)))
 	}
 	rows.Close()
 
@@ -295,20 +294,35 @@ func (s *Store) AllHostStates() ([]HostState, error) {
 	}
 	rows.Close()
 
-	rows, err = s.db.Query(`SELECT host,dataset,name,guid,used,creation,createtxg FROM snapshots ORDER BY host,dataset,creation`)
+	rows, err = s.db.Query(`SELECT host,dataset,name,props,srcs FROM snapshots ORDER BY host,dataset,name`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var sn Snapshot
-		if err := rows.Scan(&sn.Host, &sn.Dataset, &sn.Name, &sn.GUID, &sn.Used, &sn.Creation, &sn.CreateTXG); err != nil {
+		var host, ds, name, props, srcs string
+		if err := rows.Scan(&host, &ds, &name, &props, &srcs); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		st := get(sn.Host)
-		st.Snapshots = append(st.Snapshots, sn)
+		st := get(host)
+		st.Snapshots = append(st.Snapshots, snapshotFromProps(host, ds, name, unm(props), unm(srcs)))
 	}
 	rows.Close()
+
+	// Snapshot order matters downstream (latest = last): creation order is
+	// in the props now, not a sortable column.
+	for _, st := range byHost {
+		sort.SliceStable(st.Snapshots, func(a, b int) bool {
+			x, y := st.Snapshots[a], st.Snapshots[b]
+			if x.Dataset != y.Dataset {
+				return x.Dataset < y.Dataset
+			}
+			if x.Creation != y.Creation {
+				return x.Creation < y.Creation
+			}
+			return x.CreateTXG < y.CreateTXG
+		})
+	}
 
 	var out []HostState
 	for _, h := range order {

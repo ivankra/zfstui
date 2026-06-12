@@ -1,5 +1,8 @@
-// Package zfsout parses the machine-readable (-H -p) output of zpool/zfs
-// commands. Hand-rolled on purpose: tab-separated, "-" means absent.
+// Parses the machine-readable output of zpool/zfs commands. Hand-rolled on
+// purpose. Discovery uses `zpool get -Hp all` / `zfs get -Hp all`: one line
+// per (object, property, value, source), so EVERY property is available for
+// detail views and adding a displayed field never changes the protocol.
+// Typed struct fields are derived from the property maps in one place here.
 package main
 
 import (
@@ -9,140 +12,158 @@ import (
 	"strings"
 )
 
-// Column lists for the remote commands. Parsers below must stay in lockstep.
-const (
-	PoolCols     = "name,size,alloc,free,health,guid"
-	DatasetCols  = "name,type,guid,used,avail,refer,creation,createtxg,written,origin,encryption,keystatus,keylocation,mounted,canmount,mountpoint,readonly,receive_resume_token,compression,recordsize"
-	SnapshotCols = "name,guid,used,creation,createtxg"
-)
-
-// fields splits one -H output line and verifies the column count.
-func fields(line string, want int) ([]string, error) {
-	f := strings.Split(line, "\t")
-	if len(f) != want {
-		return nil, fmt.Errorf("expected %d tab-separated fields, got %d in %q", want, len(f), line)
-	}
-	return f, nil
+// propTable is `* get -Hp all` output pivoted: object -> property -> value,
+// plus the property source ("local", "inherited from X", "default", "-").
+type propTable struct {
+	order []string // object names in first-seen order
+	vals  map[string]map[string]string
+	srcs  map[string]map[string]string
 }
 
-// num parses a -p numeric field; "-" and "" mean 0.
-func num(s string) (int64, error) {
-	if s == "-" || s == "" {
-		return 0, nil
+// parsePropTable parses NAME\tPROPERTY\tVALUE\tSOURCE lines.
+func parsePropTable(out string) (*propTable, error) {
+	t := &propTable{vals: map[string]map[string]string{}, srcs: map[string]map[string]string{}}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		f := strings.SplitN(line, "\t", 4)
+		if len(f) < 3 {
+			return nil, fmt.Errorf("malformed property line %q", line)
+		}
+		name, prop, val := f[0], f[1], f[2]
+		src := ""
+		if len(f) == 4 {
+			src = f[3]
+		}
+		if t.vals[name] == nil {
+			t.order = append(t.order, name)
+			t.vals[name] = map[string]string{}
+			t.srcs[name] = map[string]string{}
+		}
+		t.vals[name][prop] = val
+		if src != "" && src != "-" {
+			t.srcs[name][prop] = src
+		}
 	}
-	return strconv.ParseInt(s, 10, 64)
+	return t, nil
 }
 
-// str normalizes a string field; "-" means absent.
-func str(s string) string {
-	if s == "-" {
+// props wraps one object's property map with forgiving accessors.
+type props map[string]string
+
+// str: "-" means absent.
+func (p props) str(k string) string {
+	v := p[k]
+	if v == "-" {
 		return ""
 	}
-	return s
+	return v
 }
 
-func boolish(s string) bool {
-	return s == "yes" || s == "on"
-}
-
-// nonEmptyLines splits raw command output into trimmed non-empty lines.
-func nonEmptyLines(out string) []string {
-	var lines []string
-	for _, l := range strings.Split(out, "\n") {
-		l = strings.TrimRight(l, "\r")
-		if l != "" {
-			lines = append(lines, l)
-		}
+// num: numeric -p value; "-", "" and unparsable mean 0. Trailing "%" and "x"
+// suffixes are tolerated (capacity, dedupratio on some versions).
+func (p props) num(k string) int64 {
+	v := strings.TrimRight(p.str(k), "%x")
+	if v == "" {
+		return 0
 	}
-	return lines
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		// e.g. dedupratio "1.00": take the integer part
+		if f, ferr := strconv.ParseFloat(v, 64); ferr == nil {
+			return int64(f)
+		}
+		return 0
+	}
+	return n
 }
 
-// ParsePools parses `zpool list -H -p -o <PoolCols>` output.
+func (p props) boolish(k string) bool {
+	v := p[k]
+	return v == "yes" || v == "on"
+}
+
+// ParsePools parses `zpool get -Hp all` output.
 func ParsePools(host, out string) ([]Pool, error) {
+	t, err := parsePropTable(out)
+	if err != nil {
+		return nil, fmt.Errorf("pools: %w", err)
+	}
 	var pools []Pool
-	for _, line := range nonEmptyLines(out) {
-		f, err := fields(line, 6)
-		if err != nil {
-			return nil, err
-		}
-		size, err1 := num(f[1])
-		alloc, err2 := num(f[2])
-		free, err3 := num(f[3])
-		for _, err := range []error{err1, err2, err3} {
-			if err != nil {
-				return nil, fmt.Errorf("pool %q: %w", f[0], err)
-			}
-		}
+	for _, name := range t.order {
+		p := props(t.vals[name])
 		pools = append(pools, Pool{
-			Host: host, Name: f[0], Size: size, Alloc: alloc, Free: free,
-			Health: f[4], GUID: str(f[5]),
+			Host: host, Name: name,
+			GUID: p.str("guid"),
+			Size: p.num("size"), Alloc: p.num("allocated"), Free: p.num("free"),
+			Cap: p.num("capacity"), Frag: p.num("fragmentation"),
+			Dedup: p.str("dedupratio"), Health: p.str("health"),
+			Props: t.vals[name], PropSrc: t.srcs[name],
 		})
 	}
 	return pools, nil
 }
 
-// ParseDatasets parses `zfs list -H -p -t filesystem,volume -o <DatasetCols>`.
+// ParseDatasets parses `zfs get -Hp -t filesystem,volume all` output.
 func ParseDatasets(host, out string) ([]Dataset, error) {
+	t, err := parsePropTable(out)
+	if err != nil {
+		return nil, fmt.Errorf("datasets: %w", err)
+	}
 	var dss []Dataset
-	for _, line := range nonEmptyLines(out) {
-		f, err := fields(line, 20)
-		if err != nil {
-			return nil, err
-		}
-		d := Dataset{Host: host, Name: f[0], Type: f[1], GUID: str(f[2])}
-		ints := []struct {
-			dst *int64
-			val string
-		}{
-			{&d.Used, f[3]}, {&d.Avail, f[4]}, {&d.Refer, f[5]},
-			{&d.Creation, f[6]}, {&d.CreateTXG, f[7]}, {&d.Written, f[8]},
-			{&d.RecordSize, f[19]},
-		}
-		for _, x := range ints {
-			if *x.dst, err = num(x.val); err != nil {
-				return nil, fmt.Errorf("dataset %q: %w", d.Name, err)
-			}
-		}
-		d.Origin = str(f[9])
-		d.Encryption = str(f[10])
-		d.KeyStatus = str(f[11])
-		d.KeyLocation = str(f[12])
-		d.Mounted = boolish(f[13])
-		d.CanMount = str(f[14])
-		d.Mountpoint = str(f[15])
-		d.ReadOnly = boolish(f[16])
-		d.ResumeToken = str(f[17])
-		d.Compression = str(f[18])
-		dss = append(dss, d)
+	for _, name := range t.order {
+		dss = append(dss, datasetFromProps(host, name, t.vals[name], t.srcs[name]))
 	}
 	return dss, nil
 }
 
-// ParseSnapshots parses `zfs list -H -p -t snapshot -o <SnapshotCols>`.
+// datasetFromProps derives the typed fields — THE single mapping, shared by
+// the parser and the sqlite load path.
+func datasetFromProps(host, name string, vals, srcs map[string]string) Dataset {
+	p := props(vals)
+	return Dataset{
+		Host: host, Name: name,
+		Type: p.str("type"), GUID: p.str("guid"),
+		Used: p.num("used"), Avail: p.num("available"), Refer: p.num("referenced"),
+		Creation: p.num("creation"), CreateTXG: p.num("createtxg"), Written: p.num("written"),
+		Origin: p.str("origin"), Encryption: p.str("encryption"),
+		KeyStatus: p.str("keystatus"), KeyLocation: p.str("keylocation"),
+		Mounted: p.boolish("mounted"), CanMount: p.str("canmount"),
+		Mountpoint: p.str("mountpoint"), ReadOnly: p.boolish("readonly"),
+		ResumeToken: p.str("receive_resume_token"), Compression: p.str("compression"),
+		RecordSize: p.num("recordsize"),
+		Props:      vals, PropSrc: srcs,
+	}
+}
+
+// ParseSnapshots parses `zfs get -Hp -t snapshot all` output.
 func ParseSnapshots(host, out string) ([]Snapshot, error) {
+	t, err := parsePropTable(out)
+	if err != nil {
+		return nil, fmt.Errorf("snapshots: %w", err)
+	}
 	var snaps []Snapshot
-	for _, line := range nonEmptyLines(out) {
-		f, err := fields(line, 5)
-		if err != nil {
-			return nil, err
-		}
-		ds, name, ok := strings.Cut(f[0], "@")
+	for _, full := range t.order {
+		ds, name, ok := strings.Cut(full, "@")
 		if !ok {
-			return nil, fmt.Errorf("snapshot name without '@': %q", f[0])
+			return nil, fmt.Errorf("snapshot name without '@': %q", full)
 		}
-		s := Snapshot{Host: host, Dataset: ds, Name: name, GUID: str(f[1])}
-		var err1, err2, err3 error
-		s.Used, err1 = num(f[2])
-		s.Creation, err2 = num(f[3])
-		s.CreateTXG, err3 = num(f[4])
-		for _, err := range []error{err1, err2, err3} {
-			if err != nil {
-				return nil, fmt.Errorf("snapshot %q: %w", f[0], err)
-			}
-		}
-		snaps = append(snaps, s)
+		snaps = append(snaps, snapshotFromProps(host, ds, name, t.vals[full], t.srcs[full]))
 	}
 	return snaps, nil
+}
+
+func snapshotFromProps(host, ds, name string, vals, srcs map[string]string) Snapshot {
+	p := props(vals)
+	return Snapshot{
+		Host: host, Dataset: ds, Name: name,
+		GUID: p.str("guid"),
+		Used: p.num("used"), Refer: p.num("referenced"),
+		Creation: p.num("creation"), CreateTXG: p.num("createtxg"),
+		Props: vals, PropSrc: srcs,
+	}
 }
 
 // Section markers used to batch all discovery commands into one ssh round trip.
@@ -174,9 +195,9 @@ func DiscoverCommand(sudo bool) string {
 		return fmt.Sprintf("echo '%s'; %s%s; echo '%s'$?'==='", mark, pfx, cmd, MarkRC)
 	}
 	return strings.Join([]string{
-		section(MarkPools, "zpool list -H -p -o "+PoolCols),
-		section(MarkDatasets, "zfs list -H -p -t filesystem,volume -o "+DatasetCols),
-		section(MarkSnapshots, "zfs list -H -p -t snapshot -o "+SnapshotCols),
+		section(MarkPools, "zpool get -Hp all"),
+		section(MarkDatasets, "zfs get -Hp -t filesystem,volume all"),
+		section(MarkSnapshots, "zfs get -Hp -t snapshot all"),
 		// Jobs need no sudo: dirs are owned by the ssh user that made them.
 		fmt.Sprintf("echo '%s'; %s; echo '%s'$?'==='", MarkJobs, jobsProbe, MarkRC),
 	}, "; ")
@@ -286,4 +307,66 @@ func ParseJobs(host, out string) []JobInfo {
 	}
 	flush()
 	return jobs
+}
+
+// poolFromProps mirrors ParsePools' field mapping (shared with the store).
+func poolFromProps(host, name string, vals, srcs map[string]string) Pool {
+	p := props(vals)
+	return Pool{
+		Host: host, Name: name,
+		GUID: p.str("guid"),
+		Size: p.num("size"), Alloc: p.num("allocated"), Free: p.num("free"),
+		Cap: p.num("capacity"), Frag: p.num("fragmentation"),
+		Dedup: p.str("dedupratio"), Health: p.str("health"),
+		Props: vals, PropSrc: srcs,
+	}
+}
+
+// The toProps inverses synthesize a property map from typed fields when an
+// object was built in code (tests) rather than parsed. Keep in lockstep with
+// the fromProps mappings above.
+
+func (d Dataset) toProps() map[string]string {
+	if d.Props != nil {
+		return d.Props
+	}
+	m := map[string]string{
+		"type": d.Type, "guid": d.GUID,
+		"used": fmt.Sprint(d.Used), "available": fmt.Sprint(d.Avail),
+		"referenced": fmt.Sprint(d.Refer), "creation": fmt.Sprint(d.Creation),
+		"createtxg": fmt.Sprint(d.CreateTXG), "written": fmt.Sprint(d.Written),
+		"origin": d.Origin, "encryption": d.Encryption,
+		"keystatus": d.KeyStatus, "keylocation": d.KeyLocation,
+		"canmount": d.CanMount, "mountpoint": d.Mountpoint,
+		"receive_resume_token": d.ResumeToken, "compression": d.Compression,
+		"recordsize": fmt.Sprint(d.RecordSize),
+	}
+	if d.Mounted {
+		m["mounted"] = "yes"
+	}
+	if d.ReadOnly {
+		m["readonly"] = "on"
+	}
+	return m
+}
+
+func (s Snapshot) toProps() map[string]string {
+	if s.Props != nil {
+		return s.Props
+	}
+	return map[string]string{
+		"guid": s.GUID, "used": fmt.Sprint(s.Used), "referenced": fmt.Sprint(s.Refer),
+		"creation": fmt.Sprint(s.Creation), "createtxg": fmt.Sprint(s.CreateTXG),
+	}
+}
+
+func (p Pool) toProps() map[string]string {
+	if p.Props != nil {
+		return p.Props
+	}
+	return map[string]string{
+		"guid": p.GUID, "size": fmt.Sprint(p.Size), "allocated": fmt.Sprint(p.Alloc),
+		"free": fmt.Sprint(p.Free), "capacity": fmt.Sprint(p.Cap),
+		"fragmentation": fmt.Sprint(p.Frag), "dedupratio": p.Dedup, "health": p.Health,
+	}
 }
