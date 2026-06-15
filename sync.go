@@ -78,7 +78,7 @@ func planSync(src *Replica, g *Group, snapsBy map[string][]Snapshot) ([]syncPlan
 			case d.Written > 0:
 				p.Kind = planIncompatible
 				p.Reason = fmt.Sprintf("destination has %s of local writes (would need rollback — fix manually)",
-					human(d.Written))
+					humanShort(d.Written))
 			case dstLatest.GUID == target.GUID:
 				p.Kind, p.Reason = planUpToDate, "up to date @"+dstLatest.Name
 			default:

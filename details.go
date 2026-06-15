@@ -56,6 +56,21 @@ func tableLine(prefix string, ws []int, cells []string, right map[int]bool) stri
 	return b.String()
 }
 
+
+// modalTable appends a section header, plain column header row, and data rows.
+func modalTable(lines []string, title string, headers []string, rows [][]string) []string {
+	if len(rows) == 0 {
+		return lines
+	}
+	ws := colWidths(headers, rows)
+	lines = append(lines, "", sectionHeader(title))
+	lines = append(lines, styleCyan.Render(tableLine("", ws, headers, nil)))
+	for _, row := range rows {
+		lines = append(lines, tableLine("", ws, row, nil))
+	}
+	return lines
+}
+
 // detailsContent builds the pane for the current selection.
 func (m *Model) detailsContent() (segs []string, lines []detLine) {
 	g, c := m.selected()
@@ -75,33 +90,36 @@ func (m *Model) detailsContent() (segs []string, lines []detLine) {
 		return m.replicaDetails(c.replicas[0])
 	case g != nil && c != nil && len(c.replicas) > 1:
 		segs = []string{c.replicas[0].Dataset.Host + ":…", fmt.Sprintf("%d replicas in this cell", len(c.replicas))}
-		lines = append(lines, sectionLine("* REPLICAS"))
 		lines = append(lines, m.replicaRows(c.replicas)...)
 		return segs, lines
 	}
-	return []string{"Details"}, nil
+	return nil, nil
 }
 
 // --- per-view builders ---
 
 func (m *Model) replicaDetails(r *Replica) ([]string, []detLine) {
 	d := r.Dataset
-	id := d.Host + ":" + d.Name
-	if d.Mounted && d.Mountpoint != "" {
-		id += " (" + d.Mountpoint + ")"
+	segs := []string{"dataset " + d.Host + ":" + d.Name}
+	info := ""
+	if d.Mountpoint != "" && d.Mountpoint != "none" {
+		mp := d.Mountpoint
+		if !d.Mounted {
+			mp += " (unmounted)"
+		}
+		info = mp + ", "
 	}
-	segs := []string{id}
-	info := human(d.Used) + " used"
+	info += humanShort(d.Used) + " used"
 	if r.Latest != nil {
 		info += ", @" + r.Latest.Name
 		if r.Latest.Refer > 0 {
-			info += " (" + human(r.Latest.Refer) + ")"
+			info += " (" + humanShort(r.Latest.Refer) + ")"
 		}
 	} else {
 		info += ", no snapshots"
 	}
 	if r.Written > 0 {
-		info += " +" + human(r.Written)
+		info += " +" + humanShort(r.Written)
 	}
 	segs = append(segs, info)
 	if d.Encrypted() {
@@ -113,7 +131,7 @@ func (m *Model) replicaDetails(r *Replica) ([]string, []detLine) {
 		lines = append(lines, plainLine("clone of "+d.Origin))
 	}
 	if d.ResumeToken != "" {
-		lines = append(lines, styled("interrupted recv (resume token present)", styleResume))
+		lines = append(lines, styled("* interrupted recv (resume token present)", styleCyan))
 	}
 	if jobs := m.data.JobsByReplica[replicaKeyOf(r)]; len(jobs) > 0 {
 		lines = append(lines, sectionLine("* JOBS"))
@@ -121,71 +139,66 @@ func (m *Model) replicaDetails(r *Replica) ([]string, []detLine) {
 	}
 	snaps := m.data.SnapsByReplica[d.Host+":"+d.Name]
 	if len(snaps) > 0 {
-		nameW := 8
-		for _, s := range snaps {
-			if len(s.Name) > nameW {
-				nameW = len(s.Name)
-			}
+		headers := []string{"SNAPSHOT", "USED", "REFER", "GUID"}
+		var snapRows [][]string
+		for i := len(snaps) - 1; i >= 0; i-- {
+			s := snaps[i]
+			snapRows = append(snapRows, []string{s.Name, orDash(humanShort(s.Used)), humanShort(s.Refer), orDash(s.GUID)})
 		}
-		lines = append(lines, sectionLine(fmt.Sprintf("* %-*s  %7s  %7s", nameW, "SNAPSHOT", "USED", "REFER")))
-		for _, s := range snaps {
-			s := s
+		ws := colWidths(headers, snapRows)
+		right := map[int]bool{1: true, 2: true}
+		lines = append(lines, sectionLine(tableLine("* ", ws, headers, right)))
+		for i := len(snaps) - 1; i >= 0; i-- {
+			s := snaps[i]
+			row := snapRows[len(snaps)-1-i]
 			lines = append(lines, detLine{
-				text:  fmt.Sprintf("  %-*s  %7s  %7s", nameW, s.Name, human(s.Used), human(s.Refer)),
+				text:  tableLine("  ", ws, row, right),
 				style: styleDetRow,
 				open:  func(*Model) *textModal { return snapshotModal(s) },
 			})
 		}
 	} else {
-		lines = append(lines, plainLine("no snapshots"))
+		lines = append(lines, plainLine("* no snapshots"))
 	}
 	return segs, lines
 }
 
 func (m *Model) groupDetails(g *Group) ([]string, []detLine) {
-	segs := []string{"group " + g.DisplayName}
-	latestSeg := ""
-	var writtenSum int64
-	for _, r := range g.Members {
-		writtenSum += r.Written
-		if r.Latest != nil && r.Latest.Name == g.LatestName && latestSeg == "" {
-			latestSeg = "@" + g.LatestName
-			if r.Latest.Refer > 0 {
-				latestSeg += " (" + human(r.Latest.Refer) + ")"
-			}
-		}
-	}
-	if latestSeg != "" {
-		if writtenSum > 0 {
-			latestSeg += " +" + human(writtenSum)
-		}
-		segs = append(segs, latestSeg)
-	}
-	lines := []detLine{sectionLine("* REPLICAS")}
-	lines = append(lines, m.replicaRows(g.Members)...)
-	return segs, lines
+	return []string{"group " + g.DisplayName}, m.replicaRows(g.Members)
 }
 
-// replicaRows renders selectable member rows (group view, multi-replica cells).
+// replicaRows renders selectable member rows as a table:
+// REPLICA  STATUS  USED  REFER  LATEST
 func (m *Model) replicaRows(members []*Replica) []detLine {
-	nameW := 0
+	headers := []string{"REPLICA", "USED", "REFER", "STATUS", "LATEST"}
+	var rows [][]string
 	for _, r := range members {
-		if l := len(r.Dataset.Host + ":" + r.Dataset.Name); l > nameW {
-			nameW = l
+		name := r.Dataset.Host + ":" + r.Dataset.Name
+		used := orDash(humanShort(r.Dataset.Used))
+		refer := "-"
+		if r.Latest != nil {
+			refer = humanShort(r.Latest.Refer)
 		}
-	}
-	var lines []detLine
-	for _, r := range members {
-		r := r
-		live := ""
+		status := string(r.State)
+		latest := replicaBrief(r)
 		if j := m.runningJobFor(r); j != nil {
-			live = "  " + spinnerFrames[m.spin%len(spinnerFrames)] + " " + jobProgressLine(j)
+			verb := "send"
+			if replicaKeyOf(r) == j.Meta["dest"] {
+				verb = "recv"
+			}
+			latest += "  " + spinnerFrames[m.spin%len(spinnerFrames)] + verb + " " + jobProgressLine(j)
 		}
+		rows = append(rows, []string{name, used, refer, status, latest})
+	}
+	ws := colWidths(headers, rows)
+	right := map[int]bool{1: true, 2: true} // USED, REFER
+	lines := []detLine{sectionLine(tableLine("* ", ws, headers, right))}
+	for i, r := range members {
+		r := r
 		lines = append(lines, detLine{
-			text: fmt.Sprintf("  %-*s  %-9s  %s%s",
-				nameW, r.Dataset.Host+":"+r.Dataset.Name, r.State, replicaBrief(r), live),
+			text:  tableLine("  ", ws, rows[i], right),
 			style: styleDetRow,
-			open:  func(*Model) *textModal { return datasetModal(r.Dataset) },
+			open:  func(m *Model) *textModal { return m.datasetModal(r.Dataset) },
 		})
 	}
 	return lines
@@ -193,12 +206,17 @@ func (m *Model) replicaRows(members []*Replica) []detLine {
 
 // jobRows renders selectable job rows, newest first.
 func (m *Model) jobRows(jobs []JobInfo, limit int) []detLine {
-	var lines []detLine
+	type entry struct {
+		j      JobInfo
+		status string
+		desc   string
+		st     lipgloss.Style
+	}
+	var entries []entry
 	for _, j := range jobs {
-		if len(lines) >= limit {
+		if len(entries) >= limit {
 			break
 		}
-		j := j
 		desc := j.Kind
 		switch j.Kind {
 		case "sync":
@@ -213,23 +231,35 @@ func (m *Model) jobRows(jobs []JobInfo, limit int) []detLine {
 		st := styleDetRow
 		switch j.State {
 		case "running":
-			status = spinnerFrames[m.spin%len(spinnerFrames)] + " "
-			if j.Expected > 0 && j.Progress > 0 {
-				status += fmt.Sprintf("%d%%", min(j.Progress*100/j.Expected, 100))
-			} else {
-				status += "run"
-			}
+			status = spinnerFrames[m.spin%len(spinnerFrames)]
+			desc += "  " + jobProgressLine(&j)
 		case "done":
-			status = "OK"
+			status = "✓"
 		case "failed":
-			status, st = "FAIL", styleErr
+			status, st = "✗", styleErr
 		default:
 			status = j.State
 		}
+		entries = append(entries, entry{j: j, status: status, desc: desc, st: st})
+	}
+	// Column widths from actual data (braille spinner: 1 display col, 3 bytes).
+	stW, idW := 0, 0
+	for _, e := range entries {
+		if w := lipgloss.Width(e.status); w > stW {
+			stW = w
+		}
+		if w := len(e.j.ID); w > idW {
+			idW = w
+		}
+	}
+	var lines []detLine
+	for _, e := range entries {
+		e := e
+		stPad := strings.Repeat(" ", stW-lipgloss.Width(e.status))
 		lines = append(lines, detLine{
-			text:  fmt.Sprintf("  %-7s %-6s %s", j.ID, status, desc),
-			style: st,
-			open:  func(*Model) *textModal { return jobModal(j) },
+			text:  fmt.Sprintf("  %s%s %-*s  %s", e.status, stPad, idW, e.j.ID, e.desc),
+			style: e.st,
+			open:  func(*Model) *textModal { return jobModal(e.j) },
 		})
 	}
 	return lines
@@ -252,7 +282,7 @@ func (m *Model) hostDetails(host string) ([]string, []detLine) {
 		}
 	}
 	if size > 0 {
-		segs = append(segs, fmt.Sprintf("%s, %d%% used, %s free", human(size), alloc*100/size, human(free)))
+		segs = append(segs, fmt.Sprintf("%s, %d%% used, %s free", humanShort(size), alloc*100/size, humanShort(free)))
 	}
 
 	var lines []detLine
@@ -309,15 +339,17 @@ func (m *Model) poolDetails(host, pool string) ([]string, []detLine) {
 		return segs, []detLine{plainLine("not in cache")}
 	}
 	if p.Size > 0 {
-		segs = append(segs, fmt.Sprintf("%s, %d%% used, %s free", human(p.Size), p.Alloc*100/p.Size, human(p.Free)))
+		segs = append(segs, fmt.Sprintf("%s, %d%% used, %s free", humanShort(p.Size), p.Alloc*100/p.Size, humanShort(p.Free)))
 	}
 	var lines []detLine
 	// scrub/errors summary first (full text in the modal); the errors bullet
 	// only appears when there ARE errors; the scrub bullet turns red with them.
 	pp := *p
+	ppVdevs := m.vdevsFor(host, pool)
+	ppDss := dss
 	for _, ln := range strings.Split(p.Props["_zpool-status"], "\n") {
 		t := strings.TrimSpace(ln)
-		open := func(*Model) *textModal { return poolModal(pp) }
+		open := func(m *Model) *textModal { return m.poolModal(pp, ppVdevs, ppDss) }
 		if s, ok := strings.CutPrefix(t, "scan:"); ok {
 			st := styleSection
 			scan := strings.TrimSpace(s)
@@ -338,20 +370,20 @@ func (m *Model) poolDetails(host, pool string) ([]string, []detLine) {
 		lines = append(lines, m.vdevTableLines(host, vds, false)...)
 	}
 	if len(dss) > 0 {
-		nameW := 7
+		headers := []string{"DATASET", "USED", "REFER", "MOUNTPOINT", "SNAPSHOT"}
+		var dsRows [][]string
 		for _, d := range dss {
-			if l := len(displayDSName(d)); l > nameW {
-				nameW = l
-			}
+			dsRows = append(dsRows, []string{d.Name, humanShort(d.Used), humanShort(d.Refer), orDash(d.Mountpoint), m.snapCell(d)})
 		}
-		lines = append(lines, sectionLine(fmt.Sprintf("* %-*s  %7s %7s  %s", nameW, "DATASET", "USED", "REFER", "MOUNTPOINT")))
-		for _, d := range dss {
+		ws := colWidths(headers, dsRows)
+		right := map[int]bool{1: true, 2: true}
+		lines = append(lines, sectionLine(tableLine("* ", ws, headers, right)))
+		for i, d := range dss {
 			d := d
 			lines = append(lines, detLine{
-				text: fmt.Sprintf("  %-*s  %7s %7s  %s",
-					nameW, displayDSName(d), human(d.Used), human(d.Refer), orDash(d.Mountpoint)),
+				text:  tableLine("  ", ws, dsRows[i], right),
 				style: styleDetRow,
-				open:  func(*Model) *textModal { return datasetModal(&d) },
+				open:  func(m *Model) *textModal { return m.datasetModal(&d) },
 			})
 		}
 	}
@@ -395,7 +427,7 @@ func diskTableLines(disks []Disk) []detLine {
 }
 
 func diskRow(d Disk) []string {
-	return []string{d.Dev, orDash(d.Model), orDash(d.Serial), human(d.Size), diskType(d), diskHealth(d)}
+	return []string{d.Dev, orDash(d.Model), orDash(d.Serial), humanShort(d.Size), diskType(d), diskHealth(d)}
 }
 
 func (m *Model) vdevTableLines(host string, vdevs []VDev, showPool bool) []detLine {
@@ -472,9 +504,21 @@ func isLeafVDev(v VDev) bool {
 
 func vdevSize(v VDev) string {
 	if v.Size > 0 {
-		return human(v.Size)
+		return humanShort(v.Size)
 	}
 	return "-"
+}
+
+func (m *Model) snapCell(d Dataset) string {
+	snaps := m.data.SnapsByReplica[d.Host+":"+d.Name]
+	if len(snaps) == 0 {
+		return "-"
+	}
+	s := "@" + snaps[len(snaps)-1].Name
+	if d.Written > 0 {
+		s += " +" + humanShort(d.Written)
+	}
+	return s
 }
 
 func (m *Model) vdevDiskLabel(host string, v VDev) string {
@@ -515,9 +559,9 @@ func (m *Model) vdevModal(host string, v VDev) *textModal {
 	}
 	if v.Size > 0 {
 		lines = append(lines, fmt.Sprintf("space     size %s  alloc %s  free %s  frag %d%%",
-			human(v.Size), human(v.Alloc), human(v.Free), v.Frag))
+			humanShort(v.Size), humanShort(v.Alloc), humanShort(v.Free), v.Frag))
 	}
-	return &textModal{title: "vdev " + v.Pool + "/" + v.Name, lines: propsDump(lines, v.Props, v.PropSrc)}
+	return makeModal("vdev "+v.Pool+"/"+v.Name, propsDump(lines, "zpool properties", v.Props, v.PropSrc))
 }
 
 // appendVerbatim adds a titled verbatim text block to modal lines.
@@ -525,7 +569,7 @@ func appendVerbatim(lines []string, title, text string) []string {
 	if strings.TrimSpace(text) == "" {
 		return lines
 	}
-	lines = append(lines, "", "── "+title+" "+strings.Repeat("─", 30))
+	lines = append(lines, "", sectionHeader(title))
 	for _, ln := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
 		lines = append(lines, ln)
 	}
@@ -577,37 +621,50 @@ func (m *Model) hostModal(host string) *textModal {
 					running++
 				}
 			}
-			info += fmt.Sprintf(", %d dataset(s), %d snapshot(s), %d/%d job(s) running",
+			info += fmt.Sprintf(", %d datasets, %d snapshots, %d/%d jobs running",
 				len(hs.Datasets), len(hs.Snapshots), running, len(hs.Jobs))
 		}
 		lines = append(lines, info)
 	}
+	if hs != nil && len(hs.Disks) > 0 {
+		var rows [][]string
+		for _, d := range hs.Disks {
+			rows = append(rows, []string{d.Dev, d.Model, orDash(d.Serial), humanShort(d.Size), diskType(d), diskHealth(d)})
+		}
+		lines = modalTable(lines, "disks", []string{"DISK", "MODEL", "SERIAL", "SIZE", "TYPE", "SMART"}, rows)
+	}
 	if hs != nil {
-		lines = append(lines, "")
+		var vrows [][]string
+		for _, v := range hs.VDevs {
+			if !isLeafVDev(v) {
+				continue
+			}
+			vrows = append(vrows, []string{v.Name, v.Pool, v.State,
+				fmt.Sprint(v.RErr), fmt.Sprint(v.WErr), fmt.Sprint(v.CErr),
+				vdevSize(v), m.vdevDiskLabel(host, v)})
+		}
+		lines = modalTable(lines, "vdevs", []string{"VDEV", "POOL", "STATE", "READ", "WRITE", "CKSUM", "SIZE", "DISK"}, vrows)
+	}
+	if hs != nil && len(hs.Pools) > 0 {
+		var rows [][]string
 		for _, p := range hs.Pools {
 			pct := int64(0)
 			if p.Size > 0 {
 				pct = p.Alloc * 100 / p.Size
 			}
-			lines = append(lines, fmt.Sprintf("pool %-12s %-9s size %-8s alloc %s (%d%%) free %s",
-				p.Name, p.Health, human(p.Size), human(p.Alloc), pct, human(p.Free)))
+			rows = append(rows, []string{p.Name, p.Health, humanShort(p.Size),
+				fmt.Sprintf("%s (%d%%)", humanShort(p.Alloc), pct), humanShort(p.Free), fmt.Sprintf("%d%%", p.Frag)})
 		}
-		if len(hs.Disks) > 0 {
-			lines = append(lines, "")
-			for _, d := range hs.Disks {
-				lines = append(lines, fmt.Sprintf("disk %-9s %-6s %-7s %-12s %s",
-					d.Dev, diskHealth(d), human(d.Size), orDash(d.Serial), d.Model))
-				if d.Serial != "" {
-					lines = append(lines, "  serial "+d.Serial)
-				}
-				if d.WWN != "" {
-					lines = append(lines, "  wwn    "+d.WWN)
-				}
-				lines = append(lines, "  type   "+diskType(d))
-			}
-		}
+		lines = modalTable(lines, "pools", []string{"POOL", "HEALTH", "SIZE", "ALLOC", "FREE", "FRAG"}, rows)
 	}
-	return &textModal{title: "host " + host, lines: lines}
+	if hs != nil && len(hs.Datasets) > 0 {
+		var rows [][]string
+		for _, d := range hs.Datasets {
+			rows = append(rows, []string{d.Name, humanShort(d.Used), humanShort(d.Refer), orDash(d.Mountpoint), m.snapCell(d)})
+		}
+		lines = modalTable(lines, "datasets", []string{"DATASET", "USED", "REFER", "MOUNTPOINT", "SNAPSHOT"}, rows)
+	}
+	return makeModal("host "+host, lines)
 }
 
 // poolModalFor looks up a pool by host:name (nil if not cached).
@@ -618,7 +675,13 @@ func (m *Model) poolModalFor(host, pool string) *textModal {
 		}
 		for _, p := range m.data.States[i].Pools {
 			if p.Name == pool {
-				return poolModal(p)
+				var dss []Dataset
+				for _, d := range m.data.States[i].Datasets {
+					if d.Pool() == pool {
+						dss = append(dss, d)
+					}
+				}
+				return m.poolModal(p, m.vdevsFor(m.data.States[i].Host, pool), dss)
 			}
 		}
 	}
@@ -628,7 +691,7 @@ func (m *Model) poolModalFor(host, pool string) *textModal {
 // --- object detail modals (everything we know) ---
 
 // propsDump appends the full sorted property map with sources.
-func propsDump(lines []string, props, srcs map[string]string) []string {
+func propsDump(lines []string, title string, props, srcs map[string]string) []string {
 	if len(props) == 0 {
 		return append(lines, "", "(no full property map cached — refresh to populate)")
 	}
@@ -639,39 +702,64 @@ func propsDump(lines []string, props, srcs map[string]string) []string {
 		}
 	}
 	sort.Strings(keys)
-	lines = append(lines, "", "── properties "+strings.Repeat("─", 30))
 	keyW := 0
 	for _, k := range keys {
 		if len(k) > keyW {
 			keyW = len(k)
 		}
 	}
+	valW, srcW := 5, 6 // min widths for "VALUE" / "SOURCE"
 	for _, k := range keys {
-		l := fmt.Sprintf("%-*s  %s", keyW, k, props[k])
-		if s := srcs[k]; s != "" && s != "local" {
-			l += "  (" + s + ")"
+		if v := len(props[k]); v > valW {
+			valW = v
 		}
-		lines = append(lines, l)
+		if s := srcs[k]; len(s) > srcW {
+			srcW = len(s)
+		}
+	}
+	lines = append(lines, "", sectionHeader(title))
+	lines = append(lines, styleCyan.Render(fmt.Sprintf("%-*s  %-*s  %s", keyW, "PROPERTY", valW, "VALUE", "SOURCE")))
+	for _, k := range keys {
+		src := orDash(srcs[k])
+		lines = append(lines, fmt.Sprintf("%-*s  %-*s  %s", keyW, k, valW, props[k], src))
 	}
 	return lines
 }
 
-func datasetModal(d *Dataset) *textModal {
+func (m *Model) datasetModal(d *Dataset) *textModal {
+	mp := orDash(d.Mountpoint)
+	if d.Mountpoint != "" && d.Mountpoint != "none" && !d.Mounted {
+		mp += " (unmounted)"
+	}
+	kv := func(k, v string) string { return fmt.Sprintf("%-11s%s", k, v) }
 	lines := []string{
-		"host      " + d.Host,
-		"type      " + d.Type,
-		"guid      " + orDash(d.GUID) + "   (dataset guids differ per replica)",
-		fmt.Sprintf("space     used %s  avail %s  refer %s  written %s",
-			human(d.Used), human(d.Avail), human(d.Refer), human(d.Written)),
-		"created   " + time.Unix(d.Creation, 0).Format("2006-01-02 15:04:05"),
+		kv("host", d.Host),
+		kv("type", d.Type),
+		kv("mountpoint", mp),
+		kv("space", fmt.Sprintf("used %s  avail %s  refer %s  written %s",
+			humanShort(d.Used), humanShort(d.Avail), humanShort(d.Refer), humanShort(d.Written))),
+		kv("created", time.Unix(d.Creation, 0).Format("2006-01-02 15:04:05")),
+	}
+	if d.Encrypted() {
+		lines = append(lines, kv("encryption", d.Encryption+"  key: "+d.KeyStatus))
 	}
 	if d.Origin != "" {
-		lines = append(lines, "origin    "+d.Origin+"  (clone)")
+		lines = append(lines, kv("origin", d.Origin+"  (clone)"))
 	}
 	if d.ResumeToken != "" {
-		lines = append(lines, "resume    interrupted recv, token present")
+		lines = append(lines, kv("resume", "interrupted recv, token present"))
 	}
-	return &textModal{title: d.Host + ":" + d.Name, lines: propsDump(lines, d.Props, d.PropSrc)}
+	snaps := m.data.SnapsByReplica[d.Host+":"+d.Name]
+	if len(snaps) > 0 {
+		headers := []string{"SNAPSHOT", "USED", "REFER", "GUID"}
+		var rows [][]string
+		for i := len(snaps) - 1; i >= 0; i-- {
+			s := snaps[i]
+			rows = append(rows, []string{s.Name, orDash(humanShort(s.Used)), humanShort(s.Refer), orDash(s.GUID)})
+		}
+		lines = modalTable(lines, "snapshots", headers, rows)
+	}
+	return makeModal("dataset "+d.Host+":"+d.Name, propsDump(lines, "zfs properties", d.Props, d.PropSrc))
 }
 
 func snapshotModal(s Snapshot) *textModal {
@@ -680,24 +768,38 @@ func snapshotModal(s Snapshot) *textModal {
 		"dataset   " + s.Dataset,
 		"guid      " + orDash(s.GUID) + "   (THE cross-replica identity)",
 		"created   " + time.Unix(s.Creation, 0).Format("2006-01-02 15:04:05"),
-		fmt.Sprintf("space     used %s  refer %s", human(s.Used), human(s.Refer)),
+		fmt.Sprintf("space     used %s  refer %s", humanShort(s.Used), humanShort(s.Refer)),
 		fmt.Sprintf("createtxg %d   (pool-local)", s.CreateTXG),
 	}
-	return &textModal{title: s.Dataset + "@" + s.Name, lines: propsDump(lines, s.Props, s.PropSrc)}
+	return makeModal("snapshot "+s.Dataset+"@"+s.Name, propsDump(lines, "zfs properties", s.Props, s.PropSrc))
 }
 
-func poolModal(p Pool) *textModal {
+func (m *Model) poolModal(p Pool, vdevs []VDev, dss []Dataset) *textModal {
 	lines := []string{
-		"host      " + p.Host,
 		"health    " + p.Health,
 		fmt.Sprintf("space     size %s  alloc %s (%d%%)  free %s",
-			human(p.Size), human(p.Alloc), p.Cap, human(p.Free)),
+			humanShort(p.Size), humanShort(p.Alloc), p.Cap, humanShort(p.Free)),
 		fmt.Sprintf("frag      %d%%   dedup %s", p.Frag, p.Dedup),
-		"guid      " + orDash(p.GUID),
 	}
-	out := appendVerbatim(lines, "zpool status "+p.Name, p.Props["_zpool-status"])
-	out = propsDump(out, p.Props, p.PropSrc)
-	return &textModal{title: "pool " + p.Host + ":" + p.Name, lines: out}
+	if len(vdevs) > 0 {
+		var rows [][]string
+		for _, v := range vdevs {
+			rows = append(rows, []string{v.Name, v.State,
+				fmt.Sprint(v.RErr), fmt.Sprint(v.WErr), fmt.Sprint(v.CErr),
+				vdevSize(v), m.vdevDiskLabel(p.Host, v)})
+		}
+		lines = modalTable(lines, "vdevs", []string{"VDEV", "STATE", "READ", "WRITE", "CKSUM", "SIZE", "DISK"}, rows)
+	}
+	if len(dss) > 0 {
+		var rows [][]string
+		for _, d := range dss {
+			rows = append(rows, []string{d.Name, humanShort(d.Used), humanShort(d.Refer), orDash(d.Mountpoint), m.snapCell(d)})
+		}
+		lines = modalTable(lines, "datasets", []string{"DATASET", "USED", "REFER", "MOUNTPOINT", "SNAPSHOT"}, rows)
+	}
+	out := appendVerbatim(lines, "zpool status", p.Props["_zpool-status"])
+	out = propsDump(out, "zpool properties", p.Props, p.PropSrc)
+	return makeModal("pool "+p.Host+":"+p.Name, out)
 }
 
 func diskModal(d Disk) *textModal {
@@ -712,12 +814,12 @@ func diskModal(d Disk) *textModal {
 		"model     " + orDash(d.Model),
 		"serial    " + orDash(d.Serial),
 		"wwn       " + orDash(d.WWN),
-		fmt.Sprintf("space     size %s  media %s  transport %s", human(d.Size), rota, orDash(d.Transport)),
+		fmt.Sprintf("space     size %s  media %s  transport %s", humanShort(d.Size), rota, orDash(d.Transport)),
 		"smart     " + diskHealth(d),
 	}
-	out := appendVerbatim(lines, "smartctl -a "+d.Dev, d.Smart)
-	out = propsDump(out, d.Props, nil)
-	return &textModal{title: "disk " + d.Host + ":" + baseName(d.Dev), lines: out}
+	out := appendVerbatim(lines, "smartctl -a", d.Smart)
+	out = propsDump(out, "lsblk properties", d.Props, nil)
+	return makeModal("disk "+d.Host+":"+baseName(d.Dev), out)
 }
 
 func diskHealth(d Disk) string {
@@ -778,7 +880,7 @@ func jobModal(j JobInfo) *textModal {
 			lines = append(lines, "  "+cl)
 		}
 	}
-	return &textModal{title: "job " + j.ID, lines: lines}
+	return makeModal("job "+j.ID, lines)
 }
 
 // --- details cursor / rendering ---

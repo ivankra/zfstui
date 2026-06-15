@@ -223,7 +223,7 @@ type JobInfo struct {
 type ReplicaState string
 
 const (
-	StateInSync    ReplicaState = "synced"
+	StateInSync    ReplicaState = "up-to-date"
 	StateAhead     ReplicaState = "ahead"
 	StateBehind    ReplicaState = "behind"
 	StateDiverged  ReplicaState = "diverged"

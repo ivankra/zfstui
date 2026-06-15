@@ -23,7 +23,7 @@ var (
 	styleNewSnaps   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))   // green: unsynced snapshots
 	styleWritten    = lipgloss.NewStyle().Foreground(lipgloss.Color("226")) // bright yellow: unsnapshotted writes (+)
 	styleDiverged   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))   // red
-	styleResume     = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))   // cyan
+	styleCyan     = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))   // cyan
 	styleClone      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))   // dim
 	styleDim        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleCursor     = lipgloss.NewStyle().Reverse(true)
@@ -46,7 +46,7 @@ func cellStyle(r *Replica) lipgloss.Style {
 	case StateDiverged:
 		return styleDiverged
 	case StateResumable:
-		return styleResume
+		return styleCyan
 	case StateClone:
 		return styleClone
 	case StateBehind:
@@ -93,13 +93,14 @@ type Model struct {
 	detOff int // Details scroll offset
 	detCur int // Details row cursor (selectable lines)
 
-	showHidden bool
-	showHelp   bool
-	refreshing bool
-	status     string
-	statusErr  bool
-	spin       int  // spinner frame counter
-	ticking    bool // spinner/poll ticker active
+	showHidden      bool
+	showHelp        bool
+	refreshing      bool
+	refreshingHosts map[string]bool // host names currently being refreshed
+	status          string
+	statusErr       bool
+	spin            int  // spinner frame counter
+	ticking         bool // spinner/poll ticker active
 
 	dryRun  bool
 	dialog  *snapDialog // snapshot dialog when non-nil
@@ -110,10 +111,57 @@ type Model struct {
 // textModal is a centered, scrollable read-only text box (vertical and
 // horizontal — job pipelines are wide).
 type textModal struct {
-	title string
-	lines []string
-	off   int // vertical scroll
-	xOff  int // horizontal pan (display columns)
+	title    string
+	lines    []string
+	contentW int // max display width across all lines, computed at creation
+	off      int // vertical scroll
+	xOff     int // horizontal pan (display columns)
+}
+
+// sectionHeader returns a deferred section header line. makeModal resolves
+// these to filled "── title ─────────" strings at the computed content width.
+func sectionHeader(title string) string { return "\x00" + title }
+
+// makeModal creates a textModal and pre-computes contentW from all lines so
+// the box width is stable at creation time and never rescanned per-render.
+// Tabs are expanded (8-col stops) for accurate terminal width measurement.
+// Lines produced by sectionHeader() are rendered last, filled to contentW.
+func makeModal(title string, lines []string) *textModal {
+	expanded := make([]string, len(lines))
+	w := 0
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "\x00") {
+			expanded[i] = ln // defer section headers to second pass
+			continue
+		}
+		expanded[i] = expandTabs(ln)
+		if x := lipgloss.Width(expanded[i]); x > w {
+			w = x
+		}
+	}
+	// Leave \x00 section-header sentinels unexpanded; modalView renders them
+	// capped to the visible width rather than the raw contentW.
+	return &textModal{title: title, lines: expanded, contentW: w}
+}
+
+// expandTabs replaces tab characters with spaces to the next 8-column stop.
+func expandTabs(s string) string {
+	if !strings.Contains(s, "\t") {
+		return s
+	}
+	var b strings.Builder
+	col := 0
+	for _, r := range s {
+		if r == '\t' {
+			n := 8 - col%8
+			b.WriteString(strings.Repeat(" ", n))
+			col += n
+		} else {
+			b.WriteRune(r)
+			col++
+		}
+	}
+	return b.String()
 }
 
 // snapDialog is the state of the snapshot dialog (TUI `s`): a modal form
@@ -137,7 +185,7 @@ const (
 )
 
 func New(st *Store, hosts []Host, dryRun bool) (*Model, error) {
-	m := &Model{st: st, hosts: hosts, dryRun: dryRun}
+	m := &Model{st: st, hosts: hosts, dryRun: dryRun, refreshingHosts: map[string]bool{}}
 	if err := m.reload(); err != nil {
 		return nil, err
 	}
@@ -216,7 +264,17 @@ func (m *Model) reload() error {
 		}
 	}
 	m.clampCursor()
+	m.fixFocus()
 	return nil
+}
+
+// fixFocus resets details-pane focus to main when there is nothing to show.
+func (m *Model) fixFocus() {
+	if m.focus == 1 {
+		if segs, _ := m.detailsContent(); len(segs) == 0 {
+			m.focus = 0
+		}
+	}
 }
 
 // clampCursor keeps the cursor in range. Row -1 is the pool header row,
@@ -301,6 +359,34 @@ func poolProblem(hs *HostState, p *Pool) bool {
 	return false
 }
 
+// poolScrubbing reports whether the pool has an active scrub or resilver.
+func poolScrubbing(p *Pool) bool {
+	if p == nil {
+		return false
+	}
+	for _, ln := range strings.Split(p.Props["_zpool-status"], "\n") {
+		t := strings.TrimSpace(ln)
+		if s, ok := strings.CutPrefix(t, "scan:"); ok {
+			return strings.Contains(s, "in progress")
+		}
+	}
+	return false
+}
+
+// beginRefresh marks the given hosts as refreshing, ensures the spinner ticker
+// is running, and returns the combined refresh + tick command.
+func (m *Model) beginRefresh(hosts []Host) tea.Cmd {
+	m.refreshing = true
+	for _, h := range hosts {
+		m.refreshingHosts[h.Name] = true
+	}
+	cmds := []tea.Cmd{m.refreshCmd(hosts)}
+	if tc := m.ensureTicker(); tc != nil {
+		cmds = append(cmds, tc)
+	}
+	return tea.Batch(cmds...)
+}
+
 // hostSpan returns the [start, end) column range sharing ci's host.
 func (m *Model) hostSpan(ci int) (int, int) {
 	host := m.hostOfCol(ci)
@@ -376,6 +462,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case refreshDoneMsg:
 		m.refreshing = false
+		for _, r := range msg.results {
+			delete(m.refreshingHosts, r.Host)
+		}
 		ok, fail := 0, []string{}
 		for _, r := range msg.results {
 			if r.Err == nil {
@@ -424,9 +513,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "?":
 			m.showHelp = true
 		case "tab", "shift+tab":
-			m.focus = 1 - m.focus
-			if m.focus == 1 {
-				m.detSnap()
+			segs, _ := m.detailsContent()
+			if len(segs) > 0 {
+				m.focus = 1 - m.focus
+				if m.focus == 1 {
+					m.detSnap()
+				}
 			}
 		case "up", "k":
 			if m.focus == 1 {
@@ -456,7 +548,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.modal = m.poolModalFor(parts[0], parts[1])
 			default:
 				if _, c := m.selected(); c != nil && len(c.replicas) == 1 {
-					m.modal = datasetModal(c.replicas[0].Dataset)
+					m.modal = m.datasetModal(c.replicas[0].Dataset)
 				} else {
 					// group row / multi-replica cell: drill into Details.
 					m.focus = 1
@@ -483,6 +575,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.curCol++
 			}
 			m.detOff, m.detCur = 0, 0
+		case "pgup":
+			if m.focus == 1 {
+				m.detOff -= detailsBodyH
+				if m.detOff < 0 {
+					m.detOff = 0
+				}
+				m.detCur = m.detOff
+				m.detSnap()
+			} else {
+				m.curRow -= max(m.tableBodyH()-3, 1)
+				m.detOff, m.detCur = 0, 0
+			}
+		case "pgdown":
+			if m.focus == 1 {
+				m.detOff += detailsBodyH
+				m.detCur = m.detOff
+				m.detSnap()
+			} else {
+				m.curRow += max(m.tableBodyH()-3, 1)
+				m.detOff, m.detCur = 0, 0
+			}
 		case "h": // toggle hidden groups, not vim-left: arrows move horizontally
 			m.showHidden = !m.showHidden
 			if err := m.reload(); err != nil {
@@ -514,6 +627,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.clampCursor()
 		m.scrollToCursor()
+		m.fixFocus()
 	}
 	return m, nil
 }
@@ -534,13 +648,12 @@ func (m *Model) startRefresh(all bool) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-	m.refreshing = true
 	names := make([]string, len(hosts))
 	for i, h := range hosts {
 		names[i] = h.Name
 	}
 	m.status, m.statusErr = "refreshing "+strings.Join(names, ", ")+"…", false
-	return m, m.refreshCmd(hosts)
+	return m, m.beginRefresh(hosts)
 }
 
 // --- view ---
@@ -589,9 +702,9 @@ func (m *Model) View() string {
 // --- scrollable text modal ---
 
 func (m *Model) modalBodyH() int {
-	h := m.height - 8
-	if h > 24 {
-		h = 24
+	h := m.height - 7
+	if h > 23 {
+		h = 23
 	}
 	if h < 4 {
 		h = 4
@@ -650,13 +763,20 @@ func (m *Model) updateModal(msg tea.KeyMsg) {
 func (m *Model) modalView() string {
 	mo := m.modal
 	bodyH := m.modalBodyH()
-	maxW := m.width - 12
-	if maxW > 96 {
-		maxW = 96
+
+	// contentW was computed from all lines at modal creation time.
+	maxW := mo.contentW
+	cap := m.width * 9 / 10
+	if cap < 20 {
+		cap = 20
+	}
+	if maxW > cap {
+		maxW = cap
 	}
 	if maxW < 20 {
 		maxW = 20
 	}
+
 	var b strings.Builder
 	end := mo.off + bodyH
 	if end > len(mo.lines) {
@@ -664,6 +784,18 @@ func (m *Model) modalView() string {
 	}
 	for i := mo.off; i < end; i++ {
 		ln := mo.lines[i]
+		if strings.HasPrefix(ln, "\x00") {
+			t := ln[1:]
+			inner := " " + t + " "
+			dashTotal := maxW - len(inner)
+			if dashTotal < 4 {
+				dashTotal = 4
+			}
+			left := dashTotal / 2
+			right := dashTotal - left
+			b.WriteString(pad(styleCyan.Render(strings.Repeat("─", left)+inner+strings.Repeat("─", right)), maxW) + "\n")
+			continue
+		}
 		if mo.xOff > 0 {
 			r := []rune(ln)
 			if mo.xOff < len(r) {
@@ -677,15 +809,10 @@ func (m *Model) modalView() string {
 	for i := end - mo.off; i < bodyH; i++ {
 		b.WriteString("\n")
 	}
-	pos := ""
-	if len(mo.lines) > bodyH {
-		pos = fmt.Sprintf("  %d–%d/%d", mo.off+1, end, len(mo.lines))
-	}
-	if mo.xOff > 0 {
-		pos += fmt.Sprintf("  →%d", mo.xOff)
-	}
-	b.WriteString("\n" + styleDim.Render("↑↓←→/hjkl scroll · PgUp/PgDn · Esc close"+pos))
-	return dialogBox(mo.title, b.String())
+	// Trim trailing newline: lipgloss Padding(1,2) already adds one blank row
+	// at the bottom; the trailing \n would add a second one.
+	content := strings.TrimRight(b.String(), "\n")
+	return dialogBox(mo.title, content)
 }
 
 // overlayCenter splices the box into the middle of base, ANSI-aware, so the
@@ -757,26 +884,40 @@ func (m *Model) cellTextLive(c cell) string {
 	txt := c.text()
 	for _, r := range c.replicas {
 		if m.runningJobFor(r) != nil {
-			txt += " " + spinnerFrames[m.spin%len(spinnerFrames)]
+			txt += spinnerFrames[m.spin%len(spinnerFrames)]
 			break
 		}
 	}
 	return txt
 }
 
-func (m *Model) colWidths() (nameW int, colWs []int) {
-	nameW = 8
+func (m *Model) colWidths() (nameW, sizeW int, colWs []int) {
+	// sizeW = max display width of the right-aligned size suffix (ASCII only).
 	for _, g := range m.rows {
-		if len(g.DisplayName) > nameW {
-			nameW = len(g.DisplayName)
+		if s := humanShort(groupSize(g)); len(s) > sizeW {
+			sizeW = len(s)
 		}
+	}
+	nameW = len("datasets")
+	for _, g := range m.rows {
+		needed := len(g.DisplayName) + 1 + sizeW
+		if needed > nameW {
+			nameW = needed
+		}
+	}
+	if nameW < 8 {
+		nameW = 8
 	}
 	if nameW > maxColW {
 		nameW = maxColW
 	}
 	colWs = make([]int, len(m.cols))
 	for i, c := range m.cols {
-		w := len(strings.SplitN(c, ":", 2)[1]) // pool name (host spans above)
+		poolLabel := strings.SplitN(c, ":", 2)[1] // pool name (host spans above)
+		if _, p := m.poolByCol(i); poolScrubbing(p) {
+			poolLabel += " 🧹"
+		}
+		w := lipgloss.Width(poolLabel)
 		for ri := range m.rows {
 			if cl, ok := m.cells[ri][i]; ok {
 				if t := lipgloss.Width(m.cellTextLive(cl)); t > w {
@@ -789,15 +930,24 @@ func (m *Model) colWidths() (nameW int, colWs []int) {
 		}
 		colWs[i] = w
 	}
-	return nameW, colWs
+	return nameW, sizeW, colWs
 }
 
 // visibleCols returns the column index range [colOff, end) that fits the width.
+// Inter-group separators (" │ ") are 3 wide; intra-group ("  ") are 2 wide.
 func (m *Model) visibleCols(nameW int, colWs []int) int {
-	avail := m.width - nameW - 2
+	avail := m.width - nameW
 	end := m.colOff
-	for end < len(colWs) && avail >= colWs[end]+2 {
-		avail -= colWs[end] + 2
+	for end < len(colWs) {
+		// The separator before this column: 3 for first-in-group, 2 otherwise.
+		sepW := 3
+		if end > m.colOff && end > 0 && m.hostOfCol(end) == m.hostOfCol(end-1) {
+			sepW = 1
+		}
+		if avail < colWs[end]+sepW {
+			break
+		}
+		avail -= colWs[end] + sepW
 		end++
 	}
 	if end == m.colOff && m.colOff < len(colWs) {
@@ -827,7 +977,7 @@ func (m *Model) scrollToCursor() {
 	if ci < m.colOff {
 		m.colOff = ci
 	}
-	nameW, colWs := m.colWidths()
+	nameW, _, colWs := m.colWidths()
 	for m.visibleCols(nameW, colWs) <= ci && m.colOff < ci {
 		m.colOff++
 	}
@@ -851,14 +1001,74 @@ func pad(s string, w int) string {
 	return string(out) + "…"
 }
 
+// humanShort formats n with 2-3 significant digits: "1.5T", "37.2T", "239M".
+// >= 100 of the unit: integer (XXX); otherwise one decimal (XX.X or X.X).
+func humanShort(n int64) string {
+	if n <= 0 {
+		return ""
+	}
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	v := float64(n) / float64(div)
+	if v >= 100 || v == float64(int(v)) {
+		return fmt.Sprintf("%d%c", int(v), "KMGTPE"[exp])
+	}
+	return fmt.Sprintf("%.1f%c", v, "KMGTPE"[exp])
+}
+
+// groupRefer returns the largest latest-snapshot Refer across group members.
+func groupRefer(g *Group) int64 {
+	var best int64
+	for _, r := range g.Members {
+		if r.Latest != nil && r.Latest.Refer > best {
+			best = r.Latest.Refer
+		}
+	}
+	return best
+}
+
+// groupSize returns the name-column size for a group: groupRefer (latest
+// snapshot Refer) when snapshots exist; max Dataset.Used otherwise.
+// Written is not used — it's bytes-since-last-snapshot and is meaningless
+// when no snapshot has ever been taken.
+func groupSize(g *Group) int64 {
+	if r := groupRefer(g); r > 0 {
+		return r
+	}
+	var best int64
+	for _, m := range g.Members {
+		if m.Dataset.Used > best {
+			best = m.Dataset.Used
+		}
+	}
+	return best
+}
+
+// centerStr centers s in a field of w display columns, padding with spaces.
+func centerStr(s string, w int) string {
+	sw := lipgloss.Width(s)
+	if sw >= w {
+		return pad(s, w)
+	}
+	left := (w - sw) / 2
+	return strings.Repeat(" ", left) + s + strings.Repeat(" ", w-sw-left)
+}
+
 func (m *Model) tableView(h int) string {
-	nameW, colWs := m.colWidths()
+	nameW, sizeW, colWs := m.colWidths()
 	end := m.visibleCols(nameW, colWs)
 
 	hostOf := func(col string) string { return strings.SplitN(col, ":", 2)[0] }
 	poolOf := func(col string) string { return strings.SplitN(col, ":", 2)[1] }
 
-	// "(37T/53%)" capacity label for a host header, shown only when it fits.
+	// "83%/1.8T" — no parens, shown only when it fits within the host span.
 	hostInfo := func(host string) string {
 		var size, alloc int64
 		for i := range m.data.States {
@@ -873,49 +1083,102 @@ func (m *Model) tableView(h int) string {
 		if size == 0 {
 			return ""
 		}
-		return fmt.Sprintf("(%d%%/%s)", alloc*100/size, human(size))
+		return fmt.Sprintf("%d%%/%s", alloc*100/size, humanShort(size))
+	}
+
+	// isColHL: the exact pool-header cell the cursor column sits under gets the
+	// active-bg highlight. Only in the pool header row, only on data-row cursors.
+	isColHL := func(ci int) bool {
+		return m.focus == 0 && m.curRow >= 0 && m.curCol > 0 && ci == m.curCol-1
+	}
+	// isNameHL: same logic for the name column header ("group" / empty row).
+	isNameHL := m.focus == 0 && m.curRow >= 0 && m.curCol == 0
+
+	// isNewGroup: true when column ci starts a new host group (or is first visible).
+	isNewGroup := func(ci int) bool {
+		return ci == m.colOff || hostOf(m.cols[ci]) != hostOf(m.cols[ci-1])
+	}
+
+	// Separator strings. Inter-group: " │ " (3 cols). Intra-group: " " (1 col).
+	dimPipe := styleDim.Render("│")
+	dimPipeBG := styleDim.Background(rowGuideBG).Render("│")
+
+	writeSep := func(b *strings.Builder, inter, onRow bool) {
+		if inter {
+			if onRow {
+				b.WriteString(styleRowGuide.Render(" ") + dimPipeBG + styleRowGuide.Render(" "))
+			} else {
+				b.WriteString(" " + dimPipe + " ")
+			}
+		} else {
+			if onRow {
+				b.WriteString(styleRowGuide.Render(" "))
+			} else {
+				b.WriteString(" ")
+			}
+		}
 	}
 
 	var b strings.Builder
-	// Header line 1: hosts, spanning their (consecutive, sorted) pool
-	// columns. Selectable: cursor row -2 highlights the whole span.
-	b.WriteString(pad("", nameW))
+
+	// ── Host header row (curRow == -2) ──────────────────────────────────────
+	groupHdr := centerStr("datasets", nameW)
+	if isNameHL {
+		b.WriteString(stylePaneActive.Render(groupHdr))
+	} else {
+		b.WriteString(styleName.Render(groupHdr))
+	}
 	for ci := m.colOff; ci < end; {
 		host := hostOf(m.cols[ci])
+		// Compute visible span width (intra-group gaps only, no leading sep).
 		span := 0
 		cj := ci
 		for cj < end && hostOf(m.cols[cj]) == host {
-			span += colWs[cj] + 2
+			if cj > ci {
+				span += 1 // intra-group gap
+			}
+			span += colWs[cj]
 			cj++
 		}
-		b.WriteString("  ")
+		b.WriteString(" " + dimPipe + " ") // inter-group separator
 		label := host
 		if info := hostInfo(host); info != "" &&
-			lipgloss.Width(host)+1+lipgloss.Width(info) <= span-2 {
+			lipgloss.Width(host)+1+lipgloss.Width(info) <= span {
 			label = host + " " + info
 		}
-		hdr := pad(label, span-2)
+		if m.refreshingHosts[host] {
+			sp := " " + spinnerFrames[m.spin%len(spinnerFrames)]
+			if lipgloss.Width(label)+lipgloss.Width(sp) <= span {
+				label += sp
+			}
+		}
+		hdr := centerStr(label, span)
 		switch {
 		case m.curRow == -2 && m.curCol-1 >= ci && m.curCol-1 < cj:
 			b.WriteString(styleCursor.Render(hdr))
 		case m.unreach[host]:
 			b.WriteString(styleDim.Render(hdr))
 		default:
-			b.WriteString(styleHeader.Render(hdr))
+			b.WriteString(styleName.Render(hdr)) // bold, no underline
 		}
 		ci = cj
 	}
 	b.WriteString("\n")
 
-	// Header line 2: pool names (selectable: cursor row -1). Problem pools
-	// are red unless the cursor is on them.
+	// ── Pool header row (curRow == -1) ──────────────────────────────────────
 	b.WriteString(pad("", nameW))
 	for ci := m.colOff; ci < end; ci++ {
-		b.WriteString("  ")
-		hdr := pad(poolOf(m.cols[ci]), colWs[ci])
+		writeSep(&b, isNewGroup(ci), false)
+		poolLabel := poolOf(m.cols[ci])
+		if _, p := m.poolByCol(ci); poolScrubbing(p) {
+			poolLabel += " 🧹"
+		}
+		hdr := pad(poolLabel, colWs[ci])
 		switch {
 		case m.curRow == -1 && ci == m.curCol-1:
 			b.WriteString(styleCursor.Render(hdr))
+		case isColHL(ci):
+			b.WriteString(stylePaneActive.Render(hdr))
 		case m.unreach[hostOf(m.cols[ci])]:
 			b.WriteString(styleDim.Render(hdr))
 		case poolProblem(m.poolByCol(ci)):
@@ -932,17 +1195,18 @@ func (m *Model) tableView(h int) string {
 	}
 	b.WriteString("\n")
 
+	// ── Data rows ────────────────────────────────────────────────────────────
 	rowsShown := 0
 	for ri := m.rowOff; ri < len(m.rows) && rowsShown < h-2; ri++ {
 		g := m.rows[ri]
-		// Row guide: the cursor's row gets a background tint so the group's
-		// replicas are easy to pick out wherever the cursor is.
 		onRow := ri == m.curRow
-		sep := "  "
-		if onRow {
-			sep = styleRowGuide.Render("  ")
-		}
-		name := pad(g.DisplayName, nameW)
+
+		// Name cell: name left-aligned, size right-aligned within nameW.
+		sizeStr := humanShort(groupSize(g))
+		namePart := pad(g.DisplayName, nameW-sizeW)
+		sizePart := fmt.Sprintf("%*s", sizeW, sizeStr) // right-align ASCII size
+		name := namePart + sizePart
+
 		nstyle := styleName
 		if g.Hidden {
 			nstyle = styleDim
@@ -955,8 +1219,9 @@ func (m *Model) tableView(h int) string {
 			}
 			b.WriteString(nstyle.Render(name))
 		}
+
 		for ci := m.colOff; ci < end; ci++ {
-			b.WriteString(sep)
+			writeSep(&b, isNewGroup(ci), onRow)
 			c, ok := m.cells[ri][ci]
 			txt := ""
 			st := styleNormal
@@ -988,18 +1253,6 @@ func (m *Model) tableView(h int) string {
 	return b.String()
 }
 
-func human(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%dB", n)
-	}
-	div, exp := int64(unit), 0
-	for x := n / unit; x >= unit; x /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f%c", float64(n)/float64(div), "KMGTPE"[exp])
-}
 
 func orDash(s string) string {
 	if s == "" {
@@ -1010,11 +1263,14 @@ func orDash(s string) string {
 
 func replicaBrief(r *Replica) string {
 	if r.Latest == nil {
-		return "no snapshots"
+		return "* no snapshots"
 	}
 	s := "@" + r.Latest.Name
+	if r.Latest.Refer > 0 {
+		s += " (" + humanShort(r.Latest.Refer) + ")"
+	}
 	if r.Written > 0 {
-		s += fmt.Sprintf(" +%s written", human(r.Written))
+		s += " +" + humanShort(r.Written) + " written"
 	}
 	return s
 }
@@ -1049,20 +1305,21 @@ func (m *Model) footerView() string {
 		}
 		keys += fmt.Sprintf("(%s%d)", mark, m.hiddenN)
 	}
-	right := m.status
+	statusStr := m.status
 	if m.refreshing {
-		right = "⟳ " + right
+		statusStr = "⟳ " + statusStr
 	}
-	gap := m.width - lipgloss.Width(keys) - lipgloss.Width(right) - 1
+	gap := m.width - lipgloss.Width(keys) - lipgloss.Width(statusStr) - 1
 	if gap < 1 {
 		gap = 1
 	}
-	line := styleStatus.Render(keys) + strings.Repeat(" ", gap)
+	var line string
 	if m.statusErr {
-		line += styleErr.Render(right)
+		line = styleErr.Render(statusStr)
 	} else {
-		line += styleStatusMsg.Render(right)
+		line = styleStatusMsg.Render(statusStr)
 	}
+	line += strings.Repeat(" ", gap) + styleStatus.Render(keys)
 	return line
 }
 
@@ -1353,7 +1610,7 @@ func dryRunModal(spec jobSpec) *textModal {
 	for _, l := range strings.Split(strings.TrimRight(spec.script(), "\n"), "\n") {
 		lines = append(lines, "  "+l)
 	}
-	return &textModal{title: "DRY RUN — nothing was executed", lines: lines}
+	return makeModal("DRY RUN — nothing was executed", lines)
 }
 
 // --- snapshot execution ---
@@ -1387,8 +1644,7 @@ func (m *Model) onSnapDone(msg snapDoneMsg) (tea.Model, tea.Cmd) {
 	case msg.state == "done":
 		m.status, m.statusErr = fmt.Sprintf("snapshot created (job %s) — refreshing %s…",
 			msg.spec.ID, msg.host.Name), false
-		m.refreshing = true
-		return m, m.refreshCmd([]Host{msg.host})
+		return m, m.beginRefresh([]Host{msg.host})
 	case msg.state == "failed":
 		m.status, m.statusErr = "snapshot FAILED", true
 		lines := []string{
@@ -1400,7 +1656,7 @@ func (m *Model) onSnapDone(msg snapDoneMsg) (tea.Model, tea.Cmd) {
 		for _, l := range strings.Split(strings.TrimRight(msg.logTail, "\n"), "\n") {
 			lines = append(lines, "  "+l)
 		}
-		m.modal = &textModal{title: "snapshot job failed", lines: lines}
+		m.modal = makeModal("snapshot job failed", lines)
 	default: // still running
 		m.status, m.statusErr = fmt.Sprintf("job %s still running on %s — its result will show on next refresh",
 			msg.spec.ID, msg.host.Name), false
@@ -1752,11 +2008,10 @@ func (m *Model) onSyncDone(msg syncDoneMsg) (tea.Model, tea.Cmd) {
 	m.status = "sync: " + strings.Join(parts, ", ")
 	m.statusErr = failed > 0
 	if failed > 0 {
-		m.modal = &textModal{title: "sync job failures", lines: failLines}
+		m.modal = makeModal("sync job failures", failLines)
 	}
 	if done > 0 || running > 0 {
-		m.refreshing = true
-		return m, m.refreshCmd(msg.affected)
+		return m, m.beginRefresh(msg.affected)
 	}
 	return m, m.ensureTicker()
 }
@@ -1843,9 +2098,10 @@ func (m *Model) runningJobHosts() []string {
 	return hosts
 }
 
-// ensureTicker starts the spinner/poll ticker when there is something live.
+// ensureTicker starts the spinner/poll ticker when there is something live
+// (running jobs or an active refresh).
 func (m *Model) ensureTicker() tea.Cmd {
-	if m.ticking || len(m.runningJobHosts()) == 0 {
+	if m.ticking || (len(m.runningJobHosts()) == 0 && !m.refreshing) {
 		return nil
 	}
 	m.ticking = true
@@ -1854,7 +2110,7 @@ func (m *Model) ensureTicker() tea.Cmd {
 
 func (m *Model) onTick() (tea.Model, tea.Cmd) {
 	hosts := m.runningJobHosts()
-	if len(hosts) == 0 {
+	if len(hosts) == 0 && !m.refreshing {
 		m.ticking = false
 		return m, nil
 	}
@@ -1912,8 +2168,7 @@ func (m *Model) onJobsPoll(msg jobsPollMsg) (tea.Model, tea.Cmd) {
 		for hn := range finished {
 			hosts = append(hosts, m.hostByName(hn))
 		}
-		m.refreshing = true
-		return m, m.refreshCmd(hosts)
+		return m, m.beginRefresh(hosts)
 	}
 	return m, nil
 }
@@ -1933,59 +2188,65 @@ func (m *Model) runningJobFor(r *Replica) *JobInfo {
 	return nil
 }
 
-// jobProgressLine renders "1.2G / 3.4G (35%)" as far as known.
+// jobStartTime parses the start timestamp from the status line "running <pid> <RFC3339>".
+func jobStartTime(j *JobInfo) time.Time {
+	if j.State != "running" {
+		return time.Time{}
+	}
+	parts := strings.Fields(j.Status)
+	if len(parts) >= 3 {
+		if t, err := time.Parse(time.RFC3339, parts[2]); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// fmtDuration formats a duration down to the minute: "3h40m", "10m", "<1m".
+// Seconds are omitted — ETA precision beyond a minute is false precision.
+func fmtDuration(d time.Duration) string {
+	m := int(d.Minutes())
+	if m < 1 {
+		return "<1m"
+	}
+	if h := m / 60; h > 0 {
+		return fmt.Sprintf("%dh%dm", h, m%60)
+	}
+	return fmt.Sprintf("%dm", m)
+}
+
+// jobProgressLine renders progress, and for running jobs with elapsed time:
+// speed and ETA. E.g. "1.2G / 3.4G (35%)  45.2M/s  ETA 0:48".
 func jobProgressLine(j *JobInfo) string {
+	var parts []string
 	switch {
 	case j.Progress > 0 && j.Expected > 0:
 		pct := j.Progress * 100 / j.Expected
 		if pct > 100 {
 			pct = 100
 		}
-		return fmt.Sprintf("%s / %s (%d%%)", human(j.Progress), human(j.Expected), pct)
+		parts = append(parts, fmt.Sprintf("%s/%s (%d%%)", humanShort(j.Progress), humanShort(j.Expected), pct))
 	case j.Progress > 0:
-		return human(j.Progress) + " transferred"
+		parts = append(parts, humanShort(j.Progress)+" transferred")
 	case j.Expected > 0:
-		return "~" + human(j.Expected) + " to transfer"
+		parts = append(parts, "~"+humanShort(j.Expected)+" to transfer")
 	default:
 		return "progress unknown (pv not installed on source?)"
 	}
-}
-
-// jobDetailLines renders recent jobs touching a replica for the details pane.
-func (m *Model) jobDetailLines(r *Replica) []string {
-	jobs := m.data.JobsByReplica[replicaKeyOf(r)]
-	var lines []string
-	shown := 0
-	for _, j := range jobs {
-		if shown >= 3 {
-			break
-		}
-		desc := j.Kind
-		if j.Kind == "sync" {
-			desc = j.Meta["src"] + " → " + j.Meta["dest"]
-			if j.Meta["full"] == "true" {
-				desc += " (full)"
-			}
-		} else if ds := j.Meta["dataset"]; ds != "" {
-			desc += " " + ds + "@" + j.Meta["snapshot"]
-		}
-		switch j.State {
-		case "running":
-			lines = append(lines, fmt.Sprintf("  %s job %s: %s — %s",
-				spinnerFrames[m.spin%len(spinnerFrames)], j.ID, desc, jobProgressLine(&j)))
-		case "failed":
-			lines = append(lines, styleErr.Render(fmt.Sprintf("  ✗ job %s: %s — FAILED (%s)", j.ID, desc, j.Status)))
-			for _, cl := range strings.Split(j.Meta["command"], "\n") {
-				if strings.Contains(cl, "zfs ") {
-					lines = append(lines, styleDim.Render("      "+strings.TrimSpace(cl)))
+	if j.Progress > 0 {
+		start := jobStartTime(j)
+		if !start.IsZero() {
+			elapsed := time.Since(start)
+			if elapsed >= 5*time.Second {
+				speed := float64(j.Progress) / elapsed.Seconds()
+				parts = append(parts, humanShort(int64(speed))+"/s")
+				if j.Expected > 0 && j.Expected > j.Progress {
+					eta := time.Duration(float64(j.Expected-j.Progress)/speed) * time.Second
+					parts = append(parts, "ETA "+fmtDuration(eta))
 				}
 			}
-		case "done":
-			lines = append(lines, styleDim.Render(fmt.Sprintf("  ✓ job %s: %s — done", j.ID, desc)))
-		default:
-			lines = append(lines, styleDim.Render(fmt.Sprintf("  ? job %s: %s — %s", j.ID, desc, j.State)))
 		}
-		shown++
 	}
-	return lines
+	return strings.Join(parts, "  ")
 }
+

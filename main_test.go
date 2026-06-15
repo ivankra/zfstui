@@ -110,7 +110,7 @@ func TestRefreshAndStatusEndToEnd(t *testing.T) {
 	out := Status(data.Groups)
 	t.Log("\n" + out)
 	if !strings.Contains(out, "git") ||
-		!strings.Contains(out, "srv@20260601+") || // unsnapshotted writes
+		!strings.Contains(out, "srv@20260601") || // unsnapshotted writes (color only)
 		!strings.Contains(out, "bak@20260501") { // the stale tank backup
 		t.Errorf("unexpected status output:\n%s", out)
 	}

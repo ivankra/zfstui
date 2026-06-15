@@ -15,11 +15,15 @@ execution with detached jobs and live progress (most of M4). Not yet: batch
   Read-only on the hosts.
 - `zfstui status` prints the groups × host:pool matrix. Replication groups
   and per-replica states (ahead/behind/diverged/resumable/clone) are derived
-  from **snapshot GUIDs**, never names. Cell markers: `+` unsnapshotted
-  writes, `!` diverged, `~` resumable, `%` clone; the newest `@name` in a
-  row is the source. Snapshot-less "plumbing" groups are hidden (`-a` shows)
-  and boring `bak/`/`srv/`-style prefixes are auto-trimmed from row names
-  into cells — all convention-free, derived from the data.
+  from **snapshot GUIDs**, never names. Cell markers: `!` diverged, `~`
+  resumable, `%` clone; unsnapshotted writes are indicated by color only
+  (no `+` suffix — color is enough). Snapshot-less replicas with writes show
+  their written size in parens `(123.4G)` instead of a snapshot name. The
+  name column shows the latest-snapshot refer size; for hidden snapshot-less
+  groups it shows the largest written (or used) size across members. Snapshot-
+  less "plumbing" groups are hidden (`-a` shows) and boring `bak/`/`srv/`-
+  style prefixes are auto-trimmed from row names into cells — all
+  convention-free, derived from the data.
 - bare `./zfstui` opens the TUI: scrollable matrix with a two-level
   host/pool header (both navigable; hosts show "(53%/38T)" capacity when the
   column is wide enough), color-coded cells (behind replicas gray; unhealthy
@@ -661,6 +665,32 @@ TUI is manual for now.
   tables with a row cursor, Enter-opens-modal everywhere (incl. directly
   from table cells/headers). State display renamed "in-sync" → "synced".
   Docs merged: README.md folded into DESIGN.md (user edit).
+- 2026-06-14: **UI polish** — modal titles prefixed with object type
+  ("dataset", "snapshot" — host/pool/disk/job/vdev already had it); footer
+  swapped so status message is on the left and keyboard help on the right;
+  jobs table in Details shows status (OK/N%/FAIL/spinner) before the ID;
+  running job progress adds average transfer speed and ETA (from start
+  timestamp in status file); PgUp/PgDn works in both main pane (page of
+  rows) and Details pane (page of lines). `+` suffix dropped from cells with
+  unsnapshotted writes — color alone signals the state. Snapshot-less
+  replicas with writes now show `(size)` in the cell; name column shows a
+  size estimate for hidden snapshot-less groups (max Written, else Used).
+- 2026-06-14: **table header redesign** — host header row drops Bold+Underline
+  (just Bold now); host labels are centered within their pool-column span;
+  capacity info drops parens ("83%/1.8T" not "(83%/1.8T)"); vertical `│`
+  separators between host groups (and after the name column) give a clean
+  column-group boundary; top-left name-column header shows "group"; data rows
+  show latest-snapshot refer size right-aligned in the name column (integer
+  shorthand: "19G", "239M"); when the main pane is focused and the cursor is
+  on a data row, the name-column header ("group") or the pool headers of the
+  cursor's host group get the active-pane background highlight (same as the
+  pane title chip) — gives a column-indicator effect without covering data.
+- 2026-06-15: **header live indicators** — host header row shows a braille
+  spinner next to the host name while that host is being refreshed (ticker
+  also runs during refresh, not just during running jobs); pool header row
+  shows 🧹 next to the pool name when a scrub or resilver is in progress
+  (detected from `scan: … in progress` in the verbatim `_zpool-status` prop).
+  Column width accounts for the emoji so data cells below stay aligned.
 - Name: `zfstui`.
 
 ## Initial wishes

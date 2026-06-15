@@ -4,9 +4,49 @@
 package main
 
 import (
+	"bytes"
+	"compress/zlib"
+	"encoding/binary"
+	"encoding/hex"
+	"io"
 	"sort"
+	"strconv"
 	"strings"
 )
+
+// resumeTokenGUID decodes a ZFS receive_resume_token and returns the toguid
+// — the snapshot GUID the destination is expecting to receive next. The token
+// format is "1-<checksum>-<length>-<hex(zlib(nvlist))>"; the nvlist is
+// native-endian (little-endian on all common platforms).
+func resumeTokenGUID(token string) string {
+	if token == "" || token == "none" {
+		return ""
+	}
+	parts := strings.SplitN(token, "-", 4)
+	if len(parts) != 4 || parts[0] != "1" {
+		return ""
+	}
+	raw, err := hex.DecodeString(parts[3])
+	if err != nil {
+		return ""
+	}
+	r, err := zlib.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return ""
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return ""
+	}
+	// Locate "toguid\x00\x00" and read the following 8 bytes as LE uint64.
+	key := []byte("toguid\x00\x00")
+	idx := bytes.Index(data, key)
+	if idx < 0 || idx+len(key)+8 > len(data) {
+		return ""
+	}
+	return strconv.FormatUint(binary.LittleEndian.Uint64(data[idx+len(key):]), 10)
+}
 
 // replicaKey identifies a dataset across the whole inventory.
 func replicaKey(host, name string) string { return host + ":" + name }
@@ -81,6 +121,19 @@ func Groups(states []HostState) []*Group {
 					union(ok2, k)
 				}
 			}
+		}
+	}
+
+	// Link datasets mid-receive to their target group via the resume token's
+	// toguid — the snapshot GUID they are expecting to receive. This groups a
+	// new replica with its source before any snapshot GUIDs are shared.
+	for _, k := range keys {
+		guid := resumeTokenGUID(entries[k].ds.ResumeToken)
+		if guid == "" {
+			continue
+		}
+		if first, ok := byGUID[guid]; ok {
+			union(first, k)
 		}
 	}
 

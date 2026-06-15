@@ -335,7 +335,7 @@ func ParseDisks(host, out string) (vdevs []VDev, statusTexts map[string]string, 
 				vdevs = append(vdevs, vdevFromProps(host, pool, name, t.vals[name], t.srcs[name]))
 			}
 		}
-		if s := strings.TrimSpace(buf.String()); s != "" {
+		if s := strings.TrimRight(buf.String(), "\n\r "); s != "" {
 			statusTexts[pool] = s
 		}
 		pool = ""
@@ -346,7 +346,7 @@ func ParseDisks(host, out string) (vdevs []VDev, statusTexts map[string]string, 
 		if smartDev == "" {
 			return
 		}
-		if s := strings.TrimSpace(buf.String()); s != "" {
+		if s := strings.TrimRight(buf.String(), "\n\r "); s != "" {
 			smartTexts[smartDev] = s
 		}
 		smartDev = ""

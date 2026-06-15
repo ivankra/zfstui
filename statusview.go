@@ -21,6 +21,11 @@ func CellText(r *Replica) string {
 	b.WriteString(strings.TrimSuffix(r.CellPrefix, "/"))
 	if r.Latest != nil {
 		b.WriteString("@" + r.Latest.Name)
+	} else if r.State != StateClone && r.Dataset.Used > 0 {
+		// Snapshot-less: show used size in parens — Used is the actual
+		// dataset size; Written is just bytes-since-last-snapshot metadata
+		// and is unreliable when no snapshot exists.
+		b.WriteString("(" + humanShort(r.Dataset.Used) + ")")
 	}
 	switch r.State {
 	case StateDiverged:
@@ -30,9 +35,8 @@ func CellText(r *Replica) string {
 	case StateClone:
 		b.WriteString("%")
 	}
-	if r.State != StateClone && r.Written > 0 {
-		b.WriteString("+")
-	}
+	// "+" dropped: cell color (styleWritten) already signals unsnapshotted
+	// writes when Latest != nil.
 	if b.Len() == 0 {
 		// Replica exists but has no snapshots, writes, or distinguishing
 		// prefix — still mark its presence.

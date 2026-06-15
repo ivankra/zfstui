@@ -36,9 +36,9 @@ func TestStatusTable(t *testing.T) {
 	if !strings.Contains(lines[0], "dev1:ssd") || !strings.Contains(lines[0], "dev2:tank") {
 		t.Errorf("header: %q", lines[0])
 	}
-	// dev1 has unsnapshotted writes => +; dev2 is behind, no marker.
+	// dev1 has unsnapshotted writes (color only, no + suffix); dev2 is behind, no marker.
 	if !strings.HasPrefix(lines[1], "git") ||
-		!strings.Contains(lines[1], "srv@20260601+") ||
+		!strings.Contains(lines[1], "srv@20260601") ||
 		!strings.Contains(lines[1], "bak@20260601") {
 		t.Errorf("row: %q", lines[1])
 	}
