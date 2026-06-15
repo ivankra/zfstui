@@ -1,11 +1,14 @@
 # zfstui design doc
 
-## Status (2026-06-12)
+## Status (2026-06-15)
 
 **Working end-to-end on a real fleet**: discovery + status (M1), full TUI
 (M3), sync planner with compatibility gate (M2 core), and snapshot/sync
-execution with detached jobs and live progress (most of M4). Not yet: batch
-`snap`/`sync` CLI, prune, jobs pane, `doctor`, job-dir cleanup.
+execution with detached jobs and live progress (most of M4). The Details pane
+and per-object modals are now unified object views rendered compact (pane) or
+full (interactive window stack, Esc-pops); job logs, host uptime/space, and a
+pool fill-bar header row were added (see the dated decisions log). Not yet:
+batch `snap`/`sync` CLI, prune, jobs pane, `doctor`, job-dir cleanup.
 
 - `zfstui refresh` ssh-es to all known hosts in parallel and scrapes
   `zpool/zfs get -Hp all` (every property + source), disk health (vdev
@@ -543,9 +546,11 @@ Non-obvious implementation decisions, with reasons:
 - Discovery is `get -Hp all`: typed struct fields derive from the property
   maps in one place (zfsparse.go fromProps/toProps); sqlite stores the maps
   as JSON; detail modals dump them fully, with property sources.
-- Details pane content is a list of `detLine`s (details.go); selectable ones
-  carry an `open` closure returning the object's modal. Scrolling pulls up
-  to 3 non-selectable context lines (section headers) into view.
+- Object views are unified (view.go): one builder per object type emits
+  `viewLine`s rendered compact (Details pane) or full (interactive window
+  stack) from a single `full bool`; selectable lines carry an `open` closure
+  returning the drilled-into object's `*objView`. Scrolling pulls up to 3
+  non-selectable context lines (section headers) into view.
 - The "ahead" state intentionally has **no marker/asterisk** in cells: the
   newest `@name` in the row identifies the source (user preference).
 - Display-name pipeline: name-in-pool → `trimBoring` (drop leading
@@ -691,6 +696,70 @@ TUI is manual for now.
   shows 🧹 next to the pool name when a scrub or resilver is in progress
   (detected from `scan: … in progress` in the verbatim `_zpool-status` prop).
   Column width accounts for the emoji so data cells below stay aligned.
+- 2026-06-15: **unified object views + window stack** — the Details pane and
+  the per-object modals were two separate code paths displaying the same
+  objects (host/pool/dataset/snapshot/disk/vdev/job/group). Merged into ONE
+  builder per object type (view.go) returning structured `viewLine`s, rendered
+  two ways from a single `full bool`: compact (Details pane — no section
+  headers, property dumps / verbatim status / SMART dropped, dense `* HEADER` /
+  indented-row tables) and full (interactive window — cyan centered `── title ──`
+  section headers, complete property maps + verbatim text: the old text-modal
+  look, now with a row cursor and Enter-to-drill). Modals became a **window
+  stack** (`Model.windows`): Enter on a selectable row pushes a sub-window for
+  that object, Esc pops it, focus returns to the previous window. Builders are
+  re-run every render, so spinners / transfer progress / ETA stay live in
+  windows too (previously only the pane updated; text modals were a static
+  snapshot taken at open time). Dry-run plans and failure logs are plain
+  windows (`textView`) on the same stack. details.go is now just the pane glue
+  (compact build + 8-line render + row cursor); view.go owns all object
+  content and the window machinery. Table data rows render white; table
+  headers cyan (centered `── title ──` in windows, `* HEADER` in the pane).
+- 2026-06-15: **job logs in the view** — `jobsProbe` now also tails `./log`
+  (last 200 lines) so `JobInfo.Log` is populated on every refresh and live
+  poll; persisted in the jobs table (schema v6). The job window shows it as a
+  `── log ──` section after `── script ──`, updating live while a transfer
+  runs. (waitJob still tails the log transiently for the immediate
+  snapshot/sync failure modals.)
+- 2026-06-15: **pool fill bars** — a third, non-focusable header row under each
+  pool header shows utilisation as a `▰▰▰▰▱▱` bar (border/dim colored), sized to
+  the pool column width and rounded to the nearest cell. The host header row
+  drops the `NN%/` prefix (the bars carry utilisation now) and shows just the
+  total pool size. tableView now emits THREE header lines (host/pool/bar); the
+  data-row count and scrollToCursor account for the extra line.
+- 2026-06-15: **host boot time / uptime + space** — discovery gained a
+  non-fatal `===ZFSTUI:host===` section (`awk '/^btime/{print $2}' /proc/stat`)
+  collecting the host's boot epoch into `HostState.BootTime`, persisted in the
+  hosts table (`boot_time`, schema v7) and surfaced as `HostInfo.BootTime`. The
+  host window now shows `space:` (total/free/%used across pools) and `uptime:`
+  (booted timestamp) rows at the top. The section is tolerated absent (old
+  caches / non-Linux) so it never aborts a refresh.
+- 2026-06-15: **view polish (user-driven tweaks)** — full-window section
+  headers always get a blank line above them (withSectionGaps); table data
+  rows render white, headers cyan; the compact pane dropped ALL `*` bullets
+  and indentation (flush, dense — user preference); propsDump omits the SOURCE
+  column when the map has no sources (lsblk); window titles are host-qualified
+  (`disk h:/dev/sda`, `vdev h:pool/x`, `snapshot h:ds@s`, `job h:id`); the
+  dataset window drops host/type rows (host is in the title) and shows
+  `encryption … root: <encryptionroot>` only when encrypted, with explicit "0"
+  for zero space values; the disk window top shows only size + smart, with the
+  `smartctl -a` verbatim moved LAST (after lsblk props). PgUp/PgDn snap the
+  cursor onto a visible selectable row (scrollMove) so it never strands behind
+  a prior page; up/down free-scroll past the last parkable row to reach
+  trailing content.
+- 2026-06-15: **control bytes stripped from log/verbatim** — job logs (and
+  smartctl/zpool verbatims) often carry carriage returns and ANSI escapes from
+  pv/ssh/zfs progress output; a bare `\r` is zero-width to lipgloss but resets
+  the cursor on a real terminal, shoving the window border mid-line. `stripCtrl`
+  drops C0 control bytes (and DEL/ESC) while keeping tabs for expandTabs;
+  applied to job-log and appendVerbatim lines, NOT to propsDump (which embeds
+  intentional ANSI).
+- 2026-06-15: **jobsProbe is collision-proof** — replaced the multi-marker
+  echo soup (`==J==`/`==M==`/`==P==`/`==E==`/`==L==`) with ONE line per job:
+  `<dir> status=<b64> meta=<b64> progress=<b64> expected=<b64> log=<b64>`
+  (`base64 | tr -d '\n'` per value). base64 has no spaces/newlines so a value
+  can't split a token or alias the framing, and the key is always present (an
+  empty value is just `log=`). ParseJobs anchors on the dir prefix, then
+  splits key=value tokens and base64-decodes.
 - Name: `zfstui`.
 
 ## Initial wishes

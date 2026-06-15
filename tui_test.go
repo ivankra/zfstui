@@ -35,6 +35,35 @@ func dialogTestModel(t *testing.T) *Model {
 	return m
 }
 
+// winOpen reports whether an interactive object window is on the stack.
+func winOpen(m *Model) bool { return m.topWindow() != nil }
+
+// winTitle / winText build the top window's full content for assertions.
+func winTitle(m *Model) string {
+	w := m.topWindow()
+	if w == nil {
+		return ""
+	}
+	segs, _ := w.view.build(m, true)
+	if len(segs) == 0 {
+		return ""
+	}
+	return segs[0]
+}
+
+func winText(m *Model) string {
+	w := m.topWindow()
+	if w == nil {
+		return ""
+	}
+	_, lines := w.view.build(m, true)
+	parts := make([]string, len(lines))
+	for i, l := range lines {
+		parts[i] = l.text
+	}
+	return strings.Join(parts, "\n")
+}
+
 func key(s string) tea.KeyMsg {
 	switch s {
 	case "enter":
@@ -93,32 +122,32 @@ func TestSnapshotDialogDryRunFlow(t *testing.T) {
 	if m.dialog != nil {
 		t.Error("dialog should close")
 	}
-	if m.modal == nil {
-		t.Fatal("dry-run details modal should open")
+	if !winOpen(m) {
+		t.Fatal("dry-run details window should open")
 	}
-	content := strings.Join(m.modal.lines, "\n")
+	content := winText(m)
 	if !strings.Contains(content, `sudo -n zfs snapshot -r 'ssd/srv/git@pre-upgrade'`) ||
 		!strings.Contains(content, "/tmp/zfstui-job-") ||
 		!strings.Contains(content, "#!/usr/bin/env bash") {
-		t.Errorf("modal content:\n%s", content)
+		t.Errorf("window content:\n%s", content)
 	}
-	if !strings.Contains(m.modal.title, "DRY RUN") {
-		t.Errorf("modal title: %q", m.modal.title)
+	if !strings.Contains(winTitle(m), "DRY RUN") {
+		t.Errorf("window title: %q", winTitle(m))
 	}
 
 	// Scrollable: j moves down, g back to top; Esc closes.
 	m.Update(key("j"))
 	m.Update(key("j"))
-	if m.modal.off != 2 {
-		t.Errorf("scroll off = %d", m.modal.off)
+	if m.topWindow().off != 2 {
+		t.Errorf("scroll off = %d", m.topWindow().off)
 	}
 	m.Update(key("g"))
-	if m.modal.off != 0 {
-		t.Errorf("scroll home off = %d", m.modal.off)
+	if m.topWindow().off != 0 {
+		t.Errorf("scroll home off = %d", m.topWindow().off)
 	}
 	m.Update(key("esc"))
-	if m.modal != nil {
-		t.Error("Esc should close the modal")
+	if winOpen(m) {
+		t.Error("Esc should close the window")
 	}
 }
 
@@ -143,8 +172,8 @@ func TestSnapshotDialogRejectsDuplicateAndBadNames(t *testing.T) {
 	if m.dialog == nil || m.dialog.errMsg == "" {
 		t.Errorf("empty name not rejected: %+v", m.dialog)
 	}
-	if m.modal != nil {
-		t.Error("no modal must open on validation failure")
+	if winOpen(m) {
+		t.Error("no window must open on validation failure")
 	}
 
 	// Esc closes.
@@ -232,10 +261,10 @@ func TestSyncDialogFlow(t *testing.T) {
 
 	// Submit (dry run): modal with the pipeline; agent-forward note present.
 	m.Update(key("enter"))
-	if m.syncDlg != nil || m.modal == nil {
-		t.Fatal("expected details modal after dry-run submit")
+	if m.syncDlg != nil || !winOpen(m) {
+		t.Fatal("expected details window after dry-run submit")
 	}
-	content := strings.Join(m.modal.lines, "\n")
+	content := winText(m)
 	for _, want := range []string{
 		`zfs send -L -c -I 'tank/srv/git@20260501' 'tank/srv/git@20260611'`,
 		`$DSSH "sudo -n zfs recv -s -u 'root/bak/git'"`, // ivan@cml => sudo
@@ -296,10 +325,10 @@ func TestSyncDialogCustomDestination(t *testing.T) {
 		t.Fatalf("custom = %q", d.custom.Value())
 	}
 	m.Update(key("enter"))
-	if m.modal == nil {
-		t.Fatalf("expected dry-run modal, err=%q", d.errMsg)
+	if !winOpen(m) {
+		t.Fatalf("expected dry-run window, err=%q", d.errMsg)
 	}
-	content := strings.Join(m.modal.lines, "\n")
+	content := winText(m)
 	for _, want := range []string{
 		"kiwi:tank/bak/git (full send)",
 		`zfs send -L -c 'tank/srv/git@20260611'`,    // full, not incremental
@@ -320,7 +349,7 @@ func TestSyncDialogCustomRejectsExisting(t *testing.T) {
 		m.Update(key(string(r)))
 	}
 	m.Update(key("enter"))
-	if m.modal != nil || m.syncDlg == nil ||
+	if winOpen(m) || m.syncDlg == nil ||
 		!strings.Contains(m.syncDlg.errMsg, "already exists") {
 		t.Fatalf("existing dataset not rejected: %+v", m.syncDlg)
 	}
@@ -341,11 +370,11 @@ func TestSyncDialogSingleReplicaGroup(t *testing.T) {
 		m.Update(key(string(r)))
 	}
 	m.Update(key("enter"))
-	if m.modal == nil {
-		t.Fatalf("expected dry-run modal, err=%q", m.syncDlg.errMsg)
+	if !winOpen(m) {
+		t.Fatalf("expected dry-run window, err=%q", m.syncDlg.errMsg)
 	}
-	if !strings.Contains(strings.Join(m.modal.lines, "\n"), "full send") {
-		t.Error("modal should describe a full send")
+	if !strings.Contains(winText(m), "full send") {
+		t.Error("window should describe a full send")
 	}
 }
 
@@ -376,11 +405,11 @@ func TestJobProgressInTUI(t *testing.T) {
 	// Enter on the job row (details focused) opens the job modal with full progress.
 	m.Update(key("tab")) // focus details; snaps to first selectable row (the job)
 	m.Update(key("enter"))
-	if m.modal == nil {
-		t.Fatal("Enter should open the job modal")
+	if !winOpen(m) {
+		t.Fatal("Enter should open the job window")
 	}
-	if !strings.Contains(strings.Join(m.modal.lines, "\n"), "500B/1000B (50%)") {
-		t.Errorf("job modal missing progress:\n%s", strings.Join(m.modal.lines, "\n"))
+	if !strings.Contains(winText(m), "500B/1000B (50%)") {
+		t.Errorf("job window missing progress:\n%s", winText(m))
 	}
 	m.Update(key("esc"))
 	m.Update(key("tab")) // back to table focus
@@ -421,29 +450,29 @@ func TestReloadWithHeaderCursor(t *testing.T) {
 
 func TestEnterOpensDetailModals(t *testing.T) {
 	m := syncTestModel(t)
-	// Cell with one replica → dataset modal.
+	// Cell with one replica → dataset window.
 	m.moveCursorToCol(t, "ws:tank")
 	m.Update(key("enter"))
-	if m.modal == nil || !strings.Contains(m.modal.title, "ws:tank/srv/git") {
-		t.Fatalf("dataset modal expected, got %+v", m.modal)
+	if !winOpen(m) || !strings.Contains(winTitle(m), "ws:tank/srv/git") {
+		t.Fatalf("dataset window expected, got %q", winTitle(m))
 	}
 	m.Update(key("esc"))
-	// Host header row → host modal.
+	// Host header row → host window.
 	m.curRow = -2
 	m.clampCursor()
 	m.Update(key("enter"))
-	if m.modal == nil || !strings.Contains(m.modal.title, "host ") {
-		t.Fatalf("host modal expected, got %+v", m.modal)
+	if !winOpen(m) || !strings.Contains(winTitle(m), "host ") {
+		t.Fatalf("host window expected, got %q", winTitle(m))
 	}
-	if !strings.Contains(strings.Join(m.modal.lines, "\n"), "ssh:") {
-		t.Errorf("host modal content:\n%s", strings.Join(m.modal.lines, "\n"))
+	if !strings.Contains(winText(m), "ssh:") {
+		t.Errorf("host window content:\n%s", winText(m))
 	}
 	m.Update(key("esc"))
-	// Group row → focus jump (no single modal).
+	// Group row → focus jump (no window).
 	m.curRow, m.curCol = 0, 0
 	m.Update(key("enter"))
-	if m.modal != nil || m.focus != 1 {
-		t.Fatalf("group row should jump to details: modal=%v focus=%d", m.modal, m.focus)
+	if winOpen(m) || m.focus != 1 {
+		t.Fatalf("group row should jump to details: window=%v focus=%d", winOpen(m), m.focus)
 	}
 }
 
@@ -482,7 +511,7 @@ func TestDiskDataFlow(t *testing.T) {
 	m.curRow, m.curCol = -1, 1
 	m.clampCursor()
 	view := m.View()
-	for _, want := range []string{"VDEV", "DISK", "HG10-2JNX", "/dev/sda", "* scrub repaired"} {
+	for _, want := range []string{"VDEV", "DISK", "HG10-2JNX", "/dev/sda", "scrub repaired"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("pool view missing %q:\n%s", want, view)
 		}
@@ -490,54 +519,54 @@ func TestDiskDataFlow(t *testing.T) {
 	if strings.Contains(view, "raidz1-0") {
 		t.Errorf("pool view should show leaf vdev rows only:\n%s", view)
 	}
-	// Enter on pool header → pool modal with verbatim status.
+	// Enter on pool header → pool window with verbatim status.
 	m.Update(key("enter"))
-	if m.modal == nil || !strings.Contains(strings.Join(m.modal.lines, "\n"), "scrub repaired 0B in 11:11:17") {
-		t.Fatalf("pool modal verbatim missing: %+v", m.modal)
+	if !winOpen(m) || !strings.Contains(winText(m), "scrub repaired 0B in 11:11:17") {
+		t.Fatalf("pool window verbatim missing: %q", winText(m))
 	}
 	m.Update(key("esc"))
 
-	// Host modal: ssh+refresh summary and disk inventory (SMART opens on disk).
+	// Host window: ssh+refresh summary and disk inventory (SMART opens on disk).
 	m.curRow = -2
 	m.clampCursor()
 	m.Update(key("enter"))
-	content := strings.Join(m.modal.lines, "\n")
+	content := winText(m)
 	for _, want := range []string{"ssh: root@sta", "jobs running", "/dev/sda", "E4GG2JNX", "sata hdd"} {
 		if !strings.Contains(content, want) {
-			t.Errorf("host modal missing %q:\n%s", want, content)
+			t.Errorf("host window missing %q:\n%s", want, content)
 		}
 	}
 	if strings.Contains(content, "zpool status") || strings.Contains(content, "smartctl -a") {
-		t.Error("host modal should not include pool or SMART verbatims")
+		t.Error("host window should not include pool or SMART verbatims")
 	}
 	m.Update(key("esc"))
 
-	// Vdev row Enter → vdev modal (navigate into details on pool view).
+	// Vdev row Enter → vdev window (navigate into details on pool view).
 	m.curRow = -1
 	m.clampCursor()
 	m.Update(key("tab"))
-	m.Update(key("j")) // pool line -> first vdev row
+	m.Update(key("j")) // scan line -> first vdev row
 	m.Update(key("enter"))
-	if m.modal == nil || !strings.Contains(m.modal.title, "vdev sta-tank/") {
-		t.Fatalf("vdev modal expected: %+v", m.modal)
+	if !winOpen(m) || !strings.Contains(winTitle(m), "vdev sta:sta-tank/") {
+		t.Fatalf("vdev window expected: %q", winTitle(m))
 	}
 	m.Update(key("esc"))
 
-	// Host details disk row Enter -> disk modal with SMART.
+	// Host details disk row Enter -> disk window with SMART.
 	m.curRow = -2
 	m.clampCursor()
 	m.focus = 1
 	m.detCur, m.detOff = 0, 0
 	m.detSnap()
-	for i := 0; i < 6 && (m.modal == nil || !strings.Contains(m.modal.title, "disk ")); i++ {
+	for i := 0; i < 6 && !(winOpen(m) && strings.Contains(winTitle(m), "disk ")); i++ {
 		m.Update(key("j"))
 		m.Update(key("enter"))
-		if m.modal == nil || !strings.Contains(m.modal.title, "disk ") {
+		if !(winOpen(m) && strings.Contains(winTitle(m), "disk ")) {
 			m.Update(key("esc"))
 		}
 	}
-	if m.modal == nil || !strings.Contains(strings.Join(m.modal.lines, "\n"), "smartctl -a") {
-		t.Fatalf("disk modal expected: %+v", m.modal)
+	if !winOpen(m) || !strings.Contains(winText(m), "smartctl -a") {
+		t.Fatalf("disk window expected: %q", winTitle(m))
 	}
 }
 

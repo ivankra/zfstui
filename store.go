@@ -20,7 +20,7 @@ type Store struct {
 
 // Bump whenever the schema changes: the db is a disposable cache, so on
 // mismatch we just drop everything and start over (no migrations).
-const schemaVersion = 5
+const schemaVersion = 7
 
 const schema = `
 CREATE TABLE IF NOT EXISTS hosts (
@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS hosts (
   -- refresh metadata
   last_refresh INTEGER NOT NULL DEFAULT 0,  -- unix seconds; 0 = never
   reachable INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT NOT NULL DEFAULT ''
+  last_error TEXT NOT NULL DEFAULT '',
+  boot_time INTEGER NOT NULL DEFAULT 0  -- unix seconds of host's last boot; 0 = unknown
 );
 -- Inventory objects are stored as their full property maps (JSON, from
 -- "zpool/zfs get -Hp all"); typed fields are re-derived on load via the
@@ -68,7 +69,7 @@ CREATE TABLE IF NOT EXISTS disks (
 CREATE TABLE IF NOT EXISTS jobs (
   host TEXT NOT NULL, id TEXT NOT NULL, dir TEXT NOT NULL,
   kind TEXT, state TEXT, status TEXT, meta TEXT,
-  progress INTEGER, expected INTEGER,
+  progress INTEGER, expected INTEGER, log TEXT,
   PRIMARY KEY (host, id)
 );
 `
@@ -200,15 +201,15 @@ func (s *Store) PutHostState(st HostState) error {
 	for _, j := range st.Jobs {
 		meta, _ := json.Marshal(j.Meta)
 		if _, err := tx.Exec(
-			`INSERT INTO jobs (host,id,dir,kind,state,status,meta,progress,expected) VALUES (?,?,?,?,?,?,?,?,?)`,
-			j.Host, j.ID, j.Dir, j.Kind, j.State, j.Status, string(meta), j.Progress, j.Expected); err != nil {
+			`INSERT INTO jobs (host,id,dir,kind,state,status,meta,progress,expected,log) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			j.Host, j.ID, j.Dir, j.Kind, j.State, j.Status, string(meta), j.Progress, j.Expected, j.Log); err != nil {
 			return err
 		}
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO hosts (name, last_refresh, reachable, last_error) VALUES (?,?,1,'')
-		 ON CONFLICT(name) DO UPDATE SET last_refresh=excluded.last_refresh, reachable=1, last_error=''`,
-		st.Host, time.Now().Unix()); err != nil {
+		`INSERT INTO hosts (name, last_refresh, reachable, last_error, boot_time) VALUES (?,?,1,'',?)
+		 ON CONFLICT(name) DO UPDATE SET last_refresh=excluded.last_refresh, reachable=1, last_error='', boot_time=excluded.boot_time`,
+		st.Host, time.Now().Unix(), st.BootTime); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -229,10 +230,11 @@ type HostInfo struct {
 	LastRefresh time.Time
 	Reachable   bool
 	LastError   string
+	BootTime    int64 // unix seconds of host's last boot; 0 if unknown
 }
 
 func (s *Store) Hosts() ([]HostInfo, error) {
-	rows, err := s.db.Query(`SELECT name, last_refresh, reachable, last_error FROM hosts ORDER BY name`)
+	rows, err := s.db.Query(`SELECT name, last_refresh, reachable, last_error, boot_time FROM hosts ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +244,7 @@ func (s *Store) Hosts() ([]HostInfo, error) {
 		var h HostInfo
 		var ts int64
 		var reach int
-		if err := rows.Scan(&h.Name, &ts, &reach, &h.LastError); err != nil {
+		if err := rows.Scan(&h.Name, &ts, &reach, &h.LastError, &h.BootTime); err != nil {
 			return nil, err
 		}
 		h.LastRefresh = time.Unix(ts, 0)
@@ -338,14 +340,14 @@ func (s *Store) AllHostStates() ([]HostState, error) {
 	}
 	rows.Close()
 
-	rows, err = s.db.Query(`SELECT host,id,dir,kind,state,status,meta,progress,expected FROM jobs ORDER BY host,id`)
+	rows, err = s.db.Query(`SELECT host,id,dir,kind,state,status,meta,progress,expected,COALESCE(log,'') FROM jobs ORDER BY host,id`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var j JobInfo
 		var meta string
-		if err := rows.Scan(&j.Host, &j.ID, &j.Dir, &j.Kind, &j.State, &j.Status, &meta, &j.Progress, &j.Expected); err != nil {
+		if err := rows.Scan(&j.Host, &j.ID, &j.Dir, &j.Kind, &j.State, &j.Status, &meta, &j.Progress, &j.Expected, &j.Log); err != nil {
 			rows.Close()
 			return nil, err
 		}

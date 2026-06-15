@@ -5,10 +5,14 @@ READ DESIGN.md first: it is THE doc now (status, architecture, dated
 decisions log explaining *why*, roadmap, and the user's original wishes at
 the bottom — README.md was merged into it and deleted).
 
-State as of 2026-06-12: discovery/status (M1), read-only TUI (M3), sync
-planner (M2 core), and most of M4 (snapshot + sync dialogs, detached jobs,
-live progress, -dry-run) are DONE and field-tested on the user's real fleet.
-Missing: batch snap/sync CLI, jobs pane, prune, job-dir cleanup, doctor.
+State as of 2026-06-15: discovery/status (M1), TUI (M3), sync planner (M2
+core), and most of M4 (snapshot + sync dialogs, detached jobs, live progress,
+-dry-run) are DONE and field-tested on the user's real fleet. The Details
+pane + per-object modals were unified into ONE builder-per-object set of views
+rendered compact (pane) or full (interactive window stack) — see view.go /
+details.go and the tui.go bullet. Job logs, host boot/uptime + pool space, and
+pool fill-bar header row were added. Missing: batch snap/sync CLI, jobs pane,
+prune, job-dir cleanup, doctor.
 
 ## Commands
 
@@ -72,23 +76,32 @@ every emitted shape — extend regexes and constructors together. The global
 - `model.go` — types: Host (identity=Name + access spec; EffUser/NeedSudo/
   Dest/URL helpers), Pool, Dataset, Snapshot, VDev (leaf/topology objects
   from vdev properties, error counters, optional DiskID), Disk (physical
-  disk identity + lsblk props + verbatim smartctl), JobInfo, HostState
-  (per-host raw inventory incl. VDevs/Disks/Jobs), Replica/Group (derived).
+  disk identity + lsblk props + verbatim smartctl), JobInfo (incl. `Log` =
+  tail of ./log), HostState (per-host raw inventory incl. VDevs/Disks/Jobs
+  + `BootTime` unix-secs from /proc/stat btime), Replica/Group (derived).
 - `hostspec.go` — parseHostSpec/parseHostSpecs (URL forms, conflict
   rejection, root normalized to "") and resolveHosts (specs ↔ sqlite memory).
 - `zfsparse.go` — discovery uses `zpool/zfs get -Hp all` (NAME\tPROP\tVALUE
   \tSOURCE lines): EVERY property is collected; typed struct fields derive
   from the prop maps in ONE place (datasetFromProps & friends, with toProps
   inverses for code-built fixtures). DiscoverCommand = ONE ssh round-trip,
-  five marker-delimited sections with per-section exit codes: pools, disks
+  marker-delimited sections with per-section exit codes: pools, disks
   (per pool: `zpool get all <pool> all-vdevs` vdev properties [OpenZFS≥2.2,
   tolerated absent — verbatim status still surfaces] + verbatim
   `zpool status`; then `lsblk -b -P` physical disks and `smartctl -a` per
   disk, 20K cap),
-  datasets, snapshots, jobs (`jobsProbe`, also used for live polling).
+  datasets, snapshots, jobs (`jobsProbe`, also used for live polling), host
+  (`===ZFSTUI:host===`: `awk '/^btime/' /proc/stat` boot epoch → BootTime;
+  NON-required + `; true` so it never aborts a refresh on non-Linux/old
+  caches — parse only if the section is present).
   Verbatim zpool status rides on Pool.Props["_zpool-status"] (underscore =
   synthetic key, excluded from propsDump, persisted for free).
-  ParseDiscovery/ParseDisks/ParseJobs. Mental model: ZFS leaf vdevs are
+  ParseDiscovery/ParseDisks/ParseJobs. `jobsProbe` emits ONE line per job dir:
+  `<dir> status=<b64> meta=<b64> progress=<b64> expected=<b64> log=<b64>` —
+  base64 values (no spaces/newlines) so arbitrary log/meta can't alias the
+  framing; the key is always present (empty = `log=`). NEVER go back to the
+  old `==J==`/`==M==` marker soup — log content aliased the markers.
+  Mental model: ZFS leaf vdevs are
   pool membership/error-counter objects, often partitions or by-partlabel
   paths; Disks are host-level physical devices with stable identity (WWN,
   serial, else dev), model/size/transport/media, and SMART text.
@@ -99,7 +112,12 @@ every emitted shape — extend regexes and constructors together. The global
   full property maps as JSON (props+srcs); typed fields are re-derived on
   load via the same fromProps mappings. `db.SetMaxOpenConns(1)` is
   load-bearing (SQLITE_BUSY under parallel refresh; `:memory:` per-conn DBs).
-  schemaVersion mismatch drops all tables.
+  schemaVersion (currently 7) mismatch drops ALL tables — disposable cache,
+  no migrations ever. hosts table carries `boot_time`; jobs table carries
+  `log`. TRAP: adding a column mid-development can leave existing rows with
+  NULL in it (a build wrote rows before the INSERT listed the column) →
+  `Scan ... converting NULL to string` on load. Read with `COALESCE(col,'')`
+  (see the jobs `log` SELECT); new writes always supply a value.
 - `derive.go` — THE core; pure functions of inventory:
   - groups = union-find over shared **snapshot GUIDs** (+ clone `origin`
     links). Dataset GUIDs differ per replica — never identity.
@@ -143,6 +161,10 @@ every emitted shape — extend regexes and constructors together. The global
   - cursor: curRow -2 = host header (←→ jump host-to-host), -1 = pool
     header, 0.. = group rows; curCol 0 = name column, 1..N = sorted
     "host:pool" columns. Row guide: cursor's row gets bg tint 238 always.
+    THREE non-data header rows (tableView emits them; data-row count and
+    scrollToCursor subtract 3): host (size only, no %), pool (name + 🧹 if
+    scrubbing), and a non-focusable pool fill-bar row (`▰▰▰▱▱` via fillBar,
+    dim/border colored, sized to the column).
   - colors: white normal, gray behind/stale, green unsynced snapshots
     (ahead), bright yellow 226 unsnapshotted writes (+), red diverged and
     unhealthy/error pool headers, cyan 14 resumable / section headers /
@@ -151,43 +173,72 @@ every emitted shape — extend regexes and constructors together. The global
   - panes: the Datasets/main table has no pane title line; Details keeps a
     segmented title: ──[ id ]──[ info chips ]── (inactive text plain white,
     brackets/rules dim). The active/focused title chip is white-on-dark
-    border fill, including its padding spaces; modal dialog titles use the
-    same filled title treatment. Host
-    modal bodies use 2-space horizontal padding; property sections render as
-    plain `── properties ─...` headers with unindented rows.
-    header spans append "(53%/38T)" when the span is wide enough. Details
-    (details.go) is structured: detLine rows; selectable ones (snapshots/
-    jobs/pools/datasets/replicas) get a white-bg row cursor when focused
-    (Tab or Enter-from-group-row; ↑↓ move — scrolling pulls section headers
-    back into view; Enter opens a textModal with ALL properties incl.
-    sources — the get-all payoff). Enter in the MAIN table opens modals
-    directly: dataset cell → datasetModal, host header → hostModal, pool
-    header → poolModal; group rows drill into Details. Per-view layouts:
-    replicaDetails (chips: "host:ds (mountpoint)", "Xg used, @latest
-    (refer) +written", encryption; JOBS rows "id 51%|OK|FAIL desc" +
-    SNAPSHOT/USED/REFER table), groupDetails (chips: "group X",
-    "@latest (refer) +writtenSum"; REPLICAS), hostDetails (selectable ssh
-    line + DISK table + capacity chips/counts),
-    poolDetails (pool line + leaf VDEV table [red rows on errors/non-ONLINE,
-    Enter → vdevModal] + scan:/errors: lines + DATASET table). VDEV topology
-    is NOT reconstructed in details; `zpool status` in pool modal is the
-    human topology view. Disk rows open disk modals with lsblk props and
-    `smartctl -a` verbatim. Details tables use measured column widths; avoid
-    fixed `%6s`-style columns that break on values like `1022.5G`.
+    border fill, including its padding spaces; window/dialog titles use the
+    same filled title treatment (window titles live in the box border, and are
+    host-qualified: `disk h:/dev/sda`, `vdev h:pool/x`, `snapshot h:ds@s`,
+    `job h:id`). host header spans append the total pool size ("38T") when wide
+    enough (utilisation now lives in the fill-bar row, not the header).
+  - **unified object views (view.go) — THE refactor**: ONE builder per object
+    type (groupView/datasetView/hostView/poolView/snapshotView/diskView/
+    vdevView/jobView, + cellView for multi-replica cells, + textView for plain
+    dry-run/failure text) returns `(segs []string, lines []viewLine)`. Each
+    builder takes `full bool` and renders TWO ways from the same code:
+    * compact (Details pane, full=false): no section headers, no property
+      dumps / verbatim zpool-status / SMART; flush tables (cyan column header,
+      NO bullets/indent — user wants it dense and flush) with the scan/errors
+      and selectable ssh lines drilling UP into the full window.
+    * full (interactive window, full=true): cyan centered `── title ──` section
+      headers, complete `get all` property maps (propsDump, sources) + verbatim
+      text (appendVerbatim) — the old text-modal look, now with a row cursor.
+      Table data rows are white; headers cyan. withSectionGaps guarantees a
+      blank line above every section header. propsDump drops the SOURCE column
+      when the map has no sources (lsblk). stripCtrl scrubs CR/ESC/control
+      bytes from job-log & verbatim lines (a bare \r is zero-width to lipgloss
+      but resets the terminal cursor → border lands mid-line) — but NOT from
+      propsDump (it embeds intentional cyan ANSI).
+    Tables come from `vtable(full, title, headers, rows, right, rstyle, open)`;
+    `open(i)` returns the row object's `*objView`. Builders are RE-RUN every
+    render so spinners / progress / ETA stay live in windows, not just the pane
+    (text modals used to be a static snapshot — gone).
+  - **window stack** (`Model.windows []*window`): Enter on a selectable row
+    pushes a sub-window (`pushView`), Esc/q pops (`popWindow`), focus returns to
+    the previous window. updateWindow: ↑↓/jk move the row cursor (or scroll when
+    no selectable rows), Enter drills / closes, ←→/hl pan, PgUp/Dn page, g/G
+    ends, Esc pops. scrollMove (shared with the pane) is the load-bearing
+    nav helper: it free-scrolls past the last parkable row to reveal trailing
+    content (props), AND pulls an off-screen cursor onto a visible selectable
+    row so PgUp/Dn never strands the cursor on a prior page. windowView renders the top window as a dialogBox overlaid
+    via overlayCenter. Enter in the MAIN table pushes directly: dataset cell →
+    datasetView, host header → hostView, pool header → poolView; group rows /
+    multi-replica cells drill into the Details pane (Tab focus). details.go is
+    now just pane glue: currentView (selection→objView), detailsContent (compact
+    build), detMove/detSnap/detOpen (push window), detailsBody (8-line render +
+    white-bg row cursor). moveSelectable is shared by pane and window.
+    Per-object content (chips → segs, body → tables/kv): dataset (mountpoint /
+    used / @latest (refer) / +written / encryption; clone/resume notes; JOBS +
+    SNAPSHOT tables; full adds kv [mountpoint/space/created/encryption-with-
+    `root:` encryptionroot; NO host/type rows — host is in the title] + zfs
+    props; `hz` shows explicit "0" not blank in kv space line), group/cell
+    (REPLICAS table), host (ssh + DISK table compact; full adds `space:` total/
+    free/%used + `uptime:` booted-ts [from HostInfo.BootTime] + vdevs/pools/
+    datasets tables + counts, NO verbatims), pool (scan/errors lines + leaf
+    VDEV + DATASET compact; full adds health/space kv + zpool status verbatim
+    + props), snapshot (kv + props), disk (top: size + smart only; full adds
+    lsblk props then `smartctl -a` verbatim LAST), vdev/job (kv + props/script
+    + job log). VDEV topology is NOT reconstructed; `zpool status` verbatim is
+    the topology view. Tables use measured column widths; avoid fixed
+    `%6s`-style columns (break on "1022.5G").
   - `s` snapshot dialog, `y` sync dialog: centered dialogBox (title in the
     border) composited OVER the table via overlayCenter (ANSI-aware
     splicing). Forms: bubbles textinput + checkbox() + button(), Tab/↑↓
     focus cycle, Space toggles, Enter = default action, NO separate confirm
     screen — the form previews the exact command live; in -dry-run buttons
-    say "(dry run)" and a textModal shows command/job dir/job.sh instead.
+    say "(dry run)" and a textView window shows command/job dir/job.sh instead.
     Sync dialog: members pre-checked iff they need syncing, disabled rows
     show reasons, free-form "new dest" editbox (host:pool/dataset, comma-
     separated → full send, must not exist); editbox focus passes ALL keys to
     textinput. Submit launches one job per dest, polls ~12s, leaves long
     transfers detached.
-  - textModal: generic scrollable text box (↑↓/jk, ←→/hl horizontal pan,
-    PgUp/PgDn, g/G) used for dry-run details and failure logs (always shows
-    the failing command + log tail).
   - live progress: ensureTicker starts a 150ms tick while runningJobHosts()
     is non-empty; every 20th tick re-polls jobsProbe per host (jobsPollMsg)
     updating Jobs/JobsByReplica in place; running→done/failed transitions

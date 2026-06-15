@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -187,29 +188,27 @@ func TestDiscoverCommandSudo(t *testing.T) {
 	}
 }
 
-const jobsOut = `==J== /tmp/zfstui-job-aa11Qx
-running 4242 2026-06-11T10:00:01Z
-==M==
-{
-  "id": "aa11Qx",
-  "kind": "sync",
-  "src": "ws:tank/srv/git",
-  "dest": "cml:root/bak/git"
+// jobLine builds one jobsProbe output line: dir + base64 key=value tokens.
+func jobLine(dir, status, meta, progress, expected, log string) string {
+	e := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	return dir + " status=" + e(status) + " meta=" + e(meta) +
+		" progress=" + e(progress) + " expected=" + e(expected) + " log=" + e(log)
 }
-==P==
-123456789
-==E==
-1000000000
-==J== /tmp/zfstui-job-bb22Zy
-done 2026-06-10T09:05:00Z
-==M==
-{"id": "bb22Zy", "kind": "snapshot", "dataset": "tank/srv/git", "snapshot": "x"}
-==P==
-==E==
-`
 
 func TestParseJobs(t *testing.T) {
-	jobs := ParseJobs("ws", jobsOut)
+	// The log deliberately contains a tab and a fake "==J==" marker line to
+	// prove base64 framing can't be aliased by arbitrary content.
+	out := jobLine("/tmp/zfstui-job-aa11Qx",
+		"running 4242 2026-06-11T10:00:01Z",
+		`{"id":"aa11Qx","kind":"sync","src":"ws:tank/srv/git","dest":"cml:root/bak/git"}`,
+		"123456789", "1000000000",
+		"sending tank/srv/git@20260611\n==J== not a real marker\tnor\tthese tabs") + "\n" +
+		jobLine("/tmp/zfstui-job-bb22Zy",
+			"done 2026-06-10T09:05:00Z",
+			`{"id":"bb22Zy","kind":"snapshot","dataset":"tank/srv/git","snapshot":"x"}`,
+			"", "", "") + "\n"
+
+	jobs := ParseJobs("ws", out)
 	if len(jobs) != 2 {
 		t.Fatalf("got %d jobs", len(jobs))
 	}
@@ -219,7 +218,10 @@ func TestParseJobs(t *testing.T) {
 		j.Meta["dest"] != "cml:root/bak/git" {
 		t.Errorf("job0: %+v", j)
 	}
-	if jobs[1].State != "done" || jobs[1].Kind != "snapshot" || jobs[1].Progress != 0 {
+	if j.Log != "sending tank/srv/git@20260611\n==J== not a real marker\tnor\tthese tabs" {
+		t.Errorf("job0 log: %q", j.Log)
+	}
+	if jobs[1].State != "done" || jobs[1].Kind != "snapshot" || jobs[1].Progress != 0 || jobs[1].Log != "" {
 		t.Errorf("job1: %+v", jobs[1])
 	}
 }
@@ -228,8 +230,12 @@ func TestParseJobsEmptyAndGarbage(t *testing.T) {
 	if jobs := ParseJobs("ws", ""); len(jobs) != 0 {
 		t.Errorf("empty: %v", jobs)
 	}
-	// A half-written dir (no meta yet) still yields an entry.
-	jobs := ParseJobs("ws", "==J== /tmp/zfstui-job-x\n==M==\n==P==\n==E==\n")
+	// Shell noise / blank lines without the dir prefix are ignored.
+	if jobs := ParseJobs("ws", "bash: base64: not found\n\n"); len(jobs) != 0 {
+		t.Errorf("garbage: %v", jobs)
+	}
+	// A half-written dir (empty fields) still yields an entry, state unknown.
+	jobs := ParseJobs("ws", jobLine("/tmp/zfstui-job-x", "", "", "", "", "")+"\n")
 	if len(jobs) != 1 || jobs[0].State != "unknown" {
 		t.Errorf("partial: %+v", jobs)
 	}

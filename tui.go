@@ -23,7 +23,7 @@ var (
 	styleNewSnaps   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))   // green: unsynced snapshots
 	styleWritten    = lipgloss.NewStyle().Foreground(lipgloss.Color("226")) // bright yellow: unsnapshotted writes (+)
 	styleDiverged   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))   // red
-	styleCyan     = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))   // cyan
+	styleCyan       = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))   // cyan
 	styleClone      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))   // dim
 	styleDim        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleCursor     = lipgloss.NewStyle().Reverse(true)
@@ -105,63 +105,7 @@ type Model struct {
 	dryRun  bool
 	dialog  *snapDialog // snapshot dialog when non-nil
 	syncDlg *syncDialog // sync dialog when non-nil
-	modal   *textModal  // scrollable centered text modal (dry-run details, job logs)
-}
-
-// textModal is a centered, scrollable read-only text box (vertical and
-// horizontal — job pipelines are wide).
-type textModal struct {
-	title    string
-	lines    []string
-	contentW int // max display width across all lines, computed at creation
-	off      int // vertical scroll
-	xOff     int // horizontal pan (display columns)
-}
-
-// sectionHeader returns a deferred section header line. makeModal resolves
-// these to filled "── title ─────────" strings at the computed content width.
-func sectionHeader(title string) string { return "\x00" + title }
-
-// makeModal creates a textModal and pre-computes contentW from all lines so
-// the box width is stable at creation time and never rescanned per-render.
-// Tabs are expanded (8-col stops) for accurate terminal width measurement.
-// Lines produced by sectionHeader() are rendered last, filled to contentW.
-func makeModal(title string, lines []string) *textModal {
-	expanded := make([]string, len(lines))
-	w := 0
-	for i, ln := range lines {
-		if strings.HasPrefix(ln, "\x00") {
-			expanded[i] = ln // defer section headers to second pass
-			continue
-		}
-		expanded[i] = expandTabs(ln)
-		if x := lipgloss.Width(expanded[i]); x > w {
-			w = x
-		}
-	}
-	// Leave \x00 section-header sentinels unexpanded; modalView renders them
-	// capped to the visible width rather than the raw contentW.
-	return &textModal{title: title, lines: expanded, contentW: w}
-}
-
-// expandTabs replaces tab characters with spaces to the next 8-column stop.
-func expandTabs(s string) string {
-	if !strings.Contains(s, "\t") {
-		return s
-	}
-	var b strings.Builder
-	col := 0
-	for _, r := range s {
-		if r == '\t' {
-			n := 8 - col%8
-			b.WriteString(strings.Repeat(" ", n))
-			col += n
-		} else {
-			b.WriteRune(r)
-			col++
-		}
-	}
-	return b.String()
+	windows []*window   // stack of interactive object windows (Esc pops)
 }
 
 // snapDialog is the state of the snapshot dialog (TUI `s`): a modal form
@@ -493,9 +437,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.onSyncDone(msg)
 
 	case tea.KeyMsg:
-		if m.modal != nil {
-			m.updateModal(msg)
-			return m, nil
+		if len(m.windows) > 0 {
+			return m.updateWindow(msg)
 		}
 		if m.showHelp {
 			m.showHelp = false
@@ -539,16 +482,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.detOpen()
 				return m, nil
 			}
-			// Main table: Enter opens the detail modal for the selection.
+			// Main table: Enter opens the detail window for the selection.
 			switch {
 			case m.curRow == -2 && m.curCol >= 1 && m.curCol <= len(m.cols):
-				m.modal = m.hostModal(m.hostOfCol(m.curCol - 1))
+				m.pushView(m.hostView(m.hostOfCol(m.curCol - 1)))
 			case m.curRow == -1 && m.curCol >= 1 && m.curCol <= len(m.cols):
 				parts := strings.SplitN(m.cols[m.curCol-1], ":", 2)
-				m.modal = m.poolModalFor(parts[0], parts[1])
+				m.pushView(m.poolView(parts[0], parts[1]))
 			default:
 				if _, c := m.selected(); c != nil && len(c.replicas) == 1 {
-					m.modal = m.datasetModal(c.replicas[0].Dataset)
+					m.pushView(m.datasetView(c.replicas[0].Dataset.Host, c.replicas[0].Dataset.Name))
 				} else {
 					// group row / multi-replica cell: drill into Details.
 					m.focus = 1
@@ -663,11 +606,12 @@ const (
 	detailsBodyH = 8 // detail lines visible (scrollable with Tab focus)
 )
 
-// tableBodyH is the table pane height including its two header lines.
+// tableBodyH is the table pane height including its three header lines
+// (host, pool, fill-bar).
 func (m *Model) tableBodyH() int {
 	h := m.height - 1 - detailsBodyH - 1 // details title + footer
-	if h < 4 {
-		h = 4
+	if h < 5 {
+		h = 5
 	}
 	return h
 }
@@ -693,126 +637,58 @@ func (m *Model) View() string {
 	if m.syncDlg != nil {
 		return overlayCenter(b.String(), m.syncDialogView(), m.width, m.height)
 	}
-	if m.modal != nil {
-		return overlayCenter(b.String(), m.modalView(), m.width, m.height)
+	if len(m.windows) > 0 {
+		return overlayCenter(b.String(), m.windowView(), m.width, m.height)
 	}
 	return b.String()
 }
 
-// --- scrollable text modal ---
-
-func (m *Model) modalBodyH() int {
-	h := m.height - 7
-	if h > 23 {
-		h = 23
-	}
-	if h < 4 {
-		h = 4
-	}
-	return h
-}
-
-func (m *Model) updateModal(msg tea.KeyMsg) {
-	mo := m.modal
-	bodyH := m.modalBodyH()
-	maxOff := len(mo.lines) - bodyH
-	if maxOff < 0 {
-		maxOff = 0
-	}
+// updateWindow handles keys for the top interactive object window: a row
+// cursor over selectable lines, Enter to drill into a sub-window (push), Esc
+// to pop, plus vertical scroll and horizontal pan for wide content.
+func (m *Model) updateWindow(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	w := m.topWindow()
 	switch msg.String() {
+	case "esc", "q":
+		m.popWindow()
+		return m, nil
+	case "enter":
+		_, lines := w.content(m)
+		if w.cur >= 0 && w.cur < len(lines) && lines[w.cur].open != nil {
+			m.pushView(lines[w.cur].open())
+		} else {
+			m.popWindow()
+		}
+		return m, nil
 	case "up", "k":
-		mo.off--
+		w.move(m, -1)
 	case "down", "j":
-		mo.off++
-	case "left", "h":
-		mo.xOff -= 10
-	case "right", "l":
-		mo.xOff += 10
+		w.move(m, 1)
 	case "pgup":
-		mo.off -= bodyH
+		w.page(m, -1)
 	case "pgdown", " ":
-		mo.off += bodyH
+		w.page(m, 1)
+	case "left", "h":
+		w.xoff -= 10
+	case "right", "l":
+		w.xoff += 10
 	case "g", "home":
-		mo.off, mo.xOff = 0, 0
+		w.off, w.xoff = 0, 0
+		_, lines := w.content(m)
+		if sel := detSelectable(lines); len(sel) > 0 {
+			w.cur = sel[0]
+		} else {
+			w.cur = 0
+		}
 	case "G", "end":
-		mo.off = maxOff
-	case "esc", "q", "enter":
-		m.modal = nil
-		return
-	}
-	if mo.off > maxOff {
-		mo.off = maxOff
-	}
-	if mo.off < 0 {
-		mo.off = 0
-	}
-	maxLine := 0
-	for _, l := range mo.lines {
-		if w := lipgloss.Width(l); w > maxLine {
-			maxLine = w
+		_, lines := w.content(m)
+		if sel := detSelectable(lines); len(sel) > 0 {
+			w.cur = sel[len(sel)-1]
 		}
+		w.off = len(lines)
+		w.clampOff(len(lines), m.windowBodyH())
 	}
-	if mo.xOff > maxLine-10 {
-		mo.xOff = max(maxLine-10, 0)
-	}
-	if mo.xOff < 0 {
-		mo.xOff = 0
-	}
-}
-
-func (m *Model) modalView() string {
-	mo := m.modal
-	bodyH := m.modalBodyH()
-
-	// contentW was computed from all lines at modal creation time.
-	maxW := mo.contentW
-	cap := m.width * 9 / 10
-	if cap < 20 {
-		cap = 20
-	}
-	if maxW > cap {
-		maxW = cap
-	}
-	if maxW < 20 {
-		maxW = 20
-	}
-
-	var b strings.Builder
-	end := mo.off + bodyH
-	if end > len(mo.lines) {
-		end = len(mo.lines)
-	}
-	for i := mo.off; i < end; i++ {
-		ln := mo.lines[i]
-		if strings.HasPrefix(ln, "\x00") {
-			t := ln[1:]
-			inner := " " + t + " "
-			dashTotal := maxW - len(inner)
-			if dashTotal < 4 {
-				dashTotal = 4
-			}
-			left := dashTotal / 2
-			right := dashTotal - left
-			b.WriteString(pad(styleCyan.Render(strings.Repeat("─", left)+inner+strings.Repeat("─", right)), maxW) + "\n")
-			continue
-		}
-		if mo.xOff > 0 {
-			r := []rune(ln)
-			if mo.xOff < len(r) {
-				ln = "…" + string(r[mo.xOff:])
-			} else {
-				ln = ""
-			}
-		}
-		b.WriteString(pad(ln, maxW) + "\n")
-	}
-	for i := end - mo.off; i < bodyH; i++ {
-		b.WriteString("\n")
-	}
-	// Trim trailing newline: lipgloss Padding(1,2) already adds one blank row
-	// at the bottom; the trailing \n would add a second one.
-	content := strings.TrimRight(b.String(), "\n")
-	return dialogBox(mo.title, content)
+	return m, nil
 }
 
 // overlayCenter splices the box into the middle of base, ANSI-aware, so the
@@ -958,7 +834,7 @@ func (m *Model) visibleCols(nameW int, colWs []int) int {
 
 func (m *Model) scrollToCursor() {
 	// Vertical.
-	tableRows := m.tableBodyH() - 2 // minus the two header lines
+	tableRows := m.tableBodyH() - 3 // minus the three header lines
 	if tableRows < 3 {
 		tableRows = 3
 	}
@@ -1068,22 +944,22 @@ func (m *Model) tableView(h int) string {
 	hostOf := func(col string) string { return strings.SplitN(col, ":", 2)[0] }
 	poolOf := func(col string) string { return strings.SplitN(col, ":", 2)[1] }
 
-	// "83%/1.8T" — no parens, shown only when it fits within the host span.
+	// Total pool size for the host (e.g. "1.8T"); the per-pool fill bars below
+	// the pool headers carry the utilisation now, so no percentage here.
 	hostInfo := func(host string) string {
-		var size, alloc int64
+		var size int64
 		for i := range m.data.States {
 			if m.data.States[i].Host != host {
 				continue
 			}
 			for _, p := range m.data.States[i].Pools {
 				size += p.Size
-				alloc += p.Alloc
 			}
 		}
 		if size == 0 {
 			return ""
 		}
-		return fmt.Sprintf("%d%%/%s", alloc*100/size, humanShort(size))
+		return humanShort(size)
 	}
 
 	// isColHL: the exact pool-header cell the cursor column sits under gets the
@@ -1195,9 +1071,21 @@ func (m *Model) tableView(h int) string {
 	}
 	b.WriteString("\n")
 
+	// ── Pool fill-bar row (visual only, not focusable) ───────────────────────
+	b.WriteString(pad("", nameW))
+	for ci := m.colOff; ci < end; ci++ {
+		writeSep(&b, isNewGroup(ci), false)
+		bar := ""
+		if _, p := m.poolByCol(ci); p != nil && p.Size > 0 {
+			bar = fillBar(p.Alloc*100/p.Size, colWs[ci])
+		}
+		b.WriteString(styleDim.Render(pad(bar, colWs[ci])))
+	}
+	b.WriteString("\n")
+
 	// ── Data rows ────────────────────────────────────────────────────────────
 	rowsShown := 0
-	for ri := m.rowOff; ri < len(m.rows) && rowsShown < h-2; ri++ {
+	for ri := m.rowOff; ri < len(m.rows) && rowsShown < h-3; ri++ {
 		g := m.rows[ri]
 		onRow := ri == m.curRow
 
@@ -1247,12 +1135,26 @@ func (m *Model) tableView(h int) string {
 		b.WriteString("\n")
 		rowsShown++
 	}
-	for ; rowsShown < h-2; rowsShown++ {
+	for ; rowsShown < h-3; rowsShown++ {
 		b.WriteString("\n")
 	}
 	return b.String()
 }
 
+// fillBar renders a pct-full progress bar of w cells: ▰ filled, ▱ empty.
+func fillBar(pct int64, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	filled := int((pct*int64(w) + 50) / 100) // round to nearest cell
+	if filled > w {
+		filled = w
+	}
+	if filled < 0 {
+		filled = 0
+	}
+	return strings.Repeat("▰", filled) + strings.Repeat("▱", w-filled)
+}
 
 func orDash(s string) string {
 	if s == "" {
@@ -1263,7 +1165,7 @@ func orDash(s string) string {
 
 func replicaBrief(r *Replica) string {
 	if r.Latest == nil {
-		return "* no snapshots"
+		return "no snapshots"
 	}
 	s := "@" + r.Latest.Name
 	if r.Latest.Refer > 0 {
@@ -1501,7 +1403,7 @@ func (m *Model) submitDialog() tea.Cmd {
 	}
 	m.dialog = nil
 	if m.dryRun {
-		m.modal = dryRunModal(spec)
+		m.pushView(dryRunView(spec))
 		m.status, m.statusErr = "[dry-run] nothing was executed", false
 		return nil
 	}
@@ -1595,7 +1497,7 @@ func (m *Model) dialogView() string {
 	return dialogBox("Create snapshot", b.String())
 }
 
-func dryRunModal(spec jobSpec) *textModal {
+func dryRunView(spec jobSpec) *objView {
 	lines := []string{
 		"on host " + spec.Host + ", zfstui would launch a detached job:",
 		"",
@@ -1610,7 +1512,7 @@ func dryRunModal(spec jobSpec) *textModal {
 	for _, l := range strings.Split(strings.TrimRight(spec.script(), "\n"), "\n") {
 		lines = append(lines, "  "+l)
 	}
-	return makeModal("DRY RUN — nothing was executed", lines)
+	return textView("DRY RUN — nothing was executed", lines)
 }
 
 // --- snapshot execution ---
@@ -1656,7 +1558,7 @@ func (m *Model) onSnapDone(msg snapDoneMsg) (tea.Model, tea.Cmd) {
 		for _, l := range strings.Split(strings.TrimRight(msg.logTail, "\n"), "\n") {
 			lines = append(lines, "  "+l)
 		}
-		m.modal = makeModal("snapshot job failed", lines)
+		m.pushView(textView("snapshot job failed", lines))
 	default: // still running
 		m.status, m.statusErr = fmt.Sprintf("job %s still running on %s — its result will show on next refresh",
 			msg.spec.ID, msg.host.Name), false
@@ -1897,7 +1799,7 @@ func (m *Model) submitSyncDialog() tea.Cmd {
 			lines = append(lines, "  "+cl)
 		}
 		m.syncDlg = nil
-		m.modal = &textModal{title: "DRY RUN — nothing was executed", lines: lines}
+		m.pushView(textView("DRY RUN — nothing was executed", lines))
 		m.status, m.statusErr = "[dry-run] nothing was executed", false
 		return nil
 	}
@@ -2008,7 +1910,7 @@ func (m *Model) onSyncDone(msg syncDoneMsg) (tea.Model, tea.Cmd) {
 	m.status = "sync: " + strings.Join(parts, ", ")
 	m.statusErr = failed > 0
 	if failed > 0 {
-		m.modal = makeModal("sync job failures", failLines)
+		m.pushView(textView("sync job failures", failLines))
 	}
 	if done > 0 || running > 0 {
 		return m, m.beginRefresh(msg.affected)
@@ -2202,6 +2104,24 @@ func jobStartTime(j *JobInfo) time.Time {
 	return time.Time{}
 }
 
+// fmtUptime formats a long duration as "12d 3h", "3h 40m", or "40m".
+func fmtUptime(d time.Duration) string {
+	if d < time.Minute {
+		return "<1m"
+	}
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	mins := int(d.Minutes()) % 60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%dd %dh", days, hours)
+	case hours > 0:
+		return fmt.Sprintf("%dh %dm", hours, mins)
+	default:
+		return fmt.Sprintf("%dm", mins)
+	}
+}
+
 // fmtDuration formats a duration down to the minute: "3h40m", "10m", "<1m".
 // Seconds are omitted — ETA precision beyond a minute is false precision.
 func fmtDuration(d time.Duration) string {
@@ -2249,4 +2169,3 @@ func jobProgressLine(j *JobInfo) string {
 	}
 	return strings.Join(parts, "  ")
 }
-

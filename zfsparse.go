@@ -6,6 +6,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -173,16 +174,29 @@ const (
 	MarkDatasets  = "===ZFSTUI:datasets==="
 	MarkSnapshots = "===ZFSTUI:snapshots==="
 	MarkJobs      = "===ZFSTUI:jobs==="
-	MarkRC        = "===ZFSTUI:rc=" // followed by "<n>==="
+	MarkHost      = "===ZFSTUI:host===" // host-level scalars (boot time)
+	MarkRC        = "===ZFSTUI:rc="     // followed by "<n>==="
 )
 
-// jobsProbe dumps every /tmp/zfstui-job-* dir: status, meta, last progress
-// line and expected size. Also used standalone for live progress polling.
+// jobsProbe emits ONE line per /tmp/zfstui-job-* dir: the dir path followed by
+// space-separated key=value tokens whose values are base64 (newlines
+// stripped):
+//
+//	<dir> status=<b64> meta=<b64> progress=<b64> expected=<b64> log=<b64>
+//
+// base64 contains no spaces/newlines, so arbitrary log or meta content can
+// never split a token or alias the framing; the key is always present (an
+// empty value is just "log=", unambiguous). The dir is a known-safe path
+// (jobDirPrefix + base62 id) and anchors the line. Also used standalone for
+// live progress polling.
 const jobsProbe = `for d in /tmp/zfstui-job-*; do [ -d "$d" ] || continue; ` +
-	`echo "==J== $d"; head -n1 "$d/status" 2>/dev/null; ` +
-	`echo "==M=="; cat "$d/meta.json" 2>/dev/null; echo; ` +
-	`echo "==P=="; tail -n1 "$d/progress" 2>/dev/null; echo; ` +
-	`echo "==E=="; head -n1 "$d/expected" 2>/dev/null; echo; done; true`
+	`b() { base64 2>/dev/null | tr -d '\n'; }; ` +
+	`printf '%s status=%s meta=%s progress=%s expected=%s log=%s\n' "$d" ` +
+	`"$(head -n1 "$d/status" 2>/dev/null | b)" ` +
+	`"$(cat "$d/meta.json" 2>/dev/null | b)" ` +
+	`"$(tail -n1 "$d/progress" 2>/dev/null | b)" ` +
+	`"$(head -n1 "$d/expected" 2>/dev/null | b)" ` +
+	`"$(tail -n 200 "$d/log" 2>/dev/null | b)"; done; true`
 
 // DiscoverCommand returns the shell command run on each host during refresh.
 // Each section echoes its marker, runs one command, and records its exit code
@@ -213,6 +227,9 @@ func DiscoverCommand(sudo bool) string {
 		section(MarkSnapshots, "zfs get -Hp -t snapshot all"),
 		// Jobs need no sudo: dirs are owned by the ssh user that made them.
 		fmt.Sprintf("echo '%s'; %s; echo '%s'$?'==='", MarkJobs, jobsProbe, MarkRC),
+		// Host scalars (boot time from /proc/stat btime); no sudo, never fatal.
+		fmt.Sprintf("echo '%s'; %s; echo '%s'$?'==='", MarkHost,
+			`awk '/^btime/{print $2}' /proc/stat 2>/dev/null; true`, MarkRC),
 	}, "; ")
 }
 
@@ -225,7 +242,7 @@ func ParseDiscovery(host, out string) (HostState, error) {
 	for _, line := range strings.Split(out, "\n") {
 		trimmed := strings.TrimSpace(line)
 		switch {
-		case trimmed == MarkPools || trimmed == MarkDisks || trimmed == MarkDatasets || trimmed == MarkSnapshots || trimmed == MarkJobs:
+		case trimmed == MarkPools || trimmed == MarkDisks || trimmed == MarkDatasets || trimmed == MarkSnapshots || trimmed == MarkJobs || trimmed == MarkHost:
 			curMark = trimmed
 			cur = &strings.Builder{}
 			sections[curMark] = cur
@@ -256,6 +273,11 @@ func ParseDiscovery(host, out string) (HostState, error) {
 		return st, err
 	}
 	st.Jobs = ParseJobs(host, sections[MarkJobs].String())
+	if sec := sections[MarkHost]; sec != nil { // non-required: tolerate absence
+		if n, e := strconv.ParseInt(strings.TrimSpace(sec.String()), 10, 64); e == nil {
+			st.BootTime = n
+		}
+	}
 	var statusTexts map[string]string
 	st.VDevs, statusTexts, st.Disks = ParseDisks(host, sections[MarkDisks].String())
 	// Attach verbatim `zpool status` to the pool as a synthetic property
@@ -635,66 +657,57 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// ParseJobs parses jobsProbe output. Malformed entries are skipped — job
-// dirs may be mid-write or owned by another user.
+// ParseJobs parses jobsProbe output: one line per job dir, anchored by the
+// dir path and followed by base64-valued key=value tokens (see jobsProbe).
+// Lines without the dir prefix (shell noise, blanks) are skipped.
 func ParseJobs(host, out string) []JobInfo {
-	var jobs []JobInfo
-	var cur *JobInfo
-	mode := ""
-	var metaBuf strings.Builder
-	flush := func() {
-		if cur == nil {
-			return
+	b64 := func(s string) string {
+		d, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return ""
 		}
-		cur.Meta = map[string]string{}
-		_ = json.Unmarshal([]byte(metaBuf.String()), &cur.Meta)
-		if k := cur.Meta["kind"]; k != "" {
-			cur.Kind = k
-		}
-		if cur.State == "" {
-			cur.State = "unknown"
-		}
-		jobs = append(jobs, *cur)
-		cur = nil
-		metaBuf.Reset()
+		return string(d)
 	}
+	var jobs []JobInfo
 	for _, line := range strings.Split(out, "\n") {
-		switch {
-		case strings.HasPrefix(line, "==J== "):
-			flush()
-			dir := strings.TrimSpace(strings.TrimPrefix(line, "==J== "))
-			cur = &JobInfo{Host: host, Dir: dir, ID: strings.TrimPrefix(dir, jobDirPrefix)}
-			mode = "status"
-		case line == "==M==":
-			mode = "meta"
-		case line == "==P==":
-			mode = "progress"
-		case line == "==E==":
-			mode = "expected"
-		case cur == nil:
-			// ignore noise outside entries
-		default:
-			switch mode {
+		if !strings.HasPrefix(line, jobDirPrefix) {
+			continue
+		}
+		fields := strings.Fields(line)
+		dir := fields[0]
+		j := JobInfo{Host: host, Dir: dir, ID: strings.TrimPrefix(dir, jobDirPrefix), Meta: map[string]string{}}
+		for _, tok := range fields[1:] {
+			key, val, ok := strings.Cut(tok, "=")
+			if !ok {
+				continue
+			}
+			v := b64(val)
+			switch key {
 			case "status":
-				if cur.Status == "" && strings.TrimSpace(line) != "" {
-					cur.Status = strings.TrimSpace(line)
-					cur.State, _, _ = strings.Cut(cur.Status, " ")
-				}
+				j.Status = strings.TrimSpace(v)
+				j.State, _, _ = strings.Cut(j.Status, " ")
 			case "meta":
-				metaBuf.WriteString(line)
-				metaBuf.WriteString("\n")
+				_ = json.Unmarshal([]byte(v), &j.Meta)
+				if k := j.Meta["kind"]; k != "" {
+					j.Kind = k
+				}
 			case "progress":
-				if v, err := strconv.ParseInt(strings.TrimSpace(line), 10, 64); err == nil {
-					cur.Progress = v
+				if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+					j.Progress = n
 				}
 			case "expected":
-				if v, err := strconv.ParseInt(strings.TrimSpace(line), 10, 64); err == nil {
-					cur.Expected = v
+				if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+					j.Expected = n
 				}
+			case "log":
+				j.Log = strings.TrimRight(v, "\n")
 			}
 		}
+		if j.State == "" {
+			j.State = "unknown"
+		}
+		jobs = append(jobs, j)
 	}
-	flush()
 	return jobs
 }
 
