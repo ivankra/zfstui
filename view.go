@@ -17,6 +17,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,16 +55,13 @@ func vrow(text string, style lipgloss.Style, open func() *objView) viewLine {
 	return viewLine{text: text, style: style, open: open}
 }
 
-// toViews converts []string (with sectionHeader sentinels) into viewLines —
-// the bridge for propsDump / appendVerbatim, which emit strings.
+// toViews wraps the []string emitted by propsDump / appendVerbatim into plain
+// viewLines (tabs expanded; any embedded ANSI, e.g. the cyan header/label, is
+// preserved by the no-op styleNormal).
 func toViews(ss []string) []viewLine {
 	out := make([]viewLine, 0, len(ss))
 	for _, s := range ss {
-		if t, ok := strings.CutPrefix(s, "\x00"); ok {
-			out = append(out, vsection(t))
-		} else {
-			out = append(out, vline(expandTabs(s), styleNormal))
-		}
+		out = append(out, vline(expandTabs(s), styleNormal))
 	}
 	return out
 }
@@ -86,20 +84,6 @@ func firstSelectable(lines []viewLine) int {
 		}
 	}
 	return 0
-}
-
-// withSectionGaps guarantees a blank line above every section header (unless
-// it is the first line or already preceded by a blank). propsDump /
-// appendVerbatim already include their own leading blank; vtable / vjobs don't.
-func withSectionGaps(lines []viewLine) []viewLine {
-	out := make([]viewLine, 0, len(lines)+4)
-	for _, l := range lines {
-		if l.section && len(out) > 0 && out[len(out)-1].text != "" {
-			out = append(out, vline("", styleNormal))
-		}
-		out = append(out, l)
-	}
-	return out
 }
 
 // selInView returns the first (dir>=0) or last (dir<0) selectable row inside
@@ -209,12 +193,12 @@ func tableLine(prefix string, ws []int, cells []string, right map[int]bool) stri
 	return b.String()
 }
 
-// vtable emits a table as viewLines. No bullets, no indent in either mode:
-// the cyan column-header row and data rows are flush. The full window adds a
-// centered section title above; the compact pane omits it.
-// rstyle (may be nil) styles each data row; open (may be nil) makes rows
-// selectable, drilling into open(i).
-func vtable(full bool, title string, headers []string, rows [][]string, right map[int]bool,
+// vtable emits a table as viewLines: a cyan column-header row then data rows,
+// flush (no bullets/indent). The column header labels the table, so there's no
+// separate centered title; the full window just prepends a blank separator so
+// consecutive tables read as distinct blocks. rstyle (may be nil) styles each
+// data row; open (may be nil) makes rows selectable, drilling into open(i).
+func vtable(full bool, headers []string, rows [][]string, right map[int]bool,
 	rstyle func(i int) lipgloss.Style, open func(i int) *objView) []viewLine {
 	if len(rows) == 0 {
 		return nil
@@ -222,7 +206,7 @@ func vtable(full bool, title string, headers []string, rows [][]string, right ma
 	ws := colWidths(headers, rows)
 	var out []viewLine
 	if full {
-		out = append(out, vsection(title))
+		out = append(out, vline("", styleNormal)) // separator above the block
 	}
 	out = append(out, vline(tableLine("", ws, headers, right), styleCyan))
 	for i, row := range rows {
@@ -308,7 +292,13 @@ func (m *Model) groupView(g *Group) *objView {
 		if gg == nil {
 			gg = g
 		}
-		return []string{"group " + name}, m.replicaTable(gg.Members, full)
+		// The REPLICAS table is the window's only/first block; drop the leading
+		// blank vtable self-spaces with so the window opens straight into it.
+		lines := m.replicaTable(gg.Members, full)
+		if len(lines) > 0 && lines[0].text == "" {
+			lines = lines[1:]
+		}
+		return []string{"group " + name}, lines
 	}}
 }
 
@@ -324,15 +314,13 @@ func (m *Model) cellView(replicas []*Replica) *objView {
 // replicaTable renders selectable member rows; the LATEST column gains a live
 // spinner + progress while a job touches the replica.
 func (m *Model) replicaTable(members []*Replica, full bool) []viewLine {
-	headers := []string{"REPLICA", "USED", "REFER", "STATUS", "LATEST"}
+	headers := []string{"REPLICA", "STATUS", "USED", "AVAIL", "SNAPSHOTS", "LATEST (REFER)"}
 	var rows [][]string
 	for _, r := range members {
 		name := r.Dataset.Host + ":" + r.Dataset.Name
 		used := orDash(humanShort(r.Dataset.Used))
-		refer := "-"
-		if r.Latest != nil {
-			refer = humanShort(r.Latest.Refer)
-		}
+		avail := orDash(humanShort(r.Dataset.Avail))
+		nsnaps := strconv.Itoa(len(m.data.SnapsByReplica[name]))
 		latest := replicaBrief(r)
 		if j := m.runningJobFor(r); j != nil {
 			verb := "send"
@@ -341,13 +329,13 @@ func (m *Model) replicaTable(members []*Replica, full bool) []viewLine {
 			}
 			latest += "  " + spinnerFrames[m.spin%len(spinnerFrames)] + verb + " " + jobProgressLine(j)
 		}
-		rows = append(rows, []string{name, used, refer, string(r.State), latest})
+		rows = append(rows, []string{name, replicaStatus(r), used, avail, nsnaps, latest})
 	}
 	open := func(i int) *objView {
 		r := members[i]
 		return m.datasetView(r.Dataset.Host, r.Dataset.Name)
 	}
-	return vtable(full, "replicas", headers, rows, map[int]bool{1: true, 2: true}, nil, open)
+	return vtable(full, headers, rows, map[int]bool{2: true, 3: true, 4: true}, nil, open)
 }
 
 // --- dataset view ---
@@ -401,28 +389,31 @@ func (m *Model) datasetContent(d *Dataset, full bool) ([]string, []viewLine) {
 		if d.Mountpoint != "" && d.Mountpoint != "none" && !d.Mounted {
 			mp += " (unmounted)"
 		}
-		kv := func(k, v string) viewLine { return vline(fmt.Sprintf("%-11s%s", k, v), styleNormal) }
+		// Right-aligned labels so colons line up; comma-separated value phrases.
+		kv := func(k, v string) viewLine { return vline(fmt.Sprintf("%10s: %s", k, v), styleNormal) }
 		hz := func(n int64) string { // explicit "0" rather than blank in kv rows
 			if s := humanShort(n); s != "" {
 				return s
 			}
 			return "0"
 		}
-		lines = append(lines,
-			kv("mountpoint", mp),
-			kv("space", fmt.Sprintf("used %s  avail %s  refer %s  written %s",
-				hz(d.Used), hz(d.Avail), hz(d.Refer), hz(d.Written))),
-			kv("created", time.Unix(d.Creation, 0).Format("2006-01-02 15:04:05")),
-		)
+		lines = append(lines, kv("created", snapCreated(d.Creation)))
 		if d.Encrypted() {
-			enc := d.Encryption + "  key: " + d.KeyStatus
+			enc := d.Encryption + ", key: " + d.KeyStatus
 			if root := props(d.Props).str("encryptionroot"); root != "" {
-				enc += "  root: " + root
+				enc += ", root: " + root
 			}
 			lines = append(lines, kv("encryption", enc))
 		}
+		ch := props(d.Props).num("usedbychildren")
+		space := hz(d.OwnUsed()) + " used"
+		if ch > 0 {
+			space += " + " + humanShort(ch) + " children"
+		}
+		space += fmt.Sprintf(", %s avail, %s refer, %s written", hz(d.Avail), hz(d.Refer), hz(d.Written))
+		lines = append(lines, kv("mountpoint", mp), kv("space", space))
 		if d.Origin != "" {
-			lines = append(lines, kv("origin", d.Origin+"  (clone)"))
+			lines = append(lines, kv("origin", d.Origin+" (clone)"))
 		}
 		if d.ResumeToken != "" {
 			lines = append(lines, kv("resume", "interrupted recv, token present"))
@@ -432,7 +423,7 @@ func (m *Model) datasetContent(d *Dataset, full bool) ([]string, []viewLine) {
 			lines = append(lines, vline("clone of "+d.Origin, styleClone))
 		}
 		if d.ResumeToken != "" {
-			lines = append(lines, vline("interrupted recv (resume token present)", styleCyan))
+			lines = append(lines, vline("resume token present", styleCyan))
 		}
 	}
 
@@ -441,19 +432,19 @@ func (m *Model) datasetContent(d *Dataset, full bool) ([]string, []viewLine) {
 	}
 
 	if len(snaps) > 0 {
-		headers := []string{"SNAPSHOT", "USED", "REFER", "GUID"}
+		headers := []string{"SNAPSHOT", "USED", "REFER", "GUID", "CREATED"}
 		var rows [][]string
 		for i := len(snaps) - 1; i >= 0; i-- {
 			s := snaps[i]
-			rows = append(rows, []string{s.Name, orDash(humanShort(s.Used)), humanShort(s.Refer), orDash(s.GUID)})
+			rows = append(rows, []string{s.Name, orDash(humanShort(s.Used)), humanShort(s.Refer), orDash(s.GUID), snapCreated(s.Creation)})
 		}
 		open := func(i int) *objView { return snapshotView(snaps[len(snaps)-1-i]) }
-		lines = append(lines, vtable(full, "snapshots", headers, rows, map[int]bool{1: true, 2: true}, nil, open)...)
+		lines = append(lines, vtable(full, headers, rows, map[int]bool{1: true, 2: true}, nil, open)...)
 	} else if !full {
 		lines = append(lines, vline("no snapshots", styleSection))
 	}
 	if full {
-		lines = append(lines, toViews(propsDump(nil, "zfs properties", d.Props, d.PropSrc))...)
+		lines = append(lines, toViews(propsDump(nil, d.Props, d.PropSrc))...)
 	}
 	return segs, lines
 }
@@ -464,18 +455,27 @@ func snapshotView(s Snapshot) *objView {
 	return &objView{build: func(m *Model, full bool) ([]string, []viewLine) { return snapshotContent(s, full) }}
 }
 
+// utcStamp formats a time as a UTC wall-clock stamp, used for every
+// human-facing timestamp so the displayed time is unambiguous.
+func utcStamp(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05") + " UTC" }
+
+// snapCreated formats a snapshot creation epoch as a UTC wall-clock stamp.
+func snapCreated(epoch int64) string { return utcStamp(time.Unix(epoch, 0)) }
+
 func snapshotContent(s Snapshot, full bool) ([]string, []viewLine) {
 	segs := []string{"snapshot " + s.Host + ":" + s.Dataset + "@" + s.Name}
+	// host/dataset are in the title; guid/space/createtxg are in the props dump.
+	kv := func(k, v string) viewLine { return vline(fmt.Sprintf("%7s: %s", k, v), styleNormal) }
+	space := humanShort(s.Refer) + " refer"
+	if s.Used > 0 {
+		space = humanShort(s.Used) + " used, " + space
+	}
 	lines := []viewLine{
-		vline("host      "+s.Host, styleNormal),
-		vline("dataset   "+s.Dataset, styleNormal),
-		vline("guid      "+orDash(s.GUID)+"   (THE cross-replica identity)", styleNormal),
-		vline("created   "+time.Unix(s.Creation, 0).Format("2006-01-02 15:04:05"), styleNormal),
-		vline(fmt.Sprintf("space     used %s  refer %s", humanShort(s.Used), humanShort(s.Refer)), styleNormal),
-		vline(fmt.Sprintf("createtxg %d   (pool-local)", s.CreateTXG), styleNormal),
+		kv("created", snapCreated(s.Creation)),
+		kv("space", space),
 	}
 	if full {
-		lines = append(lines, toViews(propsDump(nil, "zfs properties", s.Props, s.PropSrc))...)
+		lines = append(lines, toViews(propsDump(nil, s.Props, s.PropSrc))...)
 	}
 	return segs, lines
 }
@@ -498,7 +498,7 @@ func (m *Model) hostContent(host string, full bool) ([]string, []viewLine) {
 		}
 	}
 	if size > 0 {
-		segs = append(segs, fmt.Sprintf("%s, %d%% used, %s free", humanShort(size), alloc*100/size, humanShort(free)))
+		segs = append(segs, spaceSummary(size, alloc, free))
 	}
 
 	var h Host
@@ -511,25 +511,25 @@ func (m *Model) hostContent(host string, full bool) ([]string, []viewLine) {
 
 	var lines []viewLine
 	if full {
+		kv := func(k, v string) viewLine { return vline(fmt.Sprintf("%9s: %s", k, v), styleNormal) }
 		if found {
-			ssh := "ssh: " + h.URL()
+			ssh := h.URL()
 			if h.NeedSudo() {
 				ssh += " (sudo)"
 			}
 			if h.SendUser != "" {
-				ssh += "  send_user=" + h.SendUser
+				ssh += ", send_user=" + h.SendUser
 			}
 			if h.RecvUser != "" {
-				ssh += "  recv_user=" + h.RecvUser
+				ssh += ", recv_user=" + h.RecvUser
 			}
 			if h.Pool != "" {
-				ssh += "  pool=" + h.Pool + " (not enforced yet)"
+				ssh += ", pool=" + h.Pool + " (not enforced yet)"
 			}
-			lines = append(lines, vline(ssh, styleNormal))
+			lines = append(lines, kv("ssh", ssh))
 		}
 		if size > 0 {
-			lines = append(lines, vline(fmt.Sprintf("space: %s total, %s free (%d%% used)",
-				humanShort(size), humanShort(free), alloc*100/size), styleNormal))
+			lines = append(lines, kv("space", spaceSummary(size, alloc, free)))
 		}
 		for _, hi := range m.data.Hosts {
 			if hi.Name != host {
@@ -537,14 +537,15 @@ func (m *Model) hostContent(host string, full bool) ([]string, []viewLine) {
 			}
 			if hi.BootTime > 0 {
 				bt := time.Unix(hi.BootTime, 0)
-				lines = append(lines, vline(fmt.Sprintf("uptime: %s (booted %s)",
-					fmtUptime(time.Since(bt)), bt.Format("2006-01-02 15:04")), styleNormal))
+				lines = append(lines, kv("uptime", fmt.Sprintf("%s (booted %s)",
+					fmtUptime(time.Since(bt)), utcStamp(bt))))
 			}
-			when := hi.LastRefresh.Format("2006-01-02 15:04:05")
-			info := "refreshed: " + when
+			when := utcStamp(hi.LastRefresh)
 			if !hi.Reachable {
-				info = "UNREACHABLE at last refresh (" + when + "): " + hi.LastError
+				lines = append(lines, vline(fmt.Sprintf("%9s: UNREACHABLE at last refresh (%s): %s", "refreshed", when, hi.LastError), styleErr))
+				continue
 			}
+			info := when
 			if hs != nil {
 				running := 0
 				for _, j := range hs.Jobs {
@@ -555,13 +556,21 @@ func (m *Model) hostContent(host string, full bool) ([]string, []viewLine) {
 				info += fmt.Sprintf(", %d datasets, %d snapshots, %d/%d jobs running",
 					len(hs.Datasets), len(hs.Snapshots), running, len(hs.Jobs))
 			}
-			lines = append(lines, vline(info, styleNormal))
+			lines = append(lines, kv("refreshed", info))
 		}
 		if hs != nil {
+			lines = append(lines, m.poolTable(hs.Pools, full)...)
 			lines = append(lines, m.diskTable(hs.Disks, full)...)
 			lines = append(lines, m.vdevTable(host, leafVDevs(hs.VDevs), true, full)...)
-			lines = append(lines, m.poolTable(hs.Pools, full)...)
 			lines = append(lines, m.datasetTable(host, hs.Datasets, full)...)
+			if len(hs.Jobs) > 0 {
+				// Sorted newest-first (meta "created", ID as tiebreak).
+				jobs := append([]JobInfo(nil), hs.Jobs...)
+				sort.SliceStable(jobs, func(i, j int) bool {
+					return jobs[i].Meta["created"]+jobs[i].ID > jobs[j].Meta["created"]+jobs[j].ID
+				})
+				lines = append(lines, m.vjobs(jobs, 25, full)...)
+			}
 		}
 	} else {
 		access := ""
@@ -576,7 +585,7 @@ func (m *Model) hostContent(host string, full bool) ([]string, []viewLine) {
 			if hi.Name != host {
 				continue
 			}
-			when := hi.LastRefresh.Format("2006-01-02 15:04:05")
+			when := utcStamp(hi.LastRefresh)
 			if hi.Reachable {
 				lines = append(lines, vrow("ssh: "+access+", refreshed "+when, styleSection, open))
 			} else {
@@ -584,6 +593,7 @@ func (m *Model) hostContent(host string, full bool) ([]string, []viewLine) {
 			}
 		}
 		if hs != nil {
+			lines = append(lines, m.poolTable(hs.Pools, full)...)
 			lines = append(lines, m.diskTable(hs.Disks, full)...)
 		}
 	}
@@ -603,7 +613,7 @@ func (m *Model) poolContent(host, pool string, full bool) ([]string, []viewLine)
 		return segs, []viewLine{vline("not in cache", styleNormal)}
 	}
 	if p.Size > 0 {
-		segs = append(segs, fmt.Sprintf("%s, %d%% used, %s free", humanShort(p.Size), p.Alloc*100/p.Size, humanShort(p.Free)))
+		segs = append(segs, spaceSummary(p.Size, p.Alloc, p.Free))
 	}
 	var dss []Dataset
 	if hs := m.findHostState(host); hs != nil {
@@ -614,43 +624,127 @@ func (m *Model) poolContent(host, pool string, full bool) ([]string, []viewLine)
 		}
 	}
 
+	status := p.Props["_zpool-status"]
 	var lines []viewLine
 	if full {
-		lines = append(lines,
-			vline("health    "+p.Health, styleNormal),
-			vline(fmt.Sprintf("space     size %s  alloc %s (%d%%)  free %s",
-				humanShort(p.Size), humanShort(p.Alloc), p.Cap, humanShort(p.Free)), styleNormal),
-			vline(fmt.Sprintf("frag      %d%%   dedup %s", p.Frag, p.Dedup), styleNormal),
-		)
-	} else {
-		// scrub/errors summary (full text lives in the verbatim status below);
-		// the errors bullet only appears when there ARE errors.
-		open := func() *objView { return m.poolView(host, pool) }
-		for _, ln := range strings.Split(p.Props["_zpool-status"], "\n") {
-			t := strings.TrimSpace(ln)
-			if s, ok := strings.CutPrefix(t, "scan:"); ok {
-				st := styleSection
-				scan := strings.TrimSpace(s)
-				if strings.Contains(scan, "error") && !strings.Contains(scan, "with 0 errors") {
-					st = styleErr
-				}
-				lines = append(lines, vrow(scan, st, open))
+		if status != "" {
+			// Top section IS the verbatim zpool status: vdev lines are focusable
+			// (Enter → vdev window), scan/errors redden on trouble, and a space
+			// summary is appended — so there's no separate VDEV table.
+			lines = append(lines, m.zpoolStatusLines(host, pool, p)...)
+		} else {
+			lines = append(lines, vline("health    "+p.Health, styleNormal))
+			if scan := scanSummary(p); scan != "" {
+				lines = append(lines, vline("scan      "+scan, scanStyle(scan)))
 			}
-			if s, ok := strings.CutPrefix(t, "errors:"); ok {
-				if e := strings.TrimSpace(s); e != "No known data errors" {
-					lines = append(lines, vrow("errors: "+e, styleErr, open))
-				}
+			lines = append(lines, vline(fmt.Sprintf("space     %s, %d%% frag, %s dedup",
+				spaceSummary(p.Size, p.Alloc, p.Free), p.Frag, p.Dedup), styleNormal))
+			lines = append(lines, m.vdevTable(host, m.vdevsFor(host, pool), false, full)...)
+		}
+		lines = append(lines, m.datasetTable(host, dss, full)...)
+		lines = append(lines, toViews(propsDump(nil, p.Props, p.PropSrc))...)
+		return segs, lines
+	}
+	// Compact pane: scan/errors bullets (drill into the pool window) + tables.
+	open := func() *objView { return m.poolView(host, pool) }
+	for _, ln := range strings.Split(status, "\n") {
+		t := strings.TrimSpace(ln)
+		if s, ok := strings.CutPrefix(t, "scan:"); ok {
+			scan := strings.TrimSpace(s)
+			st := styleSection
+			if scanHasErrors(scan) {
+				st = styleErr
+			}
+			lines = append(lines, vrow(scan, st, open))
+		}
+		if s, ok := strings.CutPrefix(t, "errors:"); ok {
+			if e := strings.TrimSpace(s); e != "No known data errors" {
+				lines = append(lines, vrow("errors: "+e, styleErr, open))
 			}
 		}
 	}
-	// Leaf vdevs only. Full topology is the verbatim zpool status (full mode).
 	lines = append(lines, m.vdevTable(host, m.vdevsFor(host, pool), false, full)...)
 	lines = append(lines, m.datasetTable(host, dss, full)...)
-	if full {
-		lines = append(lines, toViews(appendVerbatim(nil, "zpool status", p.Props["_zpool-status"]))...)
-		lines = append(lines, toViews(propsDump(nil, "zpool properties", p.Props, p.PropSrc))...)
-	}
 	return segs, lines
+}
+
+// scanHasErrors reports whether a scan: summary mentions errors.
+func scanHasErrors(scan string) bool {
+	return strings.Contains(scan, "error") && !strings.Contains(scan, "with 0 errors")
+}
+
+func scanStyle(scan string) lipgloss.Style {
+	if scanHasErrors(scan) {
+		return styleErr
+	}
+	return styleNormal
+}
+
+// zpoolStatusLines renders the verbatim `zpool status` as the pool window's top
+// section: a cyan "zpool status" label, the text with vdev lines turned into
+// focusable rows (Enter → vdev window, reddened on errors), the scan/errors
+// lines reddened on trouble, and a trailing space/frag/dedup summary.
+func (m *Model) zpoolStatusLines(host, pool string, p *Pool) []viewLine {
+	byName := map[string]VDev{}
+	if hs := m.findHostState(host); hs != nil {
+		for _, v := range hs.VDevs {
+			if v.Pool == pool {
+				byName[v.Name] = v
+			}
+		}
+	}
+	// No label, no leading blank: the window opens straight into the zpool
+	// status text (the box padding already provides top spacing).
+	var out []viewLine
+	for _, raw := range strings.Split(strings.TrimRight(p.Props["_zpool-status"], "\n"), "\n") {
+		text := expandTabs(stripCtrl(raw))
+		trimmed := strings.TrimSpace(raw)
+		fields := strings.Fields(raw)
+		// A vdev row: the first token names a known vdev → focusable.
+		if len(fields) > 0 {
+			if v, ok := byName[fields[0]]; ok {
+				st := styleNormal
+				if v.State != "ONLINE" || v.RErr > 0 || v.WErr > 0 || v.CErr > 0 {
+					st = styleErr
+				}
+				out = append(out, vrow(text, st, func() *objView { return m.vdevView(host, v) }))
+				continue
+			}
+		}
+		st := styleNormal
+		if strings.HasPrefix(trimmed, "scan:") && scanHasErrors(trimmed) {
+			st = styleErr
+		} else if strings.HasPrefix(trimmed, "errors:") && !strings.Contains(trimmed, "No known data errors") {
+			st = styleErr
+		}
+		out = append(out, vline(text, st))
+	}
+	// Right-align "space" to the same 6-char colon column zpool status uses
+	// ("  pool:", " state:", "  scan:", "errors:").
+	out = append(out, vline(fmt.Sprintf("%6s: %s, %d%% frag, %s dedup",
+		"space", spaceSummary(p.Size, p.Alloc, p.Free), p.Frag, p.Dedup), styleNormal))
+	return out
+}
+
+// spaceSummary formats capacity as "1.9G total, 315M (16%) used, 1.6G free" —
+// shared by the pool/host detail chips and their window space rows.
+func spaceSummary(size, alloc, free int64) string {
+	pct := int64(0)
+	if size > 0 {
+		pct = alloc * 100 / size
+	}
+	return fmt.Sprintf("%s total, %s (%d%%) used, %s free", humanShort(size), humanShort(alloc), pct, humanShort(free))
+}
+
+// scanSummary returns the trimmed `scan:` line from the verbatim zpool status
+// (the scrub/resilver status), or "" if absent.
+func scanSummary(p *Pool) string {
+	for _, ln := range strings.Split(p.Props["_zpool-status"], "\n") {
+		if s, ok := strings.CutPrefix(strings.TrimSpace(ln), "scan:"); ok {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 // --- disk / vdev / job / dataset tables ---
@@ -678,7 +772,7 @@ func (m *Model) diskTable(disks []Disk, full bool) []viewLine {
 		return styleNormal
 	}
 	open := func(i int) *objView { return diskView(ds[i]) }
-	return vtable(full, "disks", headers, rows, map[int]bool{3: true}, rstyle, open)
+	return vtable(full, headers, rows, map[int]bool{3: true}, rstyle, open)
 }
 
 func (m *Model) vdevTable(host string, vdevs []VDev, showPool, full bool) []viewLine {
@@ -703,7 +797,7 @@ func (m *Model) vdevTable(host string, vdevs []VDev, showPool, full bool) []view
 		return styleNormal
 	}
 	open := func(i int) *objView { return m.vdevView(host, vdevs[i]) }
-	return vtable(full, "vdevs", headers, rows, right, rstyle, open)
+	return vtable(full, headers, rows, right, rstyle, open)
 }
 
 func (m *Model) poolTable(pools []Pool, full bool) []viewLine {
@@ -721,7 +815,7 @@ func (m *Model) poolTable(pools []Pool, full bool) []viewLine {
 			fmt.Sprintf("%s (%d%%)", humanShort(p.Alloc), pct), humanShort(p.Free), fmt.Sprintf("%d%%", p.Frag)})
 	}
 	open := func(i int) *objView { return m.poolView(pools[i].Host, pools[i].Name) }
-	return vtable(full, "pools", headers, rows, map[int]bool{2: true, 4: true}, nil, open)
+	return vtable(full, headers, rows, map[int]bool{2: true, 4: true}, nil, open)
 }
 
 func (m *Model) datasetTable(host string, dss []Dataset, full bool) []viewLine {
@@ -734,7 +828,7 @@ func (m *Model) datasetTable(host string, dss []Dataset, full bool) []viewLine {
 		rows = append(rows, []string{d.Name, humanShort(d.Used), humanShort(d.Refer), orDash(d.Mountpoint), m.snapCell(d)})
 	}
 	open := func(i int) *objView { return m.datasetView(dss[i].Host, dss[i].Name) }
-	return vtable(full, "datasets", headers, rows, map[int]bool{1: true, 2: true}, nil, open)
+	return vtable(full, headers, rows, map[int]bool{1: true, 2: true}, nil, open)
 }
 
 // vjobs renders selectable job rows (newest first), live status + progress.
@@ -753,9 +847,6 @@ func (m *Model) vjobs(jobs []JobInfo, limit int, full bool) []viewLine {
 		switch j.Kind {
 		case "sync":
 			desc = j.Meta["src"] + " → " + j.Meta["dest"]
-			if j.Meta["full"] == "true" {
-				desc += " (full)"
-			}
 		case "snapshot":
 			desc = "snapshot " + j.Meta["dataset"] + "@" + j.Meta["snapshot"]
 		}
@@ -785,10 +876,10 @@ func (m *Model) vjobs(jobs []JobInfo, limit int, full bool) []viewLine {
 	}
 	var lines []viewLine
 	if full {
-		lines = append(lines, vsection("jobs"))
-	} else {
-		lines = append(lines, vline("JOBS", styleCyan))
+		lines = append(lines, vline("", styleNormal)) // block separator
 	}
+	// Left-aligned cyan "JOBS" label (job rows have no column header to self-label).
+	lines = append(lines, vline("JOBS", styleCyan))
 	for _, e := range entries {
 		e := e
 		stPad := strings.Repeat(" ", stW-lipgloss.Width(e.status))
@@ -853,13 +944,13 @@ func diskView(d Disk) *objView {
 
 func diskContent(d Disk, full bool) ([]string, []viewLine) {
 	segs := []string{"disk " + d.Host + ":" + d.Dev}
+	// One-liner summary, e.g. "1.8T NVME SSD, SMART: OK".
 	lines := []viewLine{
-		vline("size      "+humanShort(d.Size), styleNormal),
-		vline("smart     "+diskHealth(d), styleNormal),
+		vline(fmt.Sprintf("%s %s, SMART: %s", humanShort(d.Size), strings.ToUpper(diskType(d)), diskHealth(d)), styleNormal),
 	}
 	if full {
 		// model/serial/wwn/dev all live in the lsblk dump; SMART verbatim last.
-		lines = append(lines, toViews(propsDump(nil, "lsblk properties", d.Props, nil))...)
+		lines = append(lines, toViews(propsDump(nil, d.Props, nil))...)
 		lines = append(lines, toViews(appendVerbatim(nil, "smartctl -a", d.Smart))...)
 	}
 	return segs, lines
@@ -870,28 +961,40 @@ func (m *Model) vdevView(host string, v VDev) *objView {
 }
 
 func (m *Model) vdevContent(host string, v VDev, full bool) ([]string, []viewLine) {
-	segs := []string{"vdev " + v.Host + ":" + v.Pool + "/" + v.Name}
+	segs := []string{"vdev " + v.Host + ":" + v.Pool + "/" + v.Name} // host/pool in title
+	kv := func(k, val string) viewLine { return vline(fmt.Sprintf("%6s: %s", k, val), styleNormal) }
 	lines := []viewLine{
-		vline("host      "+v.Host, styleNormal),
-		vline("pool      "+v.Pool, styleNormal),
-		vline("state     "+v.State, styleNormal),
-		vline(fmt.Sprintf("errors    read %d  write %d  cksum %d", v.RErr, v.WErr, v.CErr), styleNormal),
+		kv("state", v.State),
+		kv("errors", fmt.Sprintf("read %d, write %d, cksum %d", v.RErr, v.WErr, v.CErr)),
 	}
 	if disk := m.vdevDiskLabel(host, v); disk != "-" {
-		lines = append(lines, vline("disk      "+disk, styleNormal))
-	}
-	if v.DiskID != "" {
-		lines = append(lines, vline("disk id   "+v.DiskID, styleNormal))
+		lines = append(lines, kv("disk", disk))
 	}
 	if v.Path != "" {
-		lines = append(lines, vline("path      "+v.Path, styleNormal))
+		lines = append(lines, kv("path", v.Path))
 	}
+	var sp []string
 	if v.Size > 0 {
-		lines = append(lines, vline(fmt.Sprintf("space     size %s  alloc %s  free %s  frag %d%%",
-			humanShort(v.Size), humanShort(v.Alloc), humanShort(v.Free), v.Frag), styleNormal))
+		sp = append(sp, humanShort(v.Size)+" total")
+	}
+	if v.Alloc > 0 {
+		used := humanShort(v.Alloc) + " used"
+		if v.Size > 0 {
+			used = fmt.Sprintf("%s (%d%%) used", humanShort(v.Alloc), v.Alloc*100/v.Size)
+		}
+		sp = append(sp, used)
+	}
+	if v.Free > 0 {
+		sp = append(sp, humanShort(v.Free)+" free")
+	}
+	if v.Frag > 0 {
+		sp = append(sp, fmt.Sprintf("%d%% frag", v.Frag))
+	}
+	if len(sp) > 0 {
+		lines = append(lines, kv("space", strings.Join(sp, ", ")))
 	}
 	if full {
-		lines = append(lines, toViews(propsDump(nil, "zpool properties", v.Props, v.PropSrc))...)
+		lines = append(lines, toViews(propsDump(nil, v.Props, v.PropSrc))...)
 	}
 	return segs, lines
 }
@@ -1019,21 +1122,17 @@ func diskHealth(d Disk) string {
 }
 
 func diskType(d Disk) string {
-	media := "ssd"
+	media := "SSD"
 	if d.Rotational {
-		media = "hdd"
+		media = "HDD"
 	}
 	if d.Transport == "" {
 		return media
 	}
-	return d.Transport + " " + media
+	return strings.ToUpper(d.Transport) + " " + media
 }
 
-// --- sentinels / dumps shared with the full-window renderer ---
-
-// sectionHeader returns a deferred section header line; toViews / the window
-// renderer resolve these to centered "── title ─────" strings.
-func sectionHeader(title string) string { return "\x00" + title }
+// --- verbatim / dumps shared with the full-window renderer ---
 
 // stripCtrl removes control bytes that corrupt fixed-width rendering — most
 // notably the carriage returns and ANSI escapes that pv/ssh/zfs progress
@@ -1072,22 +1171,24 @@ func expandTabs(s string) string {
 	return b.String()
 }
 
-// appendVerbatim adds a titled verbatim text block (sectionHeader + lines).
+// appendVerbatim adds a verbatim text block under a left-aligned cyan label
+// (e.g. "zpool status", "smartctl -a") — not a centered section header.
 func appendVerbatim(lines []string, title, text string) []string {
 	if strings.TrimSpace(text) == "" {
 		return lines
 	}
-	lines = append(lines, "", sectionHeader(title))
+	lines = append(lines, "", styleCyan.Render(title))
 	for _, ln := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
 		lines = append(lines, stripCtrl(ln))
 	}
 	return lines
 }
 
-// propsDump appends the full sorted property map. The SOURCE column is shown
-// only when sources exist (zfs/zpool `get`); maps without them (e.g. lsblk)
-// render just PROPERTY/VALUE.
-func propsDump(lines []string, title string, props, srcs map[string]string) []string {
+// propsDump appends the full sorted property map, preceded by a blank line.
+// No centered title — the cyan PROPERTY/VALUE column header labels the block.
+// The SOURCE column is shown only when sources exist (zfs/zpool `get`); maps
+// without them (e.g. lsblk) render just PROPERTY/VALUE.
+func propsDump(lines []string, props, srcs map[string]string) []string {
 	if len(props) == 0 {
 		return append(lines, "", "(no full property map cached — refresh to populate)")
 	}
@@ -1105,7 +1206,7 @@ func propsDump(lines []string, title string, props, srcs map[string]string) []st
 			keyW = len(k)
 		}
 	}
-	lines = append(lines, "", sectionHeader(title))
+	lines = append(lines, "")
 	if !hasSrc {
 		lines = append(lines, styleCyan.Render(fmt.Sprintf("%-*s  %s", keyW, "PROPERTY", "VALUE")))
 		for _, k := range keys {
@@ -1138,8 +1239,9 @@ func (m *Model) topWindow() *window {
 // content builds the window's full lines with section gaps applied. All
 // window navigation/render goes through this so cursor indices stay consistent.
 func (w *window) content(m *Model) ([]string, []viewLine) {
-	segs, lines := w.view.build(m, true)
-	return segs, withSectionGaps(lines)
+	// Each block (table/jobs/verbatim/props) spaces itself with a leading blank
+	// in full mode, so no extra layout pass is needed.
+	return w.view.build(m, true)
 }
 
 func (m *Model) pushView(v *objView) {
@@ -1195,8 +1297,10 @@ func (w *window) page(m *Model, dir int) {
 	bodyH := m.windowBodyH()
 	w.off += dir * bodyH
 	w.clampOff(len(lines), bodyH)
-	// Keep the cursor on a visible selectable so up/down respond immediately.
-	if v := selInView(detSelectable(lines), w.off, bodyH, dir); v >= 0 {
+	// Land on the page's leading selectable in the travel direction: the FIRST
+	// visible row for PgUp, the LAST for PgDown (-dir flips selInView's
+	// single-step convention, which grabs the trailing row instead).
+	if v := selInView(detSelectable(lines), w.off, bodyH, -dir); v >= 0 {
 		w.cur = v
 	}
 }

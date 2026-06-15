@@ -10,10 +10,11 @@ import (
 
 // Marker suffixes:
 //
-//   - unsnapshotted local writes   !  diverged
-//     ~  interrupted recv (resumable) %  clone
+//   - unsnapshotted local writes   !  diverged   %  clone
 //
 // "Ahead" needs no marker: the per-cell @names already show who is newest.
+// Resumable carries no marker either — it's signalled by the cyan cell color
+// in the TUI and surfaced in the dataset detail.
 func CellText(r *Replica) string {
 	var b strings.Builder
 	// Display drops the prefix's trailing slash: "bak@20250409", not
@@ -21,17 +22,15 @@ func CellText(r *Replica) string {
 	b.WriteString(strings.TrimSuffix(r.CellPrefix, "/"))
 	if r.Latest != nil {
 		b.WriteString("@" + r.Latest.Name)
-	} else if r.State != StateClone && r.Dataset.Used > 0 {
-		// Snapshot-less: show used size in parens — Used is the actual
-		// dataset size; Written is just bytes-since-last-snapshot metadata
-		// and is unreliable when no snapshot exists.
-		b.WriteString("(" + humanShort(r.Dataset.Used) + ")")
+	} else if own := r.Dataset.OwnUsed(); r.State != StateClone && own > 0 {
+		// Snapshot-less: show the dataset's OWN used size (excluding children,
+		// which have their own rows) in parens. Written is just
+		// bytes-since-last-snapshot metadata and unreliable with no snapshot.
+		b.WriteString("(" + humanShort(own) + ")")
 	}
 	switch r.State {
 	case StateDiverged:
 		b.WriteString("!")
-	case StateResumable:
-		b.WriteString("~")
 	case StateClone:
 		b.WriteString("%")
 	}

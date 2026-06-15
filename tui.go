@@ -424,7 +424,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("refreshed %d host(s); unreachable: %s", ok, strings.Join(fail, ", "))
 			m.statusErr = true
 		} else {
-			m.status = fmt.Sprintf("refreshed %d host(s) at %s", ok, time.Now().Format("15:04:05"))
+			m.status = fmt.Sprintf("refreshed %d host(s) at %s", ok, time.Now().UTC().Format("15:04:05 UTC"))
 			m.statusErr = false
 		}
 		return m, m.ensureTicker()
@@ -465,6 +465,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.focus == 1 {
 				m.detMove(-1)
+			} else if m.curCol == 0 {
+				// name column has no header rows: stop at the first dataset.
+				if m.curRow > 0 {
+					m.curRow--
+				}
+				m.detOff, m.detCur = 0, 0
 			} else {
 				m.curRow--
 				m.detOff, m.detCur = 0, 0
@@ -489,10 +495,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				parts := strings.SplitN(m.cols[m.curCol-1], ":", 2)
 				m.pushView(m.poolView(parts[0], parts[1]))
 			default:
-				if _, c := m.selected(); c != nil && len(c.replicas) == 1 {
+				g, c := m.selected()
+				switch {
+				case g != nil && m.curCol == 0:
+					// group (name) column: open the group window directly.
+					m.pushView(m.groupView(g))
+				case c != nil && len(c.replicas) == 1:
 					m.pushView(m.datasetView(c.replicas[0].Dataset.Host, c.replicas[0].Dataset.Name))
-				} else {
-					// group row / multi-replica cell: drill into Details.
+				default:
+					// multi-replica cell: drill into Details.
 					m.focus = 1
 					m.detSnap()
 				}
@@ -527,6 +538,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.detSnap()
 			} else {
 				m.curRow -= max(m.tableBodyH()-3, 1)
+				if m.curCol == 0 && m.curRow < 0 {
+					m.curRow = 0 // name column has no header rows
+				}
 				m.detOff, m.detCur = 0, 0
 			}
 		case "pgdown":
@@ -547,8 +561,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.focus == 1 {
 				m.detOff, m.detCur = 0, 0
 				m.detSnap()
+			} else if m.curCol == 0 {
+				m.curRow = 0 // name column: jump to the first dataset
 			} else {
-				m.curRow = 0
+				m.curRow = -1 // data column: jump to the pool header cell
 			}
 		case "G", "end":
 			if m.focus == 1 {
@@ -773,7 +789,7 @@ func (m *Model) colWidths() (nameW, sizeW int, colWs []int) {
 			sizeW = len(s)
 		}
 	}
-	nameW = len("datasets")
+	nameW = 0
 	for _, g := range m.rows {
 		needed := len(g.DisplayName) + 1 + sizeW
 		if needed > nameW {
@@ -898,29 +914,15 @@ func humanShort(n int64) string {
 	return fmt.Sprintf("%.1f%c", v, "KMGTPE"[exp])
 }
 
-// groupRefer returns the largest latest-snapshot Refer across group members.
-func groupRefer(g *Group) int64 {
-	var best int64
-	for _, r := range g.Members {
-		if r.Latest != nil && r.Latest.Refer > best {
-			best = r.Latest.Refer
-		}
-	}
-	return best
-}
-
-// groupSize returns the name-column size for a group: groupRefer (latest
-// snapshot Refer) when snapshots exist; max Dataset.Used otherwise.
-// Written is not used — it's bytes-since-last-snapshot and is meaningless
-// when no snapshot has ever been taken.
+// groupSize returns the name-column size for a group: the dataset's OWN disk
+// usage excluding children (used - usedbychildren), maxed across replicas.
+// Children live in their own group rows, so a parent shouldn't double-count
+// them here.
 func groupSize(g *Group) int64 {
-	if r := groupRefer(g); r > 0 {
-		return r
-	}
 	var best int64
 	for _, m := range g.Members {
-		if m.Dataset.Used > best {
-			best = m.Dataset.Used
+		if own := m.Dataset.OwnUsed(); own > best {
+			best = own
 		}
 	}
 	return best
@@ -961,13 +963,12 @@ func (m *Model) tableView(h int) string {
 		return humanShort(size)
 	}
 
-	// isColHL: the exact pool-header cell the cursor column sits under gets the
-	// active-bg highlight. Only in the pool header row, only on data-row cursors.
-	isColHL := func(ci int) bool {
-		return m.focus == 0 && m.curRow >= 0 && m.curCol > 0 && ci == m.curCol-1
+	// isCurCol: the column the cursor sits under (its pool's fill bar gets the
+	// cyan highlight below). Only when the main pane is focused and the cursor
+	// isn't on the host-header row (no single pool there).
+	isCurCol := func(ci int) bool {
+		return m.focus == 0 && m.curRow != -2 && m.curCol > 0 && ci == m.curCol-1
 	}
-	// isNameHL: same logic for the name column header ("group" / empty row).
-	isNameHL := m.focus == 0 && m.curRow >= 0 && m.curCol == 0
 
 	// isNewGroup: true when column ci starts a new host group (or is first visible).
 	isNewGroup := func(ci int) bool {
@@ -997,12 +998,7 @@ func (m *Model) tableView(h int) string {
 	var b strings.Builder
 
 	// ── Host header row (curRow == -2) ──────────────────────────────────────
-	groupHdr := centerStr("datasets", nameW)
-	if isNameHL {
-		b.WriteString(stylePaneActive.Render(groupHdr))
-	} else {
-		b.WriteString(styleName.Render(groupHdr))
-	}
+	b.WriteString(styleName.Render(pad("", nameW)))
 	for ci := m.colOff; ci < end; {
 		host := hostOf(m.cols[ci])
 		// Compute visible span width (intra-group gaps only, no leading sep).
@@ -1052,12 +1048,12 @@ func (m *Model) tableView(h int) string {
 		switch {
 		case m.curRow == -1 && ci == m.curCol-1:
 			b.WriteString(styleCursor.Render(hdr))
-		case isColHL(ci):
-			b.WriteString(stylePaneActive.Render(hdr))
-		case m.unreach[hostOf(m.cols[ci])]:
-			b.WriteString(styleDim.Render(hdr))
 		case poolProblem(m.poolByCol(ci)):
 			b.WriteString(styleErr.Render(hdr))
+		case isCurCol(ci): // column indicator, matching the cyan fill-bar below
+			b.WriteString(styleCyan.Render(hdr))
+		case m.unreach[hostOf(m.cols[ci])]:
+			b.WriteString(styleDim.Render(hdr))
 		default:
 			b.WriteString(styleName.Render(hdr))
 		}
@@ -1071,6 +1067,7 @@ func (m *Model) tableView(h int) string {
 	b.WriteString("\n")
 
 	// ── Pool fill-bar row (visual only, not focusable) ───────────────────────
+	// The cursor's pool column gets a cyan bar (column indicator); others dim.
 	b.WriteString(pad("", nameW))
 	for ci := m.colOff; ci < end; ci++ {
 		writeSep(&b, isNewGroup(ci), false)
@@ -1078,7 +1075,11 @@ func (m *Model) tableView(h int) string {
 		if _, p := m.poolByCol(ci); p != nil && p.Size > 0 {
 			bar = fillBar(p.Alloc*100/p.Size, colWs[ci])
 		}
-		b.WriteString(styleDim.Render(pad(bar, colWs[ci])))
+		st := styleDim
+		if isCurCol(ci) {
+			st = styleCyan
+		}
+		b.WriteString(st.Render(pad(bar, colWs[ci])))
 	}
 	b.WriteString("\n")
 
@@ -1162,11 +1163,33 @@ func orDash(s string) string {
 	return s
 }
 
+// replicaStatus renders the lineage state with a "+" suffix when the replica
+// has uncommitted writes — dirtiness is orthogonal to snapshot lineage. The
+// derived StateModified IS synced-but-dirty, so it maps back to "synced+".
+// A replica that has never been snapshotted (the group holds no snapshots at
+// all) is "new" rather than synced/synced+ — there's nothing to be in sync
+// with yet.
+func replicaStatus(r *Replica) string {
+	switch r.State {
+	case StateInSync, StateModified:
+		if r.Latest == nil {
+			return "new"
+		}
+	}
+	if r.State == StateModified {
+		return string(StateInSync) + "+"
+	}
+	if r.Written > 0 {
+		return string(r.State) + "+"
+	}
+	return string(r.State)
+}
+
 func replicaBrief(r *Replica) string {
 	if r.Latest == nil {
 		return "no snapshots"
 	}
-	s := "@" + r.Latest.Name
+	s := r.Latest.Name
 	if r.Latest.Refer > 0 {
 		s += " (" + humanShort(r.Latest.Refer) + ")"
 	}
@@ -1322,7 +1345,7 @@ func (m *Model) openSnapshotDialog() {
 	in.CharLimit = 64
 	in.Width = 28
 	in.TextStyle = lipgloss.NewStyle().Underline(true)
-	in.SetValue(time.Now().Format("20060102"))
+	in.SetValue(time.Now().UTC().Format("20060102"))
 	in.CursorEnd()
 	in.Focus()
 	m.dialog = &snapDialog{host: host, dataset: r.Dataset.Name, input: in}

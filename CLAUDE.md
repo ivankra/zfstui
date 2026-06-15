@@ -192,19 +192,28 @@ every emitted shape — extend regexes and constructors together. The global
       dumps / verbatim zpool-status / SMART; flush tables (cyan column header,
       NO bullets/indent — user wants it dense and flush) with the scan/errors
       and selectable ssh lines drilling UP into the full window.
-    * full (interactive window, full=true): cyan centered `── title ──` section
-      headers, complete `get all` property maps (propsDump, sources) + verbatim
-      text (appendVerbatim) — the old text-modal look, now with a row cursor.
-      Table data rows are white; headers cyan. withSectionGaps guarantees a
-      blank line above every section header. propsDump drops the SOURCE column
-      when the map has no sources (lsblk). stripCtrl scrubs CR/ESC/control
-      bytes from job-log & verbatim lines (a bare \r is zero-width to lipgloss
-      but resets the terminal cursor → border lands mid-line) — but NOT from
-      propsDump (it embeds intentional cyan ANSI).
-    Tables come from `vtable(full, title, headers, rows, right, rstyle, open)`;
-    `open(i)` returns the row object's `*objView`. Builders are RE-RUN every
-    render so spinners / progress / ETA stay live in windows, not just the pane
-    (text modals used to be a static snapshot — gone).
+    * full (interactive window, full=true): complete `get all` property maps
+      (propsDump, sources) + verbatim text (appendVerbatim) — the old text-modal
+      look, now with a row cursor. Table data rows white; column headers cyan.
+      Each block SELF-SPACES with a leading blank in full mode (no layout pass).
+      Block labels are LEFT-ALIGNED cyan, not centered: tables use their cyan
+      column header (DISK/VDEV/POOL/DATASET/SNAPSHOT/REPLICA — self-labeling),
+      property dumps use the PROPERTY/VALUE header, `JOBS` and verbatim blocks
+      (`zpool status`, `smartctl -a`, via appendVerbatim) get a plain cyan label
+      line. The ONLY remaining centered `── title ──` (vsection) headers are the
+      job window's `script` / `log` (user asked for those). Top kv
+      blocks are trimmed to essentials (identity is in the window title, the rest
+      is in the props dump): dataset=mountpoint/space/created; snapshot=created;
+      vdev=state/errors/disk/path/space; disk=size/smart; host=ssh/space/uptime/
+      refreshed. propsDump drops
+      the SOURCE column when the map has no sources (lsblk). stripCtrl scrubs
+      CR/ESC/control bytes from job-log & verbatim lines (a bare \r is
+      zero-width to lipgloss but resets the terminal cursor → border lands
+      mid-line) — but NOT from propsDump (it embeds intentional cyan ANSI).
+    Tables come from `vtable(full, headers, rows, right, rstyle, open)` (no
+    title arg); `open(i)` returns the row object's `*objView`. Builders are
+    RE-RUN every render so spinners / progress / ETA stay live in windows, not
+    just the pane (text modals used to be a static snapshot — gone).
   - **window stack** (`Model.windows []*window`): Enter on a selectable row
     pushes a sub-window (`pushView`), Esc/q pops (`popWindow`), focus returns to
     the previous window. updateWindow: ↑↓/jk move the row cursor (or scroll when
@@ -224,15 +233,21 @@ every emitted shape — extend regexes and constructors together. The global
     SNAPSHOT tables; full adds kv [mountpoint/space/created/encryption-with-
     `root:` encryptionroot; NO host/type rows — host is in the title] + zfs
     props; `hz` shows explicit "0" not blank in kv space line), group/cell
-    (REPLICAS table), host (ssh + DISK table compact; full adds `space:` total/
-    free/%used + `uptime:` booted-ts [from HostInfo.BootTime] + vdevs/pools/
-    datasets tables + counts, NO verbatims), pool (scan/errors lines + leaf
-    VDEV + DATASET compact; full adds health/space kv + zpool status verbatim
-    + props), snapshot (kv + props), disk (top: size + smart only; full adds
-    lsblk props then `smartctl -a` verbatim LAST), vdev/job (kv + props/script
-    + job log). VDEV topology is NOT reconstructed; `zpool status` verbatim is
-    the topology view. Tables use measured column widths; avoid fixed
-    `%6s`-style columns (break on "1022.5G").
+    (REPLICAS table), host (chip + `space:` both via spaceSummary "Xtotal,
+    Y(N%)used, Zfree"; compact = ssh + POOLS + DISK tables; full = ssh +
+    space/uptime/counts, then POOLS (first) / DISK / VDEV / DATASET tables + a
+    jobs table LAST, NO verbatims). pool: chip = spaceSummary. **full window's
+    TOP section IS the verbatim `zpool status`** (zpoolStatusLines, no label):
+    its vdev lines (first token matches a Pool's VDev.Name) become FOCUSABLE
+    rows opening the vdev window (reddened on error); the scan:/errors: lines
+    redden on trouble; a `space: …, frag, dedup` line is appended at the end —
+    so there's NO separate VDEV table. Falls back to health/scan/space kv + vdev
+    table only when `_zpool-status` is absent. Then DATASET table + props.
+    Compact pool pane keeps scan/errors bullets + leaf VDEV + DATASET tables.
+    snapshot (created + props), disk (top: size + smart only; full adds lsblk
+    props then `smartctl -a` verbatim LAST), vdev (state/errors/disk/path/space
+    + props), job (kv + script + log). Tables use measured column widths; avoid
+    fixed `%6s`-style columns (break on "1022.5G").
   - `s` snapshot dialog, `y` sync dialog: centered dialogBox (title in the
     border) composited OVER the table via overlayCenter (ANSI-aware
     splicing). Forms: bubbles textinput + checkbox() + button(), Tab/↑↓

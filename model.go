@@ -117,6 +117,13 @@ type Dataset struct {
 	PropSrc     map[string]string // property sources (local/inherited/...)
 }
 
+// OwnUsed is the dataset's own disk usage excluding children
+// (used - usedbychildren). Child datasets occupy their own group rows, so a
+// container dataset shouldn't double-count them in the main table.
+func (d Dataset) OwnUsed() int64 {
+	return d.Used - props(d.Props).num("usedbychildren")
+}
+
 // Pool returns the pool component of the dataset name.
 func (d Dataset) Pool() string {
 	for i := 0; i < len(d.Name); i++ {

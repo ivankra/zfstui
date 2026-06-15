@@ -18,8 +18,9 @@ batch `snap`/`sync` CLI, prune, jobs pane, `doctor`, job-dir cleanup.
   Read-only on the hosts.
 - `zfstui status` prints the groups × host:pool matrix. Replication groups
   and per-replica states (ahead/behind/diverged/resumable/clone) are derived
-  from **snapshot GUIDs**, never names. Cell markers: `!` diverged, `~`
-  resumable, `%` clone; unsnapshotted writes are indicated by color only
+  from **snapshot GUIDs**, never names. Cell markers: `!` diverged,
+  `%` clone (resumable carries no marker — cyan color + detail only);
+  unsnapshotted writes are indicated by color only
   (no `+` suffix — color is enough). Snapshot-less replicas with writes show
   their written size in parens `(123.4G)` instead of a snapshot name. The
   name column shows the latest-snapshot refer size; for hidden snapshot-less
@@ -187,7 +188,7 @@ For each replica in a group, comparing against the group-wide latest snapshot
 | modified  | holds the newest snapshot but `written` > 0 (uncommitted writes)  | `srv/@20260610` yellow |
 | stale     | missing the group's newest snapshot                               | gray, `@<its-latest>` |
 | diverged  | holds snapshots past the common base while another replica does too | red `!` marker |
-| resumable | has a `receive_resume_token` (interrupted recv)                   | cyan `~` marker |
+| resumable | has a `receive_resume_token` (interrupted recv)                   | cyan color (no marker) |
 | clone     | `origin` set (clone of another snapshot)                          | dim `%` marker |
 
 ### Language: Go (bubbletea + pure-Go sqlite)
@@ -435,9 +436,9 @@ Keyboard scheme (mnemonic letters, consistent everywhere):
 - arrows / `jk`: move cursor (NOT vim h/l — `h` is the hidden toggle);
   ↑ past the first row selects a pool, ↑ again a host (←→ jump host-to-host)
 - `Enter`: detail modal for the selection (dataset cell, host or pool
-  header); group rows drill into Details instead. In focused Details, ↑↓
-  move between selectable rows (snapshots/jobs/pools/datasets/replicas),
-  Enter opens that object's modal
+  header, group name column → group modal); multi-replica cells drill into
+  Details instead. In focused Details, ↑↓ move between selectable rows
+  (snapshots/jobs/pools/datasets/replicas), Enter opens that object's modal
 - `r` refresh the selected host, `R` refresh all (async; spinner + live
   progress polling while jobs run)
 - `s` snapshot dialog: name input (default `YYYYMMDD`), recursive checkbox,
@@ -748,8 +749,31 @@ TUI is manual for now.
   stale, white synced. The `dna` fleet example (one live master with +680K
   uncommitted, three backups at the same snapshot) now reads master=modified,
   backups=synced — not "behind".
-- 2026-06-15: **view polish (user-driven tweaks)** — full-window section
-  headers always get a blank line above them (withSectionGaps); table data
+- 2026-06-15: **pool window top = clickable `zpool status`** — the pool
+  window's top section IS the verbatim `zpool status` (no label): vdev lines
+  (first token matches a Pool VDev name) are focusable rows opening the vdev
+  window (reddened on error), scan:/errors: lines redden on trouble, and a
+  `space: <total/used/free>, N% frag, X dedup` line is appended at the end —
+  replacing the separate VDEV table and the health/scan/space kv rows. Falls
+  back to those kv rows + a VDEV table only when `_zpool-status` is absent.
+  pool/host detail chips + window space rows share a `spaceSummary` helper
+  ("1.9G total, 315M (16%) used, 1.6G free").
+- 2026-06-15: **block labels left-aligned cyan, not centered; kv blocks
+  trimmed; host view reshaped** — in full windows labels are LEFT-ALIGNED cyan:
+  tables self-label via their cyan column header (DISK/VDEV/POOL/…), property
+  dumps via PROPERTY/VALUE, `JOBS` and verbatim blocks (`zpool status`,
+  `smartctl -a` via appendVerbatim) get a plain cyan label line. The only
+  remaining centered `── title ──` (vsection) headers are the job window's
+  `script`/`log`. Each block self-spaces with a leading blank
+  (vtable lost its `title` param, propsDump lost its title, the
+  layoutSections/withSectionGaps pass is gone — done explicitly per user, no
+  redundancy-matching heuristic). Top kv blocks trimmed to essentials (identity
+  is in the window title; details are in the props dump): dataset =
+  mountpoint/space/created; snapshot = created; vdev = state/errors/disk/path/
+  space; disk = size/smart. Host view: chip uses the window's
+  `X total, Y free (N% used)` form; pools table moved to the TOP (compact pane:
+  POOLS + DISK; full: pools/disk/vdev/dataset then a jobs table last).
+- 2026-06-15: **view polish (user-driven tweaks)** — table data
   rows render white, headers cyan; the compact pane dropped ALL `*` bullets
   and indentation (flush, dense — user preference); propsDump omits the SOURCE
   column when the map has no sources (lsblk); window titles are host-qualified

@@ -468,11 +468,11 @@ func TestEnterOpensDetailModals(t *testing.T) {
 		t.Errorf("host window content:\n%s", winText(m))
 	}
 	m.Update(key("esc"))
-	// Group row → focus jump (no window).
+	// Group (name) column → group window.
 	m.curRow, m.curCol = 0, 0
 	m.Update(key("enter"))
-	if winOpen(m) || m.focus != 1 {
-		t.Fatalf("group row should jump to details: window=%v focus=%d", winOpen(m), m.focus)
+	if !winOpen(m) || m.focus != 0 {
+		t.Fatalf("group column should open a window: window=%v focus=%d", winOpen(m), m.focus)
 	}
 }
 
@@ -531,7 +531,7 @@ func TestDiskDataFlow(t *testing.T) {
 	m.clampCursor()
 	m.Update(key("enter"))
 	content := winText(m)
-	for _, want := range []string{"ssh: root@sta", "jobs running", "/dev/sda", "E4GG2JNX", "sata hdd"} {
+	for _, want := range []string{"ssh: root@sta", "jobs running", "/dev/sda", "E4GG2JNX", "SATA HDD"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("host window missing %q:\n%s", want, content)
 		}
@@ -633,13 +633,14 @@ func TestTitleFillStyles(t *testing.T) {
 }
 
 func TestPropsDumpLayout(t *testing.T) {
-	lines := propsDump([]string{"host      cml"}, "zfs properties", map[string]string{
+	lines := propsDump([]string{"host      cml"}, map[string]string{
 		"guid":   "123",
 		"health": "ONLINE",
 	}, map[string]string{"guid": "default"})
 	var foundHeader, foundGuid bool
 	for _, ln := range lines {
-		if strings.Contains(ln, "properties") {
+		// No centered title now; the PROPERTY/VALUE column header labels it.
+		if strings.Contains(ln, "PROPERTY") && strings.Contains(ln, "VALUE") {
 			foundHeader = true
 		}
 		if strings.HasPrefix(ln, "guid") {
@@ -650,7 +651,7 @@ func TestPropsDumpLayout(t *testing.T) {
 		}
 	}
 	if !foundHeader {
-		t.Fatalf("missing properties header: %v", lines)
+		t.Fatalf("missing PROPERTY/VALUE header: %v", lines)
 	}
 	if !foundGuid {
 		t.Fatalf("missing guid row: %v", lines)

@@ -150,7 +150,7 @@ func cmdStatus(st *Store, showAll bool, specs []string) error {
 	for _, h := range data.Hosts {
 		if !h.Reachable {
 			fmt.Printf("note: %s unreachable at last refresh (%s): %s\n",
-				h.Name, h.LastRefresh.Format(time.DateTime), h.LastError)
+				h.Name, utcStamp(h.LastRefresh), h.LastError)
 		}
 	}
 	return nil
