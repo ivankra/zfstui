@@ -124,10 +124,15 @@ every emitted shape — extend regexes and constructors together. The global
   - display name = longest common path suffix (pool stripped), clones
     excluded; leading components whose ancestor dataset is snapshot-less
     plumbing get trimmed (`trimBoring`); the remainder is the cell prefix.
-  - states via pairwise compare against the newest shared snapshot (GUID
-    equality only — trap #1): ahead / behind / diverged (both sides ahead) /
-    in-sync; written>0 counts as ahead; clone/resume-token override display.
-    No stored "master", no pins — the source is always derived.
+  - states key off the group's NEWEST snapshot (GUID, trap #1): **ahead** (sole
+    holder, peers lack it = the source), **synced** (holds it, clean), **stale**
+    (missing it), **modified** (holds it but written>0 uncommitted), **diverged**
+    (pairwise: both sides hold snapshots past their common base). TWO axes:
+    snapshot lineage (ahead/synced/stale/diverged, GUID-only) vs uncommitted
+    writes (→ modified only). written>0 NEVER makes peers stale or anyone
+    diverged (that was the atime false-divergence bug). clone/resume-token
+    override display. No stored "master" — the source is derived. Constants
+    StateInSync="synced", StateBehind="stale", StateModified="modified".
   - Group.Hidden = no member has any snapshot (plumbing datasets).
 - `mutate.go` — THE ONLY place mutation command lines are built:
   buildSnapshotCmd, buildSendCmd / buildFullSendCmd (flags per trap #3),
@@ -165,8 +170,8 @@ every emitted shape — extend regexes and constructors together. The global
     scrollToCursor subtract 3): host (size only, no %), pool (name + 🧹 if
     scrubbing), and a non-focusable pool fill-bar row (`▰▰▰▱▱` via fillBar,
     dim/border colored, sized to the column).
-  - colors: white normal, gray behind/stale, green unsynced snapshots
-    (ahead), bright yellow 226 unsnapshotted writes (+), red diverged and
+  - colors: white synced, gray stale, green ahead (holds snapshots peers
+    lack), bright yellow 226 modified (uncommitted writes), red diverged and
     unhealthy/error pool headers, cyan 14 resumable / section headers /
     status messages, dim clone / unreachable-host columns. Done jobs plain
     white. The user picks colors by feel — expect tweaks.

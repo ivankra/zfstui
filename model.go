@@ -225,9 +225,10 @@ type JobInfo struct {
 type ReplicaState string
 
 const (
-	StateInSync    ReplicaState = "up-to-date"
-	StateAhead     ReplicaState = "ahead"
-	StateBehind    ReplicaState = "behind"
+	StateInSync    ReplicaState = "synced"   // holds the group's newest snapshot, no local writes
+	StateAhead     ReplicaState = "ahead"    // sole holder of the newest snapshot → the source
+	StateBehind    ReplicaState = "stale"    // missing the group's newest snapshot
+	StateModified  ReplicaState = "modified" // holds the newest snapshot but has uncommitted writes
 	StateDiverged  ReplicaState = "diverged"
 	StateClone     ReplicaState = "clone"
 	StateResumable ReplicaState = "resumable" // partial recv; orthogonal but exclusive in v1 display

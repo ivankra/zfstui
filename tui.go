@@ -20,8 +20,8 @@ var (
 	styleHeader     = lipgloss.NewStyle().Bold(true).Underline(true)
 	styleName       = lipgloss.NewStyle().Bold(true)
 	styleNormal     = lipgloss.NewStyle()
-	styleNewSnaps   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))   // green: unsynced snapshots
-	styleWritten    = lipgloss.NewStyle().Foreground(lipgloss.Color("226")) // bright yellow: unsnapshotted writes (+)
+	styleNewSnaps   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))   // green: ahead (snapshots peers lack)
+	styleWritten    = lipgloss.NewStyle().Foreground(lipgloss.Color("226")) // bright yellow: modified (uncommitted writes)
 	styleDiverged   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))   // red
 	styleCyan       = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))   // cyan
 	styleClone      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))   // dim
@@ -38,9 +38,10 @@ var (
 	styleErr        = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
 
-// cellStyle: white = normal, gray = behind (stale but compatible),
-// green = has snapshots not yet synced elsewhere, orange = unsnapshotted
-// local writes ("+"); red/cyan/dim keep flagging diverged/resumable/clone.
+// cellStyle: white = synced, gray = stale (missing the newest snapshot),
+// green = ahead (sole holder of the newest snapshot), yellow = modified
+// (holds it but has uncommitted writes); red/cyan/dim flag diverged/
+// resumable/clone. Uncommitted writes alone never make a peer "stale".
 func cellStyle(r *Replica) lipgloss.Style {
 	switch r.State {
 	case StateDiverged:
@@ -50,15 +51,13 @@ func cellStyle(r *Replica) lipgloss.Style {
 	case StateClone:
 		return styleClone
 	case StateBehind:
-		return styleDetRow
+		return styleDetRow // stale: gray
+	case StateModified:
+		return styleWritten // yellow: uncommitted local writes
+	case StateAhead:
+		return styleNewSnaps // green: holds snapshots peers lack
 	}
-	if r.Written > 0 {
-		return styleWritten
-	}
-	if r.State == StateAhead {
-		return styleNewSnaps
-	}
-	return styleNormal
+	return styleNormal // synced
 }
 
 // cell is one (group, column) position; usually 0 or 1 replicas, rarely more.
@@ -1244,12 +1243,14 @@ func (m *Model) helpView() string {
   q              quit
   ?              close this help
 
-cell markers:  + unsnapshotted writes  ! diverged  ~ resumable  % clone
-cell colors:   white normal · green unsynced snapshots · orange unsnapshotted
-               writes (+) · red diverged · cyan resumable · dim clone
+cell markers:  ! diverged  ~ resumable  % clone
+states/colors: white synced · green ahead (sole holder of newest snapshot) ·
+               yellow modified (holds newest snapshot, has uncommitted writes) ·
+               gray stale (missing newest snapshot) · red diverged ·
+               cyan resumable · dim clone
 column dim = host unreachable at last refresh
 
-(snapshot/sync/prune actions arrive in the next milestone)
+(prune actions arrive in the next milestone)
 
 press any key to close`
 	return help

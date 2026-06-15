@@ -105,13 +105,17 @@ func TestTypicalMasterAndBackups(t *testing.T) {
 		t.Error("group with snapshots must not be hidden")
 	}
 
+	// master and the fresh backup BOTH hold the newest snapshot (20260601);
+	// the master differs only by unsnapshotted writes → "modified", and the
+	// fresh backup is fully replicated → "synced" (NOT behind, despite the
+	// master's pending writes). Only the tank backup, missing 20260601, is stale.
 	m := member(t, g, "dev1", "ssd/srv/git")
-	if m.State != StateAhead || m.CellPrefix != "srv/" {
+	if m.State != StateModified || m.CellPrefix != "srv/" {
 		t.Errorf("master: state=%s prefix=%q", m.State, m.CellPrefix)
 	}
 	fresh := member(t, g, "dev2", "ssd/bak/git")
-	if fresh.State != StateBehind { // master has unsnapshotted writes
-		t.Errorf("fresh backup: state=%s", fresh.State)
+	if fresh.State != StateInSync {
+		t.Errorf("fresh backup: state=%s (want synced)", fresh.State)
 	}
 	if fresh.CellPrefix != "bak/" {
 		t.Errorf("fresh backup prefix=%q", fresh.CellPrefix)
@@ -160,9 +164,12 @@ func TestDivergence(t *testing.T) {
 	}
 }
 
-// written>0 on a non-master replica also means divergence (e.g. atime writes
-// on a mounted backup) once the master is ahead too.
-func TestDivergenceViaWrites(t *testing.T) {
+// Uncommitted writes are NOT divergence: two replicas sharing the same latest
+// snapshot, each with local writes (e.g. atime on mounted copies), are both
+// "modified" — not diverged. Divergence requires independent SNAPSHOTS past a
+// common base. (Old behavior flagged this as false divergence; see the atime
+// caveat in DESIGN.md — fixed by the snapshot/writes split.)
+func TestWritesAreModifiedNotDiverged(t *testing.T) {
 	f := newFx()
 	f.ds("dev1", "ssd/srv/git", 4096, "")
 	f.snap("dev1", "ssd/srv/git", "base", "g1", 100)
@@ -170,8 +177,13 @@ func TestDivergenceViaWrites(t *testing.T) {
 	f.snap("dev2", "ssd/bak/git", "base", "g1", 100)
 
 	g := findGroup(t, f.groups(), "git")
-	if !g.Diverged {
-		t.Fatal("want divergence when both sides wrote")
+	if g.Diverged {
+		t.Fatal("uncommitted writes must not be treated as divergence")
+	}
+	for _, r := range g.Members {
+		if r.State != StateModified {
+			t.Errorf("%s state=%s (want modified)", r.Dataset.Name, r.State)
+		}
 	}
 }
 

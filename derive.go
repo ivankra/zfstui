@@ -284,9 +284,6 @@ done:
 // snapshot are incomparable and skipped (connectivity may be transitive).
 func classify(g *Group, entries map[string]*entry, members []string) {
 	n := len(members)
-	ahead := make([]bool, n)  // ahead of at least one peer
-	behind := make([]bool, n) // behind at least one peer
-	diverged := make([]bool, n)
 	guidSets := make([]map[string]bool, n)
 	for i, k := range members {
 		guidSets[i] = map[string]bool{}
@@ -294,12 +291,15 @@ func classify(g *Group, entries map[string]*entry, members []string) {
 			guidSets[i][s.GUID] = true
 		}
 	}
-	// hasNewerThan: does replica i have snapshots past the shared base?
+	// hasNewerThan: does replica i hold a SNAPSHOT past the shared base?
 	// Identity is the GUID — a replica's copy of the base itself is never
 	// "newer". createtxg is POOL-LOCAL (a received snapshot gets the recv
 	// txg) and must never be compared across replicas; creation has 1s
 	// resolution, so equal-creation distinct snapshots compare as not-newer
-	// (conservative: prefer behind/in-sync over a spurious diverged).
+	// (conservative: prefer stale/synced over a spurious diverged).
+	// Uncommitted writes (ds.Written) are NOT a snapshot and never count here:
+	// they aren't replicable, so they can't make a replica diverged/ahead or
+	// its peers stale — they only mark the holder "modified" (below).
 	hasNewerThan := func(i int, base *Snapshot) bool {
 		e := entries[members[i]]
 		if len(e.snaps) == 0 {
@@ -311,9 +311,11 @@ func classify(g *Group, entries map[string]*entry, members []string) {
 		}
 		return last.Creation > base.Creation
 	}
+	// Diverged is the only pairwise verdict: both sides hold snapshots past
+	// their newest common one (a real fork → manual repair).
+	diverged := make([]bool, n)
 	for i := 0; i < n; i++ {
 		for j := i + 1; j < n; j++ {
-			// Newest shared snapshot, scanning i's snaps newest-first.
 			ei := entries[members[i]]
 			var base *Snapshot
 			for s := len(ei.snaps) - 1; s >= 0; s-- {
@@ -325,19 +327,33 @@ func classify(g *Group, entries map[string]*entry, members []string) {
 			if base == nil {
 				continue // incomparable pair
 			}
-			iAhead := hasNewerThan(i, base) || ei.ds.Written > 0
-			jAhead := hasNewerThan(j, base) || entries[members[j]].ds.Written > 0
-			switch {
-			case iAhead && jAhead:
+			if hasNewerThan(i, base) && hasNewerThan(j, base) {
 				diverged[i], diverged[j] = true, true
-			case iAhead:
-				ahead[i], behind[j] = true, true
-			case jAhead:
-				ahead[j], behind[i] = true, true
+			}
+		}
+	}
+	// The remaining states key off the group's NEWEST snapshot (by creation,
+	// GUID-identified). Holding it ⇒ synced/modified; lacking it ⇒ stale; being
+	// its sole holder while peers lack it ⇒ ahead (the source).
+	var newestGUID string
+	newestCreation := int64(-1)
+	for i := range members {
+		for _, s := range entries[members[i]].snaps {
+			if s.Creation > newestCreation {
+				newestCreation, newestGUID = s.Creation, s.GUID
+			}
+		}
+	}
+	holders := 0
+	if newestGUID != "" {
+		for i := range members {
+			if guidSets[i][newestGUID] {
+				holders++
 			}
 		}
 	}
 	for i, r := range g.Members {
+		holdsNewest := newestGUID == "" || guidSets[i][newestGUID]
 		switch {
 		case r.Dataset.Origin != "":
 			r.State = StateClone
@@ -346,12 +362,14 @@ func classify(g *Group, entries map[string]*entry, members []string) {
 		case diverged[i]:
 			r.State = StateDiverged
 			g.Diverged = true
-		case ahead[i] && !behind[i]:
-			r.State = StateAhead
-		case behind[i]:
-			r.State = StateBehind
+		case !holdsNewest:
+			r.State = StateBehind // stale: missing the group's newest snapshot
+		case n > 1 && holders == 1:
+			r.State = StateAhead // sole holder of the newest snapshot → the source
+		case r.Dataset.Written > 0:
+			r.State = StateModified // holds the latest snapshot, but has uncommitted writes
 		default:
-			r.State = StateInSync
+			r.State = StateInSync // synced
 		}
 	}
 }

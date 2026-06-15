@@ -29,7 +29,7 @@ batch `snap`/`sync` CLI, prune, jobs pane, `doctor`, job-dir cleanup.
   convention-free, derived from the data.
 - bare `./zfstui` opens the TUI: scrollable matrix with a two-level
   host/pool header (both navigable; hosts show "(53%/38T)" capacity when the
-  column is wide enough), color-coded cells (behind replicas gray; unhealthy
+  column is wide enough), color-coded cells (stale replicas gray; unhealthy
   pools red), row guide on the cursor's row, async refresh (`r` host / `R`
   all), `h` toggles hidden groups, `?` help. The main table has no title
   line. The Details pane is interactive: segmented title chips
@@ -137,33 +137,34 @@ that host and are picked up on the next refresh — even by a brand-new control 
 
 ### Source detection: derived from data, not declared
 
-There is no stored "master" role, no pins, no name heuristics. Per group, a
-replica is **ahead** if it has data the others lack past the newest common
-snapshot: snapshots with GUIDs no other replica has, and/or `written > 0`
-(local writes since its latest snapshot). Then:
+There is no stored "master" role, no pins, no name heuristics. Per-replica
+states key off the group's **newest snapshot** (GUID, by `creation`):
 
-- exactly one replica ahead → it's the source; sync defaults flow from it
-- none ahead → group is in sync; no sync needed, "master" is moot
-- two or more mutually ahead → **diverged**: flagged red. This does *not*
-  disable syncing for the group — the sync dialog (or `--from`/`--to`) can
-  still replicate between any pair that is compatible (see the compatibility
-  gate in Sync planning); only pairs whose receive would be destructive are
-  rejected, with the reason shown. Repairing the diverged pair itself stays
-  a manual job.
+- **ahead** — sole holder of the newest snapshot (every peer lacks it) → the
+  source; sync defaults flow from it.
+- **synced** — holds the newest snapshot (alongside ≥1 peer that also holds it),
+  no uncommitted writes; nothing to do.
+- **modified** — holds the newest snapshot but has uncommitted local writes
+  (`written > 0`). NOT a replication source on its own (uncommitted data can't
+  be sent — snapshot it first), and crucially it does **not** make its peers
+  stale. This is the common "live master with pending changes, backups already
+  caught up to the last snapshot" case (the `dna` example).
+- **stale** — missing the group's newest snapshot; cleanly behind, can receive.
+- **diverged** — two replicas each hold SNAPSHOTS past their newest common one
+  (a real fork) → flagged red. Does *not* disable syncing for the group: the
+  sync dialog (or `--from`/`--to`) can still replicate any compatible pair (see
+  the compatibility gate in Sync planning); only destructive receives are
+  rejected, with the reason shown. Repairing the fork itself stays manual.
 
-Wrong-direction replication is structurally impossible this way: the tool only
-ever proposes sending from the replica that provably has the newer data.
+Key split (fixed 2026-06-15): **snapshot lineage** decides ahead/synced/stale/
+diverged (GUID-only); **uncommitted writes** are a separate axis that only marks
+the holder `modified`. Writes NEVER make a replica diverged/ahead or its peers
+stale — that produced false divergence from atime on mounted copies. (Snapshot
+equality is GUID equality, full stop: `creation` has 1s resolution and
+`createtxg` is pool-local — neither may break ties across replicas.)
 
-Implementation caveat: snapshot equality is GUID equality, full stop —
-`creation` has 1s resolution and `createtxg` is pool-local (received
-snapshots get the txg of the receive), so neither may break ties across
-replicas; ambiguous cases resolve toward in-sync/behind, never diverged.
-
-Caveat worth documenting for users: `written` counts *any* writes, including
-atime updates on a mounted replica, which would surface as false divergence.
-That's honest (the replica really did change) and the usual setups
-(`canmount=off` backups, `atime=off`) avoid it; the diverged-cell detail view
-shows the `written` byte count so a 4K-atime-blip is easy to recognize.
+Wrong-direction replication is structurally impossible: the tool only ever
+proposes sending from a replica that provably holds snapshots the dest lacks.
 
 ### Hidden groups
 
@@ -181,11 +182,13 @@ For each replica in a group, comparing against the group-wide latest snapshot
 
 | state     | meaning                                                           | render |
 |-----------|-------------------------------------------------------------------|--------|
-| in-sync   | has the group's latest snapshot, `written` == 0                   | `bak/@20260601` plain/green |
-| ahead     | sole holder of newest data (unique snaps and/or `written` > 0)    | `srv/@20260610` bold (`+` if unsnapshotted writes) |
-| behind    | missing the group's latest snapshot, no unique data of its own    | yellow, `@<its-latest>` |
-| diverged  | unique data past the common base while another replica is ahead too | red `!` marker |
-| resumable | has a `receive_resume_token` (interrupted recv)                   | cyan `…` marker |
+| synced    | holds the group's newest snapshot, `written` == 0                 | `bak/@20260601` white |
+| ahead     | sole holder of the newest snapshot (peers lack it)                | `srv/@20260610` green |
+| modified  | holds the newest snapshot but `written` > 0 (uncommitted writes)  | `srv/@20260610` yellow |
+| stale     | missing the group's newest snapshot                               | gray, `@<its-latest>` |
+| diverged  | holds snapshots past the common base while another replica does too | red `!` marker |
+| resumable | has a `receive_resume_token` (interrupted recv)                   | cyan `~` marker |
+| clone     | `origin` set (clone of another snapshot)                          | dim `%` marker |
 
 ### Language: Go (bubbletea + pure-Go sqlite)
 
@@ -245,7 +248,7 @@ pools(host, name, guid, size, alloc, free, health)
 datasets(id PK, host, pool, name, guid, ...props)
 snapshots(dataset_id, name, guid, creation, createtxg, used)
 groups(id, display_name)            -- derived, recomputed on refresh
-group_members(group_id, dataset_id, state)  -- ahead/in-sync/behind/diverged/clone
+group_members(group_id, dataset_id, state)  -- ahead/synced/stale/modified/diverged/clone
 jobs(id PK, host, src_dataset, dst_host, dst_dataset, state, from_snap, to_snap,
      bytes_total, bytes_done, started_at, finished_at, log_path)
 ```
@@ -733,6 +736,18 @@ TUI is manual for now.
   host window now shows `space:` (total/free/%used across pools) and `uptime:`
   (booted timestamp) rows at the top. The section is tolerated absent (old
   caches / non-Linux) so it never aborts a refresh.
+- 2026-06-15: **state taxonomy split — `modified` added; writes ≠ behind** —
+  states now key off the group's newest snapshot (GUID): ahead (sole holder),
+  synced (holds it, clean), stale (missing it), and the NEW **modified** (holds
+  it but has uncommitted writes). Snapshot lineage and uncommitted writes are
+  separate axes — `written>0` only marks the holder `modified`, never makes
+  peers stale or anyone diverged (kills the atime false-divergence). Renamed
+  values: in-sync→`synced`, behind→`stale` (constants StateInSync/StateBehind
+  kept). classify() rewritten: pairwise GUID compare for divergence only, then
+  per-replica group-newest logic. Colors: green ahead, yellow modified, gray
+  stale, white synced. The `dna` fleet example (one live master with +680K
+  uncommitted, three backups at the same snapshot) now reads master=modified,
+  backups=synced — not "behind".
 - 2026-06-15: **view polish (user-driven tweaks)** — full-window section
   headers always get a blank line above them (withSectionGaps); table data
   rows render white, headers cyan; the compact pane dropped ALL `*` bullets
