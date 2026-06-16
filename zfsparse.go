@@ -94,15 +94,7 @@ func ParsePools(host, out string) ([]Pool, error) {
 	}
 	var pools []Pool
 	for _, name := range t.order {
-		p := props(t.vals[name])
-		pools = append(pools, Pool{
-			Host: host, Name: name,
-			GUID: p.str("guid"),
-			Size: p.num("size"), Alloc: p.num("allocated"), Free: p.num("free"),
-			Cap: p.num("capacity"), Frag: p.num("fragmentation"),
-			Dedup: p.str("dedupratio"), Health: p.str("health"),
-			Props: t.vals[name], PropSrc: t.srcs[name],
-		})
+		pools = append(pools, poolFromProps(host, name, t.vals[name], t.srcs[name]))
 	}
 	return pools, nil
 }
@@ -711,7 +703,8 @@ func ParseJobs(host, out string) []JobInfo {
 	return jobs
 }
 
-// poolFromProps mirrors ParsePools' field mapping (shared with the store).
+// poolFromProps is THE single Pool field mapping, shared by ParsePools and the
+// sqlite load path (like datasetFromProps & friends).
 func poolFromProps(host, name string, vals, srcs map[string]string) Pool {
 	p := props(vals)
 	return Pool{
@@ -724,8 +717,9 @@ func poolFromProps(host, name string, vals, srcs map[string]string) Pool {
 	}
 }
 
-// The toProps inverses synthesize a property map from typed fields when an
-// object was built in code (tests) rather than parsed. Keep in lockstep with
+// The toProps inverses are used by the store's save path: for refresh-parsed
+// objects they short-circuit (Props != nil); for objects built in code (tests)
+// they synthesize a property map from the typed fields. Keep in lockstep with
 // the fromProps mappings above.
 
 func (d Dataset) toProps() map[string]string {

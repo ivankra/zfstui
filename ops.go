@@ -4,9 +4,20 @@ package main
 
 import (
 	"context"
+	"sort"
 
 	"golang.org/x/sync/errgroup"
 )
+
+// jobLess orders jobs newest-first by meta "created", with the random ID as a
+// stable tiebreak (IDs aren't time-ordered). Shared by indexJobs and the
+// host-window jobs table.
+func jobLess(a, b JobInfo) bool {
+	if a.Meta["created"] != b.Meta["created"] {
+		return a.Meta["created"] > b.Meta["created"]
+	}
+	return a.ID > b.ID
+}
 
 // RefreshResult is the outcome of refreshing one host.
 type RefreshResult struct {
@@ -90,15 +101,7 @@ func indexJobs(states []HostState) map[string][]JobInfo {
 	}
 	for k := range idx {
 		jobs := idx[k]
-		// Newest first; IDs are random, time order lives in meta "created".
-		key := func(j JobInfo) string { return j.Meta["created"] + " " + j.ID }
-		for i := 0; i < len(jobs); i++ {
-			for l := i + 1; l < len(jobs); l++ {
-				if key(jobs[l]) > key(jobs[i]) {
-					jobs[i], jobs[l] = jobs[l], jobs[i]
-				}
-			}
-		}
+		sort.SliceStable(jobs, func(i, l int) bool { return jobLess(jobs[i], jobs[l]) })
 	}
 	return idx
 }

@@ -30,16 +30,15 @@ command is limited to those hosts.
 flags (before the command):
   -db PATH   sqlite cache (default ./zfstui.db while in development; :memory: works)
   -a         status: also show hidden groups (those with no snapshots at all)
-  -dry-run   never mutate anything: show the exact commands that would run instead
 
-status cell markers:  + unsnapshotted writes  ! diverged  ~ resumable  % clone
+status cell markers:  ! diverged  % clone
+  (ahead/resumable/unsnapshotted-writes carry no marker — color-only in the TUI)
 `
 
 func main() {
 	var (
 		dbPath  = flag.String("db", "", "sqlite cache path")
 		showAll = flag.Bool("a", false, "status: show hidden (snapshot-less) groups too")
-		dryRun  = flag.Bool("dry-run", false, "show mutation commands instead of running them")
 	)
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
@@ -67,7 +66,7 @@ func main() {
 	case "":
 		var hosts []Host
 		if hosts, err = resolveHosts(st, args); err == nil {
-			err = runTUI(st, hosts, *dryRun)
+			err = runTUI(st, hosts)
 		}
 	case "refresh":
 		var hosts []Host

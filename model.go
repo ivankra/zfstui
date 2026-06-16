@@ -266,3 +266,18 @@ type Group struct {
 	// (system/plumbing datasets), unless overridden by the user (TUI `h`).
 	Hidden bool
 }
+
+// Key is a stable identifier for a group across reloads: the lexicographically
+// smallest member "host:name". Unlike DisplayName (derived, and able to collide
+// — e.g. the two unrelated `packages` groups), member identities are concrete,
+// so this disambiguates same-named groups. Empty only for a memberless group.
+func (g *Group) Key() string {
+	key := ""
+	for _, r := range g.Members {
+		k := r.Dataset.Host + ":" + r.Dataset.Name
+		if key == "" || k < key {
+			key = k
+		}
+	}
+	return key
+}

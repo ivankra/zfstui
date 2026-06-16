@@ -1,6 +1,7 @@
 // Package tui is the interactive interface: a scrollable groups × host:pool
-// matrix with a details pane. Read-only in M3 — actions (snap/sync/prune)
-// arrive with M4. See DESIGN.md "TUI".
+// matrix with an interactive details pane and a window stack for per-object
+// views. Snapshot and sync actions (detached jobs, live progress) are wired
+// up; prune/job-cancel are still to come. See DESIGN.md "TUI".
 package main
 
 import (
@@ -17,7 +18,6 @@ import (
 )
 
 var (
-	styleHeader     = lipgloss.NewStyle().Bold(true).Underline(true)
 	styleName       = lipgloss.NewStyle().Bold(true)
 	styleNormal     = lipgloss.NewStyle()
 	styleNewSnaps   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))   // green: ahead (snapshots peers lack)
@@ -60,6 +60,15 @@ func cellStyle(r *Replica) lipgloss.Style {
 	return styleNormal // synced
 }
 
+// colKey identifies a table column: a host and one of its pools. Replaces the
+// old `"host:pool"` string joins (and their fragile `SplitN(…, ":", 2)`
+// re-splits) with concrete fields. String() reproduces the display form.
+type colKey struct {
+	Host, Pool string
+}
+
+func (c colKey) String() string { return c.Host + ":" + c.Pool }
+
 // cell is one (group, column) position; usually 0 or 1 replicas, rarely more.
 type cell struct {
 	replicas []*Replica
@@ -78,7 +87,7 @@ type Model struct {
 	hosts []Host // the active inventory (resolved from cli specs / sqlite)
 
 	data    *Data
-	cols    []string             // "host:pool"
+	cols    []colKey             // table columns (host + pool)
 	rows    []*Group             // currently listed (hidden filtered unless showHidden)
 	cells   map[int]map[int]cell // row -> col -> cell
 	unreach map[string]bool      // hostname -> unreachable at last refresh
@@ -101,7 +110,6 @@ type Model struct {
 	spin            int  // spinner frame counter
 	ticking         bool // spinner/poll ticker active
 
-	dryRun  bool
 	dialog  *snapDialog // snapshot dialog when non-nil
 	syncDlg *syncDialog // sync dialog when non-nil
 	windows []*window   // stack of interactive object windows (Esc pops)
@@ -109,7 +117,7 @@ type Model struct {
 
 // snapDialog is the state of the snapshot dialog (TUI `s`): a modal form
 // with a text input, a checkbox and buttons; Tab/↑↓ cycle focus. The Create
-// button acts immediately (in -dry-run it opens the details modal instead).
+// button acts immediately — the form's live command preview is the confirmation.
 type snapDialog struct {
 	host      Host
 	dataset   string
@@ -127,8 +135,8 @@ const (
 	formFocusCount
 )
 
-func New(st *Store, hosts []Host, dryRun bool) (*Model, error) {
-	m := &Model{st: st, hosts: hosts, dryRun: dryRun, refreshingHosts: map[string]bool{}}
+func New(st *Store, hosts []Host) (*Model, error) {
+	m := &Model{st: st, hosts: hosts, refreshingHosts: map[string]bool{}}
 	if err := m.reload(); err != nil {
 		return nil, err
 	}
@@ -152,13 +160,14 @@ func (m *Model) reload() error {
 		}
 	}
 
-	// Header rows have negative curRow — there is no group there.
-	var curName string
+	// Header rows have negative curRow — there is no group there. Remember the
+	// group by its stable Key (DisplayName can collide across groups).
+	var curKey string
 	if m.curRow >= 0 && m.curRow < len(m.rows) {
-		curName = m.rows[m.curRow].DisplayName
+		curKey = m.rows[m.curRow].Key()
 	}
 
-	colSet := map[string]bool{}
+	colSet := map[colKey]bool{}
 	m.rows = m.rows[:0]
 	m.hiddenN = 0
 	for _, g := range data.Groups {
@@ -170,15 +179,15 @@ func (m *Model) reload() error {
 		}
 		m.rows = append(m.rows, g)
 		for _, r := range g.Members {
-			colSet[r.Dataset.Host+":"+r.Dataset.Pool()] = true
+			colSet[colKey{r.Dataset.Host, r.Dataset.Pool()}] = true
 		}
 	}
 	m.cols = m.cols[:0]
 	for c := range colSet {
 		m.cols = append(m.cols, c)
 	}
-	sort.Strings(m.cols)
-	colIdx := map[string]int{}
+	sort.Slice(m.cols, func(i, j int) bool { return m.cols[i].String() < m.cols[j].String() })
+	colIdx := map[colKey]int{}
 	for i, c := range m.cols {
 		colIdx[c] = i
 	}
@@ -186,7 +195,7 @@ func (m *Model) reload() error {
 	for ri, g := range m.rows {
 		m.cells[ri] = map[int]cell{}
 		for _, r := range g.Members {
-			ci := colIdx[r.Dataset.Host+":"+r.Dataset.Pool()]
+			ci := colIdx[colKey{r.Dataset.Host, r.Dataset.Pool()}]
 			c := m.cells[ri][ci]
 			c.replicas = append(c.replicas, r)
 			m.cells[ri][ci] = c
@@ -201,7 +210,7 @@ func (m *Model) reload() error {
 	}
 	m.curRow = 0
 	for i, g := range m.rows {
-		if g.DisplayName == curName {
+		if g.Key() == curKey {
 			m.curRow = i
 			break
 		}
@@ -213,10 +222,8 @@ func (m *Model) reload() error {
 
 // fixFocus resets details-pane focus to main when there is nothing to show.
 func (m *Model) fixFocus() {
-	if m.focus == 1 {
-		if segs, _ := m.detailsContent(); len(segs) == 0 {
-			m.focus = 0
-		}
+	if m.focus == 1 && !m.hasSelection() {
+		m.focus = 0
 	}
 }
 
@@ -245,21 +252,21 @@ func (m *Model) clampCursor() {
 }
 
 func (m *Model) hostOfCol(ci int) string {
-	return strings.SplitN(m.cols[ci], ":", 2)[0]
+	return m.cols[ci].Host
 }
 
 func (m *Model) poolByCol(ci int) (*HostState, *Pool) {
 	if ci < 0 || ci >= len(m.cols) {
 		return nil, nil
 	}
-	parts := strings.SplitN(m.cols[ci], ":", 2)
+	col := m.cols[ci]
 	for i := range m.data.States {
 		hs := &m.data.States[i]
-		if hs.Host != parts[0] {
+		if hs.Host != col.Host {
 			continue
 		}
 		for j := range hs.Pools {
-			if hs.Pools[j].Name == parts[1] {
+			if hs.Pools[j].Name == col.Pool {
 				return hs, &hs.Pools[j]
 			}
 		}
@@ -275,15 +282,9 @@ func poolProblem(hs *HostState, p *Pool) bool {
 	if health != "" && health != "ONLINE" {
 		return true
 	}
-	status := p.Props["_zpool-status"]
-	for _, ln := range strings.Split(status, "\n") {
-		t := strings.TrimSpace(ln)
-		if s, ok := strings.CutPrefix(t, "errors:"); ok {
-			errs := strings.TrimSpace(s)
-			if errs != "" && errs != "No known data errors" {
-				return true
-			}
-			break
+	if errs, ok := zpoolStatusField(p, "errors:"); ok {
+		if errs != "" && errs != "No known data errors" {
+			return true
 		}
 	}
 	if hs != nil {
@@ -304,14 +305,8 @@ func poolProblem(hs *HostState, p *Pool) bool {
 
 // poolScrubbing reports whether the pool has an active scrub or resilver.
 func poolScrubbing(p *Pool) bool {
-	if p == nil {
-		return false
-	}
-	for _, ln := range strings.Split(p.Props["_zpool-status"], "\n") {
-		t := strings.TrimSpace(ln)
-		if s, ok := strings.CutPrefix(t, "scan:"); ok {
-			return strings.Contains(s, "in progress")
-		}
+	if s, ok := zpoolStatusField(p, "scan:"); ok {
+		return strings.Contains(s, "in progress")
 	}
 	return false
 }
@@ -455,8 +450,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "?":
 			m.showHelp = true
 		case "tab", "shift+tab":
-			segs, _ := m.detailsContent()
-			if len(segs) > 0 {
+			if m.hasSelection() {
 				m.focus = 1 - m.focus
 				if m.focus == 1 {
 					m.detSnap()
@@ -492,8 +486,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case m.curRow == -2 && m.curCol >= 1 && m.curCol <= len(m.cols):
 				m.pushView(m.hostView(m.hostOfCol(m.curCol - 1)))
 			case m.curRow == -1 && m.curCol >= 1 && m.curCol <= len(m.cols):
-				parts := strings.SplitN(m.cols[m.curCol-1], ":", 2)
-				m.pushView(m.poolView(parts[0], parts[1]))
+				col := m.cols[m.curCol-1]
+				m.pushView(m.poolView(col.Host, col.Pool))
 			default:
 				g, c := m.selected()
 				switch {
@@ -598,7 +592,7 @@ func (m *Model) startRefresh(all bool) (tea.Model, tea.Cmd) {
 	}
 	hosts := m.hosts
 	if !all && m.curCol > 0 && m.curCol <= len(m.cols) {
-		hostName := strings.SplitN(m.cols[m.curCol-1], ":", 2)[0]
+		hostName := m.cols[m.curCol-1].Host
 		for _, h := range m.hosts {
 			if h.Name == hostName {
 				hosts = []Host{h}
@@ -690,15 +684,11 @@ func (m *Model) updateWindow(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "g", "home":
 		w.off, w.xoff = 0, 0
 		_, lines := w.content(m)
-		if sel := detSelectable(lines); len(sel) > 0 {
-			w.cur = sel[0]
-		} else {
-			w.cur = 0
-		}
+		w.cur = firstSelectable(lines)
 	case "G", "end":
 		_, lines := w.content(m)
-		if sel := detSelectable(lines); len(sel) > 0 {
-			w.cur = sel[len(sel)-1]
+		if i := lastSelectable(lines); i >= 0 {
+			w.cur = i
 		}
 		w.off = len(lines)
 		w.clampOff(len(lines), m.windowBodyH())
@@ -716,6 +706,12 @@ func overlayCenter(base, box string, w, h int) string {
 			bw = x
 		}
 	}
+	// Never let the box exceed the terminal: an over-wide box would splice
+	// lines longer than w and wrap, shoving the layout. Clamp the width and
+	// truncate the box lines to match.
+	if bw > w {
+		bw = w
+	}
 	x := (w - bw) / 2
 	if x < 0 {
 		x = 0
@@ -730,6 +726,9 @@ func overlayCenter(base, box string, w, h int) string {
 	}
 	const reset = "\x1b[0m"
 	for i, bl := range boxLines {
+		if ansi.StringWidth(bl) > bw {
+			bl = ansi.Truncate(bl, bw, "")
+		}
 		orig := baseLines[y+i]
 		left := ansi.Truncate(orig, x, "")
 		pad := strings.Repeat(" ", max(x-ansi.StringWidth(left), 0))
@@ -804,7 +803,7 @@ func (m *Model) colWidths() (nameW, sizeW int, colWs []int) {
 	}
 	colWs = make([]int, len(m.cols))
 	for i, c := range m.cols {
-		poolLabel := strings.SplitN(c, ":", 2)[1] // pool name (host spans above)
+		poolLabel := c.Pool // pool name (host spans above)
 		if _, p := m.poolByCol(i); poolScrubbing(p) {
 			poolLabel += " 🧹"
 		}
@@ -914,6 +913,24 @@ func humanShort(n int64) string {
 	return fmt.Sprintf("%.1f%c", v, "KMGTPE"[exp])
 }
 
+// hz is humanShort with an explicit "0" instead of a blank for zero — used in
+// kv detail rows where an empty value would read as missing data.
+func hz(n int64) string {
+	if s := humanShort(n); s != "" {
+		return s
+	}
+	return "0"
+}
+
+// pctOf returns part as an integer percentage of whole, guarding the divide
+// (whole <= 0 → 0).
+func pctOf(part, whole int64) int64 {
+	if whole <= 0 {
+		return 0
+	}
+	return part * 100 / whole
+}
+
 // groupSize returns the name-column size for a group: the dataset's OWN disk
 // usage excluding children (used - usedbychildren), maxed across replicas.
 // Children live in their own group rows, so a parent shouldn't double-count
@@ -942,9 +959,6 @@ func (m *Model) tableView(h int) string {
 	nameW, sizeW, colWs := m.colWidths()
 	end := m.visibleCols(nameW, colWs)
 
-	hostOf := func(col string) string { return strings.SplitN(col, ":", 2)[0] }
-	poolOf := func(col string) string { return strings.SplitN(col, ":", 2)[1] }
-
 	// Total pool size for the host (e.g. "1.8T"); the per-pool fill bars below
 	// the pool headers carry the utilisation now, so no percentage here.
 	hostInfo := func(host string) string {
@@ -972,7 +986,7 @@ func (m *Model) tableView(h int) string {
 
 	// isNewGroup: true when column ci starts a new host group (or is first visible).
 	isNewGroup := func(ci int) bool {
-		return ci == m.colOff || hostOf(m.cols[ci]) != hostOf(m.cols[ci-1])
+		return ci == m.colOff || m.cols[ci].Host != m.cols[ci-1].Host
 	}
 
 	// Separator strings. Inter-group: " │ " (3 cols). Intra-group: " " (1 col).
@@ -1000,11 +1014,11 @@ func (m *Model) tableView(h int) string {
 	// ── Host header row (curRow == -2) ──────────────────────────────────────
 	b.WriteString(styleName.Render(pad("", nameW)))
 	for ci := m.colOff; ci < end; {
-		host := hostOf(m.cols[ci])
+		host := m.cols[ci].Host
 		// Compute visible span width (intra-group gaps only, no leading sep).
 		span := 0
 		cj := ci
-		for cj < end && hostOf(m.cols[cj]) == host {
+		for cj < end && m.cols[cj].Host == host {
 			if cj > ci {
 				span += 1 // intra-group gap
 			}
@@ -1040,7 +1054,7 @@ func (m *Model) tableView(h int) string {
 	b.WriteString(pad("", nameW))
 	for ci := m.colOff; ci < end; ci++ {
 		writeSep(&b, isNewGroup(ci), false)
-		poolLabel := poolOf(m.cols[ci])
+		poolLabel := m.cols[ci].Pool
 		if _, p := m.poolByCol(ci); poolScrubbing(p) {
 			poolLabel += " 🧹"
 		}
@@ -1052,7 +1066,7 @@ func (m *Model) tableView(h int) string {
 			b.WriteString(styleErr.Render(hdr))
 		case isCurCol(ci): // column indicator, matching the cyan fill-bar below
 			b.WriteString(styleCyan.Render(hdr))
-		case m.unreach[hostOf(m.cols[ci])]:
+		case m.unreach[m.cols[ci].Host]:
 			b.WriteString(styleDim.Render(hdr))
 		default:
 			b.WriteString(styleName.Render(hdr))
@@ -1073,7 +1087,7 @@ func (m *Model) tableView(h int) string {
 		writeSep(&b, isNewGroup(ci), false)
 		bar := ""
 		if _, p := m.poolByCol(ci); p != nil && p.Size > 0 {
-			bar = fillBar(p.Alloc*100/p.Size, colWs[ci])
+			bar = fillBar(pctOf(p.Alloc, p.Size), colWs[ci])
 		}
 		st := styleDim
 		if isCurCol(ci) {
@@ -1119,7 +1133,7 @@ func (m *Model) tableView(h int) string {
 					st = cellStyle(c.replicas[0])
 				}
 			}
-			if m.unreach[strings.SplitN(m.cols[ci], ":", 2)[0]] {
+			if m.unreach[m.cols[ci].Host] {
 				st = styleDim
 			}
 			if onRow {
@@ -1219,9 +1233,6 @@ func snapList(snaps []Snapshot, n int) string {
 
 func (m *Model) footerView() string {
 	keys := "q quit · ? help · ←↓↑→ move · Tab focus · s snap · y sync · r/R refresh · h hidden"
-	if m.dryRun {
-		keys = styleDiverged.Render("DRY-RUN") + " · " + keys
-	}
 	if m.hiddenN > 0 {
 		mark := "+"
 		if m.showHidden {
@@ -1289,8 +1300,8 @@ func hostNames(hosts []Host) []string {
 }
 
 // Run starts the TUI.
-func runTUI(st *Store, hosts []Host, dryRun bool) error {
-	m, err := New(st, hosts, dryRun)
+func runTUI(st *Store, hosts []Host) error {
+	m, err := New(st, hosts)
 	if err != nil {
 		return err
 	}
@@ -1303,16 +1314,21 @@ func runTUI(st *Store, hosts []Host, dryRun bool) error {
 
 // openSnapshotDialog picks the snapshot target from the cursor: a specific
 // cell's replica, or — on the name column — the group's sole ahead replica.
-func (m *Model) openSnapshotDialog() {
+// selectedReplicaFor resolves the cursor to a single source replica, its
+// access host, and its group for an action ("snapshot", "sync from"): the
+// cell's replica, or the group's sole ahead replica when on the name column.
+// Errors carry the action verb so the status message reads naturally. Shared
+// by the snapshot and sync dialogs (and future action dialogs) so they can't
+// drift on which selection shapes they accept.
+func (m *Model) selectedReplicaFor(action string) (*Replica, Host, *Group, error) {
 	g, c := m.selected()
 	if m.curRow < 0 || g == nil {
-		m.status, m.statusErr = "select a dataset to snapshot", true
-		return
+		return nil, Host{}, nil, fmt.Errorf("select a dataset to %s", action)
 	}
-	var r *Replica
 	switch {
 	case c != nil && len(c.replicas) > 0:
-		r = c.replicas[0]
+		r := c.replicas[0]
+		return r, m.hostByName(r.Dataset.Host), g, nil
 	case m.curCol == 0:
 		var ahead []*Replica
 		for _, mem := range g.Members {
@@ -1321,24 +1337,20 @@ func (m *Model) openSnapshotDialog() {
 			}
 		}
 		if len(ahead) != 1 {
-			m.status, m.statusErr = "no single ahead replica — select a specific cell to snapshot", true
-			return
+			return nil, Host{}, nil, fmt.Errorf("no single ahead replica — select a specific cell to %s", action)
 		}
-		r = ahead[0]
+		r := ahead[0]
+		return r, m.hostByName(r.Dataset.Host), g, nil
 	default:
-		m.status, m.statusErr = "empty cell — nothing to snapshot here", true
+		return nil, Host{}, nil, fmt.Errorf("empty cell — nothing to %s here", action)
+	}
+}
+
+func (m *Model) openSnapshotDialog() {
+	r, host, _, err := m.selectedReplicaFor("snapshot")
+	if err != nil {
+		m.status, m.statusErr = err.Error(), true
 		return
-	}
-	var host Host
-	found := false
-	for _, h := range m.hosts {
-		if h.Name == r.Dataset.Host {
-			host, found = h, true
-			break
-		}
-	}
-	if !found {
-		host = Host{Name: r.Dataset.Host}
 	}
 	in := textinput.New()
 	in.Prompt = ""
@@ -1408,9 +1420,8 @@ func (d *snapDialog) setFocus(f int) {
 	}
 }
 
-// submitDialog validates the form and acts: in -dry-run it opens the
-// details modal; otherwise it launches the snapshot job. The form itself is
-// the confirmation — the exact command is shown before pressing Create.
+// submitDialog validates the form and launches the snapshot job. The form
+// itself is the confirmation — the exact command is shown before Create.
 func (m *Model) submitDialog() tea.Cmd {
 	d := m.dialog
 	name := strings.TrimSpace(d.input.Value())
@@ -1426,11 +1437,6 @@ func (m *Model) submitDialog() tea.Cmd {
 		return nil
 	}
 	m.dialog = nil
-	if m.dryRun {
-		m.pushView(dryRunView(spec))
-		m.status, m.statusErr = "[dry-run] nothing was executed", false
-		return nil
-	}
 	m.refreshing = true
 	m.status, m.statusErr = fmt.Sprintf("creating %s@%s on %s (job %s)…",
 		d.dataset, name, d.host.Name, spec.ID), false
@@ -1511,32 +1517,10 @@ func (m *Model) dialogView() string {
 	if d.errMsg != "" {
 		b.WriteString("\n" + styleErr.Render("⚠ "+d.errMsg) + "\n")
 	}
-	create := "Create"
-	if m.dryRun {
-		create = "Create (dry run)"
-	}
-	b.WriteString("\n" + button(create, d.focus == formFocusOK) + "   " +
+	b.WriteString("\n" + button("Create", d.focus == formFocusOK) + "   " +
 		button("Cancel", d.focus == formFocusCancel) + "\n")
 	b.WriteString("\n" + styleDim.Render("Tab/↑↓ move · Space toggle · Enter ok · Esc cancel"))
 	return dialogBox("Create snapshot", b.String())
-}
-
-func dryRunView(spec jobSpec) *objView {
-	lines := []string{
-		"on host " + spec.Host + ", zfstui would launch a detached job:",
-		"",
-		"  job dir:  " + spec.Dir(),
-		"  command:  " + spec.Command,
-		"",
-		"mechanics: job.sh is piped over ssh and started with setsid,",
-		"writing meta.json, status and log into the job dir; the TUI then",
-		"polls status and refreshes the host. Full job.sh:",
-		"",
-	}
-	for _, l := range strings.Split(strings.TrimRight(spec.script(), "\n"), "\n") {
-		lines = append(lines, "  "+l)
-	}
-	return textView("DRY RUN — nothing was executed", lines)
 }
 
 // --- snapshot execution ---
@@ -1630,29 +1614,9 @@ func (m *Model) hostByName(name string) Host {
 // openSyncDialog picks the sync source from the cursor (cell replica, or the
 // group's sole ahead replica on the name column) and plans all destinations.
 func (m *Model) openSyncDialog() {
-	g, c := m.selected()
-	if m.curRow < 0 || g == nil {
-		m.status, m.statusErr = "select a dataset to sync from", true
-		return
-	}
-	var src *Replica
-	switch {
-	case c != nil && len(c.replicas) > 0:
-		src = c.replicas[0]
-	case m.curCol == 0:
-		var ahead []*Replica
-		for _, mem := range g.Members {
-			if mem.State == StateAhead {
-				ahead = append(ahead, mem)
-			}
-		}
-		if len(ahead) != 1 {
-			m.status, m.statusErr = "no single ahead replica — select the source cell explicitly", true
-			return
-		}
-		src = ahead[0]
-	default:
-		m.status, m.statusErr = "empty cell — nothing to sync from here", true
+	src, srcHost, g, err := m.selectedReplicaFor("sync from")
+	if err != nil {
+		m.status, m.statusErr = err.Error(), true
 		return
 	}
 	plans, err := planSync(src, g, m.data.SnapsByReplica)
@@ -1667,7 +1631,7 @@ func (m *Model) openSyncDialog() {
 	in.Placeholder = "host:pool/dataset, comma-separated"
 	in.TextStyle = lipgloss.NewStyle().Underline(true)
 	d := &syncDialog{
-		src: src, srcHost: m.hostByName(src.Dataset.Host),
+		src: src, srcHost: srcHost,
 		plans: plans, checked: map[int]bool{}, custom: in, intermediate: true,
 	}
 	for i, p := range plans {
@@ -1753,8 +1717,7 @@ func (m *Model) datasetExists(host, ds string) bool {
 	return false
 }
 
-// submitSyncDialog builds one job per checked destination and launches them
-// (or shows the dry-run details modal).
+// submitSyncDialog builds one job per checked destination and launches them.
 func (m *Model) submitSyncDialog() tea.Cmd {
 	d := m.syncDlg
 	type launch struct {
@@ -1807,26 +1770,6 @@ func (m *Model) submitSyncDialog() tea.Cmd {
 		return nil
 	}
 	srcLabel := d.srcHost.Name + ":" + d.src.Dataset.Name
-	if m.dryRun {
-		lines := []string{"source: " + srcLabel, ""}
-		for _, l := range launches {
-			lines = append(lines,
-				"→ "+l.label+"   (job dir "+l.spec.Dir()+" on "+d.srcHost.Name+", launched with ssh -A)",
-				"")
-			for _, cl := range strings.Split(strings.TrimRight(l.spec.Command, "\n"), "\n") {
-				lines = append(lines, "    "+cl)
-			}
-			lines = append(lines, "")
-		}
-		lines = append(lines, "full job.sh of the first job:", "")
-		for _, cl := range strings.Split(strings.TrimRight(launches[0].spec.script(), "\n"), "\n") {
-			lines = append(lines, "  "+cl)
-		}
-		m.syncDlg = nil
-		m.pushView(textView("DRY RUN — nothing was executed", lines))
-		m.status, m.statusErr = "[dry-run] nothing was executed", false
-		return nil
-	}
 	m.syncDlg = nil
 	m.refreshing = true
 	m.status, m.statusErr = fmt.Sprintf("syncing %s → %d destination(s)…", srcLabel, len(launches)), false
@@ -1983,11 +1926,7 @@ func (m *Model) syncDialogView() string {
 	if d.errMsg != "" {
 		b.WriteString("\n" + styleErr.Render("⚠ "+d.errMsg) + "\n")
 	}
-	sync := "Sync"
-	if m.dryRun {
-		sync = "Sync (dry run)"
-	}
-	b.WriteString("\n" + button(sync, d.focus == len(d.selectable)+2) + "   " +
+	b.WriteString("\n" + button("Sync", d.focus == len(d.selectable)+2) + "   " +
 		button("Cancel", d.focus == len(d.selectable)+3) + "\n")
 	b.WriteString("\n" + styleDim.Render("Tab/↑↓ move · Space toggle · Enter ok · Esc cancel"))
 	return dialogBox("Sync (incremental send)", b.String())
@@ -2165,7 +2104,7 @@ func jobProgressLine(j *JobInfo) string {
 	var parts []string
 	switch {
 	case j.Progress > 0 && j.Expected > 0:
-		pct := j.Progress * 100 / j.Expected
+		pct := pctOf(j.Progress, j.Expected)
 		if pct > 100 {
 			pct = 100
 		}

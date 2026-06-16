@@ -86,6 +86,16 @@ func firstSelectable(lines []viewLine) int {
 	return 0
 }
 
+// lastSelectable returns the index of the last selectable line, or -1 if none.
+func lastSelectable(lines []viewLine) int {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if lines[i].open != nil {
+			return i
+		}
+	}
+	return -1
+}
+
 // selInView returns the first (dir>=0) or last (dir<0) selectable row inside
 // the viewport [off, off+bodyH), or -1 if none is visible.
 func selInView(sel []int, off, bodyH, dir int) int {
@@ -391,12 +401,6 @@ func (m *Model) datasetContent(d *Dataset, full bool) ([]string, []viewLine) {
 		}
 		// Right-aligned labels so colons line up; comma-separated value phrases.
 		kv := func(k, v string) viewLine { return vline(fmt.Sprintf("%10s: %s", k, v), styleNormal) }
-		hz := func(n int64) string { // explicit "0" rather than blank in kv rows
-			if s := humanShort(n); s != "" {
-				return s
-			}
-			return "0"
-		}
 		lines = append(lines, kv("created", snapCreated(d.Creation)))
 		if d.Encrypted() {
 			enc := d.Encryption + ", key: " + d.KeyStatus
@@ -566,9 +570,7 @@ func (m *Model) hostContent(host string, full bool) ([]string, []viewLine) {
 			if len(hs.Jobs) > 0 {
 				// Sorted newest-first (meta "created", ID as tiebreak).
 				jobs := append([]JobInfo(nil), hs.Jobs...)
-				sort.SliceStable(jobs, func(i, j int) bool {
-					return jobs[i].Meta["created"]+jobs[i].ID > jobs[j].Meta["created"]+jobs[j].ID
-				})
+				sort.SliceStable(jobs, func(i, j int) bool { return jobLess(jobs[i], jobs[j]) })
 				lines = append(lines, m.vjobs(jobs, 25, full)...)
 			}
 		}
@@ -729,22 +731,30 @@ func (m *Model) zpoolStatusLines(host, pool string, p *Pool) []viewLine {
 // spaceSummary formats capacity as "1.9G total, 315M (16%) used, 1.6G free" —
 // shared by the pool/host detail chips and their window space rows.
 func spaceSummary(size, alloc, free int64) string {
-	pct := int64(0)
-	if size > 0 {
-		pct = alloc * 100 / size
+	return fmt.Sprintf("%s total, %s (%d%%) used, %s free",
+		humanShort(size), humanShort(alloc), pctOf(alloc, size), humanShort(free))
+}
+
+// zpoolStatusField returns the trimmed remainder of the first line in the
+// verbatim `zpool status` blob that begins with label (e.g. "scan:",
+// "errors:"), and whether such a line was found.
+func zpoolStatusField(p *Pool, label string) (string, bool) {
+	if p == nil {
+		return "", false
 	}
-	return fmt.Sprintf("%s total, %s (%d%%) used, %s free", humanShort(size), humanShort(alloc), pct, humanShort(free))
+	for _, ln := range strings.Split(p.Props["_zpool-status"], "\n") {
+		if s, ok := strings.CutPrefix(strings.TrimSpace(ln), label); ok {
+			return strings.TrimSpace(s), true
+		}
+	}
+	return "", false
 }
 
 // scanSummary returns the trimmed `scan:` line from the verbatim zpool status
 // (the scrub/resilver status), or "" if absent.
 func scanSummary(p *Pool) string {
-	for _, ln := range strings.Split(p.Props["_zpool-status"], "\n") {
-		if s, ok := strings.CutPrefix(strings.TrimSpace(ln), "scan:"); ok {
-			return strings.TrimSpace(s)
-		}
-	}
-	return ""
+	s, _ := zpoolStatusField(p, "scan:")
+	return s
 }
 
 // --- disk / vdev / job / dataset tables ---
@@ -807,12 +817,8 @@ func (m *Model) poolTable(pools []Pool, full bool) []viewLine {
 	headers := []string{"POOL", "HEALTH", "SIZE", "ALLOC", "FREE", "FRAG"}
 	var rows [][]string
 	for _, p := range pools {
-		pct := int64(0)
-		if p.Size > 0 {
-			pct = p.Alloc * 100 / p.Size
-		}
 		rows = append(rows, []string{p.Name, p.Health, humanShort(p.Size),
-			fmt.Sprintf("%s (%d%%)", humanShort(p.Alloc), pct), humanShort(p.Free), fmt.Sprintf("%d%%", p.Frag)})
+			fmt.Sprintf("%s (%d%%)", humanShort(p.Alloc), pctOf(p.Alloc, p.Size)), humanShort(p.Free), fmt.Sprintf("%d%%", p.Frag)})
 	}
 	open := func(i int) *objView { return m.poolView(pools[i].Host, pools[i].Name) }
 	return vtable(full, headers, rows, map[int]bool{2: true, 4: true}, nil, open)
@@ -980,7 +986,7 @@ func (m *Model) vdevContent(host string, v VDev, full bool) ([]string, []viewLin
 	if v.Alloc > 0 {
 		used := humanShort(v.Alloc) + " used"
 		if v.Size > 0 {
-			used = fmt.Sprintf("%s (%d%%) used", humanShort(v.Alloc), v.Alloc*100/v.Size)
+			used = fmt.Sprintf("%s (%d%%) used", humanShort(v.Alloc), pctOf(v.Alloc, v.Size))
 		}
 		sp = append(sp, used)
 	}
@@ -999,7 +1005,7 @@ func (m *Model) vdevContent(host string, v VDev, full bool) ([]string, []viewLin
 	return segs, lines
 }
 
-// textView is a plain, non-object window: dry-run plans and failure logs.
+// textView is a plain, non-object window: job-failure logs and other plain text.
 func textView(title string, lines []string) *objView {
 	return &objView{build: func(m *Model, full bool) ([]string, []viewLine) {
 		return []string{title}, toViews(lines)

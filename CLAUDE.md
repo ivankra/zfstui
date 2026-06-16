@@ -5,9 +5,10 @@ READ DESIGN.md first: it is THE doc now (status, architecture, dated
 decisions log explaining *why*, roadmap, and the user's original wishes at
 the bottom — README.md was merged into it and deleted).
 
-State as of 2026-06-15: discovery/status (M1), TUI (M3), sync planner (M2
-core), and most of M4 (snapshot + sync dialogs, detached jobs, live progress,
--dry-run) are DONE and field-tested on the user's real fleet. The Details
+State as of 2026-06-16: discovery/status (M1), TUI (M3), sync planner (M2
+core), and most of M4 (snapshot + sync dialogs, detached jobs, live progress)
+are DONE and field-tested on the user's real fleet. (The global `-dry-run`
+flag was removed 2026-06-16 — see DESIGN.md decisions log.) The Details
 pane + per-object modals were unified into ONE builder-per-object set of views
 rendered compact (pane) or full (interactive window stack) — see view.go /
 details.go and the tui.go bullet. Job logs, host boot/uptime + pool space, and
@@ -21,7 +22,7 @@ go build -o zfstui . && go vet ./... && go test ./...   # all must stay green
 gofmt -l .                                              # must print nothing
 ./zfstui refresh root@ws ivan@cml                       # real ssh discovery (read-only on hosts)
 ./zfstui status [-a] [host...]                          # matrix from cache
-./zfstui [-dry-run] [host-spec...]                      # TUI
+./zfstui [host-spec...]                                 # TUI
 ```
 
 Host model ("never again" bug class): the **hostname is the sole identity** —
@@ -50,8 +51,7 @@ Only ever emit: `zfs snapshot`, `zfs send | zfs recv -s -u` (NEVER -F),
 `recv -o encryption=off`, see mutate.go). ALL mutating command lines are
 built in mutate.go and nowhere else (charset validation + shell quoting);
 mutate_test.go's allowlist regexes + jobs_test.go's job-script scanner verify
-every emitted shape — extend regexes and constructors together. The global
-`-dry-run` flag must keep disabling every mutation path.
+every emitted shape — extend regexes and constructors together.
 
 ## Field-bug traps (each cost a real debugging session — don't reintroduce)
 
@@ -186,7 +186,7 @@ every emitted shape — extend regexes and constructors together. The global
   - **unified object views (view.go) — THE refactor**: ONE builder per object
     type (groupView/datasetView/hostView/poolView/snapshotView/diskView/
     vdevView/jobView, + cellView for multi-replica cells, + textView for plain
-    dry-run/failure text) returns `(segs []string, lines []viewLine)`. Each
+    job-failure text) returns `(segs []string, lines []viewLine)`. Each
     builder takes `full bool` and renders TWO ways from the same code:
     * compact (Details pane, full=false): no section headers, no property
       dumps / verbatim zpool-status / SMART; flush tables (cyan column header,
@@ -252,8 +252,8 @@ every emitted shape — extend regexes and constructors together. The global
     border) composited OVER the table via overlayCenter (ANSI-aware
     splicing). Forms: bubbles textinput + checkbox() + button(), Tab/↑↓
     focus cycle, Space toggles, Enter = default action, NO separate confirm
-    screen — the form previews the exact command live; in -dry-run buttons
-    say "(dry run)" and a textView window shows command/job dir/job.sh instead.
+    screen — the form previews the exact command live, then Create/Sync acts
+    immediately (no -dry-run; that flag was removed 2026-06-16).
     Sync dialog: members pre-checked iff they need syncing, disabled rows
     show reasons, free-form "new dest" editbox (host:pool/dataset, comma-
     separated → full send, must not exist); editbox focus passes ALL keys to

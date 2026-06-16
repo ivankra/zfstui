@@ -8,13 +8,11 @@ import (
 	"strings"
 )
 
-// Marker suffixes:
-//
-//   - unsnapshotted local writes   !  diverged   %  clone
+// Marker suffixes:  !  diverged   %  clone
 //
 // "Ahead" needs no marker: the per-cell @names already show who is newest.
-// Resumable carries no marker either — it's signalled by the cyan cell color
-// in the TUI and surfaced in the dataset detail.
+// Resumable and unsnapshotted local writes carry no marker either — they're
+// signalled by cell color in the TUI and surfaced in the dataset detail.
 func CellText(r *Replica) string {
 	var b strings.Builder
 	// Display drops the prefix's trailing slash: "bak@20250409", not

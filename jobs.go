@@ -38,13 +38,26 @@ type jobSpec struct {
 const jobIDAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 // newJobID: 6 random base62 chars. Time ordering comes from meta.json's
-// "created" field, not the ID.
+// "created" field, not the ID. Rejection sampling avoids the modulo bias that
+// `byte % 62` would introduce (62 doesn't divide 256); a CSPRNG failure is
+// unrecoverable here and panics rather than minting a guessable ID.
 func newJobID() string {
-	var b [6]byte
-	rand.Read(b[:])
-	out := make([]byte, len(b))
-	for i, v := range b {
-		out[i] = jobIDAlphabet[int(v)%len(jobIDAlphabet)]
+	const n = 62 // len(jobIDAlphabet)
+	limit := byte(256 - 256%n)
+	out := make([]byte, 0, 6)
+	var b [8]byte
+	for len(out) < 6 {
+		if _, err := rand.Read(b[:]); err != nil {
+			panic("zfstui: crypto/rand failed generating a job ID: " + err.Error())
+		}
+		for _, v := range b {
+			if v < limit { // reject the biased tail
+				out = append(out, jobIDAlphabet[v%n])
+				if len(out) == 6 {
+					break
+				}
+			}
+		}
 	}
 	return string(out)
 }

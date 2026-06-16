@@ -59,10 +59,10 @@ batch `snap`/`sync` CLI, prune, jobs pane, `doctor`, job-dir cleanup.
   dialog (name, default YYYYMMDD; recursive toggle; live preview of the
   exact `zfs snapshot` command). Runs as a detached job in
   `/tmp/zfstui-job-<id>/` on the host (status/log/meta files; survives
-  control-node disconnect), then auto-refreshes. A global `-dry-run` flag
-  disables all mutations and shows the would-be command + job script
-  instead. All mutation command lines are built in one audited place and
-  allowlist-tested.
+  control-node disconnect), then auto-refreshes. The form's live command
+  preview is the confirmation — there is no separate confirm screen (the
+  `-dry-run` flag was removed 2026-06-16). All mutation command lines are
+  built in one audited place and allowlist-tested.
 
 Try: `go build && ./zfstui refresh root@host1 user@host2 && ./zfstui`.
 Hosts are positional specs (`host`, `user@host[:pool]`, or
@@ -298,11 +298,10 @@ Given a compatible (group, source replica, dest replica):
    parent's encryption (which would demand the parent's key be loaded —
    second field bug 2026-06-11). Mountpoint/canmount on dest are left alone
    (raw recv preserves props; your `bak/` convention handles mounting).
-7. Dry-run mode prints/logs the exact pipeline without executing — this exact
-   command line is also what goes into the generated job script, so dry-run
-   output is trustworthy. Implemented as a global `-dry-run` flag: all
-   mutations are disabled; confirming a dialog shows the command, the job dir
-   and the full job.sh in an overlay instead of executing.
+7. The exact pipeline is previewed live in the dialog before it runs — the
+   same command line that goes into the generated job script, so the preview
+   is trustworthy. (A global `-dry-run` flag that showed the command/job.sh in
+   an overlay instead of executing was removed 2026-06-16 — see decisions log.)
 
 Engine selection per job: `auto` (use syncoid if found on the source host, else
 raw ssh+bash), or forced `syncoid` / `raw` via config/flag/dialog. The raw
@@ -329,6 +328,20 @@ constructors in one place (mutate.go: charset validation + shell quoting),
 and tests assert both the constructors' output and every mutating line of
 generated job scripts match the allowlist regex (mutate_test.go,
 jobs_test.go).
+
+**ssh agent-forwarding trust window.** Sync jobs are launched with `ssh -A`
+(agent forwarding) so the source host can open its own src→dest connection
+without provisioned keys (see the job protocol). This is intentional and
+necessary for pull-through replication, but it means that while a sync job is
+authenticating its destination ControlMaster, the *source host* can reach any
+key in the control node's forwarded agent. The exposure is deliberately
+bounded: the forward is only needed at the destination handshake, the job
+`touch ssh-ok`s and the launcher disconnects as soon as the master is up, and
+the launch bypasses the control node's own ControlMaster
+(`-o ControlPath=none`) so the agent isn't shared with unrelated sessions.
+Trust assumption: you trust the source hosts you replicate *from* for the
+duration of a sync. If that's not acceptable for a given host, provision a
+dedicated key on it instead of relying on the forwarded agent.
 
 ## Snapshot pruning
 
@@ -448,8 +461,7 @@ Keyboard scheme (mnemonic letters, consistent everywhere):
   `-I` intermediate default-on
 - `h` toggle showing hidden (snapshot-less) groups
 - dialogs: Tab/↑↓ cycle focus, Space toggles, Enter = default action, Esc
-  cancel; in -dry-run, action buttons say "(dry run)" and show a scrollable
-  plan modal instead of executing
+  cancel; the form's live command preview is the confirmation (no -dry-run)
 
 Colors: white normal, gray behind/stale, green unsynced snapshots (ahead),
 bright yellow unsnapshotted writes (`+`), red diverged and unhealthy/error
@@ -465,14 +477,14 @@ zfstui refresh [host-spec...]           # update cache
 zfstui status [host-spec...]            # the table, printed plain (cron-able)
 zfstui snap <group|dataset> [--name N] [-r]
 zfstui sync  <group|--all> [--to host[:pool]...] [--from host] [--engine raw|syncoid]
-             [--dry-run] [--detach|--wait]
-zfstui prune <group> [--keep-last N] [--on host] [--dry-run]
+             [--detach|--wait]
+zfstui prune <group> [--keep-last N] [--on host]
 zfstui jobs [--watch] / zfstui log <job-id>
 zfstui doctor                           # per-host tool/sudo/ssh sanity checks
 ```
 
-`sync --all --dry-run` is the confidence-building command: it prints every
-send|recv it *would* run, computed from a fresh refresh.
+(The `-dry-run`/`--dry-run` confidence mode was removed 2026-06-16 — see the
+decisions log; the dialog's live command preview now serves that purpose.)
 
 ## Hosts & access specs (no config file)
 
@@ -575,14 +587,14 @@ TUI is manual for now.
    derivation, `refresh`/`status` CLI. (Most of the risk and most of the value
    for confidence-building lives here.)
 2. **M2 — plan** *(planner done 2026-06-11 — planSync in sync.go with the
-   compatibility gate; batch `sync --dry-run` CLI + `doctor` still open)*.
+   compatibility gate; batch `sync` CLI + `doctor` still open)*.
 3. ✅ **M3 — watch**: read-only TUI (table with two-level host/pool header,
    details pane with Tab focus + scrolling, host/pool/group/cell details,
    async refresh, hidden-group toggle, boring-prefix-trimmed names).
 4. **M4 — act** *(mostly done 2026-06-11/12: job protocol, TUI snapshot &
-   sync dialogs, -dry-run, full sends to custom destinations, resume via
-   tokens, refresh-time job discovery, live progress with spinner +
-   bytes/percent)*. Still open: batch `snap`/`sync` CLI, a jobs/log pane.
+   sync dialogs, full sends to custom destinations, resume via tokens,
+   refresh-time job discovery, live progress with spinner + bytes/percent)*.
+   Still open: batch `snap`/`sync` CLI, a jobs/log pane.
 5. **M5 — polish**: syncoid engine, prune dialog + `prune` command, job
    cancel, job-dir pruning, packaging.
 
@@ -629,6 +641,8 @@ TUI is manual for now.
   by job.sh itself. First job kind: snapshot (TUI `s` dialog).
 - 2026-06-11: **global `-dry-run` flag** — disables all mutations everywhere;
   confirmations show the exact command + job dir + job.sh instead.
+  *(SUPERSEDED 2026-06-16: the flag was removed entirely — see the 2026-06-16
+  entry below.)*
 - 2026-06-11: **sync implemented (TUI `y`)** — dialog pre-checks exactly
   the destinations that need syncing (skips up-to-date; lists diverged/
   dirty/clone/empty disabled with reasons); `-I` intermediate snapshots
@@ -713,8 +727,8 @@ TUI is manual for now.
   that object, Esc pops it, focus returns to the previous window. Builders are
   re-run every render, so spinners / transfer progress / ETA stay live in
   windows too (previously only the pane updated; text modals were a static
-  snapshot taken at open time). Dry-run plans and failure logs are plain
-  windows (`textView`) on the same stack. details.go is now just the pane glue
+  snapshot taken at open time). Job-failure logs are plain windows (`textView`)
+  on the same stack. details.go is now just the pane glue
   (compact build + 8-line render + row cursor); view.go owns all object
   content and the window machinery. Table data rows render white; table
   headers cyan (centered `── title ──` in windows, `* HEADER` in the pane).
@@ -799,6 +813,23 @@ TUI is manual for now.
   can't split a token or alias the framing, and the key is always present (an
   empty value is just `log=`). ParseJobs anchors on the dir prefix, then
   splits key=value tokens and base64-decodes.
+- 2026-06-16: **`-dry-run` removed** (executive call, reversing the 2026-06-11
+  decision and the original "dry mode" wish). The global `-dry-run` flag, the
+  `Model.dryRun` field + `New`/`runTUI` params, the footer DRY-RUN badge, the
+  "(dry run)" button labels, and the `dryRunView`/dry-run-plan `textView`
+  overlays were all ripped out; submitting a snapshot/sync dialog now launches
+  the job directly. The confidence story is preserved by the dialogs' **live
+  command preview** (the exact `zfs …` line, shown before Create/Sync) plus the
+  data-safety invariants that don't depend on dry-run: every mutating line is
+  still built only in mutate.go and allowlist-tested (mutate_test.go +
+  jobs_test.go), so the emitted commands are verified independently of the UI.
+  Planned batch `--dry-run` CLI flags were dropped from the roadmap too. The
+  dialog-flow tests that asserted command shapes via the dry-run overlay were
+  reworked to assert the live submit (dialog closes, a launch `tea.Cmd` is
+  returned but not run, so tests still touch no ssh); command-shape coverage
+  lives in sync_test.go / mutate_test.go / jobs_test.go. Revisit if a
+  before-it-runs preview for the *batch* CLI is wanted (a pure plan-printer is
+  the natural place — no Model.dryRun gating).
 - Name: `zfstui`.
 
 ## Initial wishes

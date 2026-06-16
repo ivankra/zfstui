@@ -27,7 +27,7 @@ func dialogTestModel(t *testing.T) *Model {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := New(st, []Host{{Name: "dev1", User: "ivan"}}, true /* dry-run */)
+	m, err := New(st, []Host{{Name: "dev1", User: "ivan"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func key(s string) tea.KeyMsg {
 	}
 }
 
-func TestSnapshotDialogDryRunFlow(t *testing.T) {
+func TestSnapshotDialogFlow(t *testing.T) {
 	m := dialogTestModel(t)
 
 	// Name column: single replica isn't "ahead" of anyone — must refuse.
@@ -117,37 +117,21 @@ func TestSnapshotDialogDryRunFlow(t *testing.T) {
 		t.Errorf("form should preview the command:\n%s", m.View())
 	}
 
-	// Create in dry-run mode: dialog closes, scrollable details modal opens.
-	m.Update(key("enter"))
+	// Create: dialog closes and a launch command is returned (the tea.Cmd that
+	// would ssh — the test doesn't run it, so nothing actually executes). No
+	// window opens; status reflects the in-flight job.
+	_, cmd := m.Update(key("enter"))
 	if m.dialog != nil {
-		t.Error("dialog should close")
+		t.Error("dialog should close on Create")
 	}
-	if !winOpen(m) {
-		t.Fatal("dry-run details window should open")
+	if cmd == nil {
+		t.Error("Create should return a launch command")
 	}
-	content := winText(m)
-	if !strings.Contains(content, `sudo -n zfs snapshot -r 'ssd/srv/git@pre-upgrade'`) ||
-		!strings.Contains(content, "/tmp/zfstui-job-") ||
-		!strings.Contains(content, "#!/usr/bin/env bash") {
-		t.Errorf("window content:\n%s", content)
-	}
-	if !strings.Contains(winTitle(m), "DRY RUN") {
-		t.Errorf("window title: %q", winTitle(m))
-	}
-
-	// Scrollable: j moves down, g back to top; Esc closes.
-	m.Update(key("j"))
-	m.Update(key("j"))
-	if m.topWindow().off != 2 {
-		t.Errorf("scroll off = %d", m.topWindow().off)
-	}
-	m.Update(key("g"))
-	if m.topWindow().off != 0 {
-		t.Errorf("scroll home off = %d", m.topWindow().off)
-	}
-	m.Update(key("esc"))
 	if winOpen(m) {
-		t.Error("Esc should close the window")
+		t.Error("no window should open on a live Create")
+	}
+	if !m.refreshing || !strings.Contains(m.status, "creating") {
+		t.Errorf("status after Create: refreshing=%v status=%q", m.refreshing, m.status)
 	}
 }
 
@@ -215,7 +199,7 @@ func syncTestModel(t *testing.T) *Model {
 		sn("dev", "tank/bak/git", "own", "gX", 150))
 
 	hosts := []Host{{Name: "ws"}, {Name: "cml", User: "ivan"}, {Name: "hetzner"}, {Name: "dev"}}
-	m, err := New(st, hosts, true /* dry-run */)
+	m, err := New(st, hosts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +210,7 @@ func syncTestModel(t *testing.T) *Model {
 func (m *Model) moveCursorToCol(t *testing.T, col string) {
 	t.Helper()
 	for i, c := range m.cols {
-		if c == col {
+		if c.String() == col {
 			m.curRow, m.curCol = 0, i+1
 			return
 		}
@@ -253,26 +237,26 @@ func TestSyncDialogFlow(t *testing.T) {
 		t.Errorf("pre-checked selection: %+v", sel)
 	}
 	view := m.View()
-	for _, want := range []string{"up to date", "diverged", "@20260501 ⇒ @20260611", "Sync (dry run)"} {
+	for _, want := range []string{"up to date", "diverged", "@20260501 ⇒ @20260611", "Sync"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("dialog view missing %q", want)
 		}
 	}
 
-	// Submit (dry run): modal with the pipeline; agent-forward note present.
-	m.Update(key("enter"))
-	if m.syncDlg != nil || !winOpen(m) {
-		t.Fatal("expected details window after dry-run submit")
+	// Submit: dialog closes and a launch command is returned (unexecuted in the
+	// test). The emitted send|recv shapes are covered by sync_test.go.
+	_, cmd := m.Update(key("enter"))
+	if m.syncDlg != nil {
+		t.Fatal("sync dialog should close on submit")
 	}
-	content := winText(m)
-	for _, want := range []string{
-		`zfs send -L -c -I 'tank/srv/git@20260501' 'tank/srv/git@20260611'`,
-		`$DSSH "sudo -n zfs recv -s -u 'root/bak/git'"`, // ivan@cml => sudo
-		"ssh -A", "ivan@cml", "#!/usr/bin/env bash",
-	} {
-		if !strings.Contains(content, want) {
-			t.Errorf("modal missing %q:\n%s", want, content)
-		}
+	if cmd == nil {
+		t.Error("submit should return a launch command")
+	}
+	if winOpen(m) {
+		t.Error("no window should open on a live submit")
+	}
+	if !m.refreshing || !strings.Contains(m.status, "syncing") {
+		t.Errorf("status after submit: refreshing=%v status=%q", m.refreshing, m.status)
 	}
 }
 
@@ -324,19 +308,17 @@ func TestSyncDialogCustomDestination(t *testing.T) {
 	if d.custom.Value() != "kiwi:tank/bak/git" {
 		t.Fatalf("custom = %q", d.custom.Value())
 	}
-	m.Update(key("enter"))
-	if !winOpen(m) {
-		t.Fatalf("expected dry-run window, err=%q", d.errMsg)
+	// Submit launches the checked group member AND the custom full-send dest;
+	// the dialog closes cleanly with a launch command (send shapes: sync_test.go).
+	_, cmd := m.Update(key("enter"))
+	if m.syncDlg != nil {
+		t.Fatalf("dialog should close on submit, err=%q", d.errMsg)
 	}
-	content := winText(m)
-	for _, want := range []string{
-		"kiwi:tank/bak/git (full send)",
-		`zfs send -L -c 'tank/srv/git@20260611'`,    // full, not incremental
-		`zfs send -L -c -I 'tank/srv/git@20260501'`, // the checked group member too
-	} {
-		if !strings.Contains(content, want) {
-			t.Errorf("modal missing %q:\n%s", want, content)
-		}
+	if cmd == nil {
+		t.Error("submit should return a launch command")
+	}
+	if winOpen(m) {
+		t.Error("no window should open on a live submit")
 	}
 }
 
@@ -365,16 +347,17 @@ func TestSyncDialogSingleReplicaGroup(t *testing.T) {
 	if len(m.syncDlg.selectable) != 0 {
 		t.Fatalf("selectable: %v", m.syncDlg.selectable)
 	}
-	// Editbox is focused from the start; type and submit (dry run).
+	// Editbox is focused from the start; type a new dest and submit. A
+	// single-replica group seeds its first backup via a full send.
 	for _, r := range "dev2:ssd/bak/git" {
 		m.Update(key(string(r)))
 	}
-	m.Update(key("enter"))
-	if !winOpen(m) {
-		t.Fatalf("expected dry-run window, err=%q", m.syncDlg.errMsg)
+	_, cmd := m.Update(key("enter"))
+	if m.syncDlg != nil {
+		t.Fatalf("dialog should close on submit")
 	}
-	if !strings.Contains(winText(m), "full send") {
-		t.Error("window should describe a full send")
+	if cmd == nil {
+		t.Error("submit should return a launch command for the full send")
 	}
 }
 
@@ -501,7 +484,7 @@ func TestDiskDataFlow(t *testing.T) {
 	if err := st.PutHostState(hs); err != nil {
 		t.Fatal(err)
 	}
-	m, err := New(st, []Host{{Name: "sta"}}, true)
+	m, err := New(st, []Host{{Name: "sta"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +588,7 @@ func TestMainTableStyling(t *testing.T) {
 	if err := st.PutHostState(hs2); err != nil {
 		t.Fatal(err)
 	}
-	m, err := New(st, []Host{{Name: "src"}, {Name: "dst"}}, true)
+	m, err := New(st, []Host{{Name: "src"}, {Name: "dst"}})
 	if err != nil {
 		t.Fatal(err)
 	}

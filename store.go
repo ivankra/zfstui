@@ -151,10 +151,17 @@ func (s *Store) PutHostState(st HostState) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"pools", "datasets", "snapshots", "vdevs", "disks", "jobs"} {
-		if _, err := tx.Exec("DELETE FROM "+table+" WHERE host = ?", st.Host); err != nil {
-			return err
+	// exec is sticky: the first error is remembered and later calls no-op, so
+	// the inserts below stay free of repetitive `if _, err := ...` checks; the
+	// accumulated error is returned before Commit.
+	var execErr error
+	exec := func(q string, a ...any) {
+		if execErr == nil {
+			_, execErr = tx.Exec(q, a...)
 		}
+	}
+	for _, table := range []string{"pools", "datasets", "snapshots", "vdevs", "disks", "jobs"} {
+		exec("DELETE FROM "+table+" WHERE host = ?", st.Host)
 	}
 	mj := func(m map[string]string) string {
 		if m == nil {
@@ -164,53 +171,35 @@ func (s *Store) PutHostState(st HostState) error {
 		return string(b)
 	}
 	for _, p := range st.Pools {
-		if _, err := tx.Exec(
-			`INSERT INTO pools (host,name,props,srcs) VALUES (?,?,?,?)`,
-			p.Host, p.Name, mj(p.toProps()), mj(p.PropSrc)); err != nil {
-			return err
-		}
+		exec(`INSERT INTO pools (host,name,props,srcs) VALUES (?,?,?,?)`,
+			p.Host, p.Name, mj(p.toProps()), mj(p.PropSrc))
 	}
 	for _, d := range st.Datasets {
-		if _, err := tx.Exec(
-			`INSERT INTO datasets (host,name,props,srcs) VALUES (?,?,?,?)`,
-			d.Host, d.Name, mj(d.toProps()), mj(d.PropSrc)); err != nil {
-			return err
-		}
+		exec(`INSERT INTO datasets (host,name,props,srcs) VALUES (?,?,?,?)`,
+			d.Host, d.Name, mj(d.toProps()), mj(d.PropSrc))
 	}
 	for _, sn := range st.Snapshots {
-		if _, err := tx.Exec(
-			`INSERT INTO snapshots (host,dataset,name,props,srcs) VALUES (?,?,?,?,?)`,
-			sn.Host, sn.Dataset, sn.Name, mj(sn.toProps()), mj(sn.PropSrc)); err != nil {
-			return err
-		}
+		exec(`INSERT INTO snapshots (host,dataset,name,props,srcs) VALUES (?,?,?,?,?)`,
+			sn.Host, sn.Dataset, sn.Name, mj(sn.toProps()), mj(sn.PropSrc))
 	}
 	for i, v := range st.VDevs {
-		if _, err := tx.Exec(
-			`INSERT INTO vdevs (host,pool,name,ord,props,srcs) VALUES (?,?,?,?,?,?)`,
-			v.Host, v.Pool, v.Name, i, mj(v.toProps()), mj(v.PropSrc)); err != nil {
-			return err
-		}
+		exec(`INSERT INTO vdevs (host,pool,name,ord,props,srcs) VALUES (?,?,?,?,?,?)`,
+			v.Host, v.Pool, v.Name, i, mj(v.toProps()), mj(v.PropSrc))
 	}
 	for _, d := range st.Disks {
-		if _, err := tx.Exec(
-			`INSERT INTO disks (host,id,props) VALUES (?,?,?)`,
-			d.Host, d.ID, mj(d.toProps())); err != nil {
-			return err
-		}
+		exec(`INSERT INTO disks (host,id,props) VALUES (?,?,?)`,
+			d.Host, d.ID, mj(d.toProps()))
 	}
 	for _, j := range st.Jobs {
 		meta, _ := json.Marshal(j.Meta)
-		if _, err := tx.Exec(
-			`INSERT INTO jobs (host,id,dir,kind,state,status,meta,progress,expected,log) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-			j.Host, j.ID, j.Dir, j.Kind, j.State, j.Status, string(meta), j.Progress, j.Expected, j.Log); err != nil {
-			return err
-		}
+		exec(`INSERT INTO jobs (host,id,dir,kind,state,status,meta,progress,expected,log) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			j.Host, j.ID, j.Dir, j.Kind, j.State, j.Status, string(meta), j.Progress, j.Expected, j.Log)
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO hosts (name, last_refresh, reachable, last_error, boot_time) VALUES (?,?,1,'',?)
+	exec(`INSERT INTO hosts (name, last_refresh, reachable, last_error, boot_time) VALUES (?,?,1,'',?)
 		 ON CONFLICT(name) DO UPDATE SET last_refresh=excluded.last_refresh, reachable=1, last_error='', boot_time=excluded.boot_time`,
-		st.Host, time.Now().Unix(), st.BootTime); err != nil {
-		return err
+		st.Host, time.Now().Unix(), st.BootTime)
+	if execErr != nil {
+		return execErr
 	}
 	return tx.Commit()
 }
@@ -254,6 +243,23 @@ func (s *Store) Hosts() ([]HostInfo, error) {
 	return out, rows.Err()
 }
 
+// eachRow runs query and calls scan for every row, owning the
+// Next/Close/rows.Err() lifecycle so callers don't repeat (and can't forget)
+// the close-on-early-return or the post-iteration error check.
+func (s *Store) eachRow(query string, scan func(*sql.Rows) error) error {
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // AllHostStates loads the cached inventory for every host.
 func (s *Store) AllHostStates() ([]HostState, error) {
 	byHost := map[string]*HostState{}
@@ -273,105 +279,87 @@ func (s *Store) AllHostStates() ([]HostState, error) {
 		_ = json.Unmarshal([]byte(s), &m)
 		return m
 	}
-	rows, err := s.db.Query(`SELECT host,name,props,srcs FROM pools ORDER BY host,name`)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
+	if err := s.eachRow(`SELECT host,name,props,srcs FROM pools ORDER BY host,name`, func(rows *sql.Rows) error {
 		var host, name, props, srcs string
 		if err := rows.Scan(&host, &name, &props, &srcs); err != nil {
-			rows.Close()
-			return nil, err
+			return err
 		}
 		st := get(host)
 		st.Pools = append(st.Pools, poolFromProps(host, name, unm(props), unm(srcs)))
-	}
-	rows.Close()
-
-	rows, err = s.db.Query(`SELECT host,name,props,srcs FROM datasets ORDER BY host,name`)
-	if err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	for rows.Next() {
+
+	if err := s.eachRow(`SELECT host,name,props,srcs FROM datasets ORDER BY host,name`, func(rows *sql.Rows) error {
 		var host, name, props, srcs string
 		if err := rows.Scan(&host, &name, &props, &srcs); err != nil {
-			rows.Close()
-			return nil, err
+			return err
 		}
 		st := get(host)
 		st.Datasets = append(st.Datasets, datasetFromProps(host, name, unm(props), unm(srcs)))
-	}
-	rows.Close()
-
-	rows, err = s.db.Query(`SELECT host,pool,name,props,srcs FROM vdevs ORDER BY host,pool,ord`)
-	if err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	for rows.Next() {
+
+	if err := s.eachRow(`SELECT host,pool,name,props,srcs FROM vdevs ORDER BY host,pool,ord`, func(rows *sql.Rows) error {
 		var host, pool, name, props, srcs string
 		if err := rows.Scan(&host, &pool, &name, &props, &srcs); err != nil {
-			rows.Close()
-			return nil, err
+			return err
 		}
 		st := get(host)
 		st.VDevs = append(st.VDevs, vdevFromProps(host, pool, name, unm(props), unm(srcs)))
-	}
-	rows.Close()
-
-	rows, err = s.db.Query(`SELECT host,id,props FROM disks ORDER BY host,id`)
-	if err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	for rows.Next() {
+
+	if err := s.eachRow(`SELECT host,id,props FROM disks ORDER BY host,id`, func(rows *sql.Rows) error {
 		var host, id, props string
 		if err := rows.Scan(&host, &id, &props); err != nil {
-			rows.Close()
-			return nil, err
+			return err
 		}
-		st := get(host)
 		d := diskFromProps(host, unm(props))
 		if d.ID == "" {
 			d.ID = id
 		}
 		if isPseudoDiskName(firstNonEmpty(d.KName, baseName(d.Dev))) {
-			continue
+			return nil
 		}
+		st := get(host)
 		st.Disks = append(st.Disks, d)
-	}
-	rows.Close()
-
-	rows, err = s.db.Query(`SELECT host,id,dir,kind,state,status,meta,progress,expected,COALESCE(log,'') FROM jobs ORDER BY host,id`)
-	if err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	for rows.Next() {
+
+	if err := s.eachRow(`SELECT host,id,dir,kind,state,status,meta,progress,expected,COALESCE(log,'') FROM jobs ORDER BY host,id`, func(rows *sql.Rows) error {
 		var j JobInfo
 		var meta string
 		if err := rows.Scan(&j.Host, &j.ID, &j.Dir, &j.Kind, &j.State, &j.Status, &meta, &j.Progress, &j.Expected, &j.Log); err != nil {
-			rows.Close()
-			return nil, err
+			return err
 		}
 		j.Meta = map[string]string{}
 		_ = json.Unmarshal([]byte(meta), &j.Meta)
 		st := get(j.Host)
 		st.Jobs = append(st.Jobs, j)
-	}
-	rows.Close()
-
-	rows, err = s.db.Query(`SELECT host,dataset,name,props,srcs FROM snapshots ORDER BY host,dataset,name`)
-	if err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	for rows.Next() {
+
+	if err := s.eachRow(`SELECT host,dataset,name,props,srcs FROM snapshots ORDER BY host,dataset,name`, func(rows *sql.Rows) error {
 		var host, ds, name, props, srcs string
 		if err := rows.Scan(&host, &ds, &name, &props, &srcs); err != nil {
-			rows.Close()
-			return nil, err
+			return err
 		}
 		st := get(host)
 		st.Snapshots = append(st.Snapshots, snapshotFromProps(host, ds, name, unm(props), unm(srcs)))
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	rows.Close()
 
 	// Snapshot order matters downstream (latest = last): creation order is
 	// in the props now, not a sortable column.

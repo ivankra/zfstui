@@ -19,8 +19,8 @@ func (m *Model) currentView() *objView {
 	case m.curRow == -2 && m.curCol >= 1 && m.curCol <= len(m.cols):
 		return m.hostView(m.hostOfCol(m.curCol - 1))
 	case m.curRow == -1 && m.curCol >= 1 && m.curCol <= len(m.cols):
-		parts := strings.SplitN(m.cols[m.curCol-1], ":", 2)
-		return m.poolView(parts[0], parts[1])
+		col := m.cols[m.curCol-1]
+		return m.poolView(col.Host, col.Pool)
 	case g != nil && m.curCol == 0:
 		return m.groupView(g)
 	case g != nil && c != nil && len(c.replicas) == 1:
@@ -30,6 +30,11 @@ func (m *Model) currentView() *objView {
 	}
 	return nil
 }
+
+// hasSelection reports whether the current main-table selection has a details
+// view — cheaper than detailsContent when only emptiness matters (it skips the
+// view build).
+func (m *Model) hasSelection() bool { return m.currentView() != nil }
 
 // detailsContent builds the compact pane content for the current selection.
 func (m *Model) detailsContent() ([]string, []viewLine) {
