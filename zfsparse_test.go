@@ -304,6 +304,14 @@ func TestParseDisks(t *testing.T) {
 		!strings.Contains(disks[1].Smart, "Critical Warning") {
 		t.Errorf("disks: %+v", disks)
 	}
+	// sda1 hangs off sda; the partition row is attached and persisted.
+	if len(disks[0].Parts) != 1 || disks[0].Parts[0]["NAME"] != "sda1" ||
+		disks[0].Props["_parts"] == "" {
+		t.Errorf("disk partitions: %+v", disks[0].Parts)
+	}
+	if len(disks[1].Parts) != 0 {
+		t.Errorf("nvme0n1 should have no partitions: %+v", disks[1].Parts)
+	}
 	if isPseudoDiskName("zdata") || !isPseudoDiskName("zd0") {
 		t.Error("pseudo disk filter should only match zd followed by digits")
 	}

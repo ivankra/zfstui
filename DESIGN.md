@@ -830,6 +830,32 @@ TUI is manual for now.
   lives in sync_test.go / mutate_test.go / jobs_test.go. Revisit if a
   before-it-runs preview for the *batch* CLI is wanted (a pure plan-printer is
   the natural place — no Model.dryRun gating).
+- 2026-06-20: **UI polish.** Unreachable hosts dim ONLY their hostname header
+  cell now (not the whole column — pool row, fill-bar, and data cells keep their
+  normal state colors); the refresh spinner sits immediately before the hostname
+  with no space; the snapshot table's CREATED column drops the ` UTC` suffix
+  (the `created: … UTC` kv/detail lines keep it); and running-job spinners are
+  now **directional** — a rising bar `▁▃▅▇` for send (upload), a falling bar
+  `▇▅▃▁` for recv (download), so a replica's animation shows which way bytes
+  flow (jobSpinnerFrame, keyed off `Meta["dest"]`). The generic braille spinner
+  stays for host-refresh and the jobs-table status column.
+- 2026-06-20: **disk discovery & partitions.** lsblk now runs `-b -P -O`
+  (`--output-all`) instead of a hardcoded `-o` column list — every column lsblk
+  knows lands in `Disk.Props` (typed fields still derive from the well-known
+  ones), and `propsDump` drops empty-valued props so the unset `FS*`/`PART*`
+  columns don't clutter the dump. Partitions (lsblk `TYPE="part"` rows) are now
+  hung off their parent disk: `Disk.Parts []map[string]string`, persisted into
+  `Props["_parts"]` (synthetic underscore key → excluded from propsDump,
+  serialized with the disk row for free, re-decoded by diskFromProps on cache
+  load). The disk window renders a PARTITION/SIZE/FSTYPE/LABEL/MOUNTPOINT table
+  whose rows are selectable → Enter opens a `partition h:/dev/sdaN` window
+  (one-liner summary + full lsblk propsDump). Builders: partitionView/
+  partitionContent + partSize helper in view.go.
+- 2026-06-20: **smartctl -a is now a centered `── smartctl -a ──` section
+  header** (vsection) in the disk window, matching the job window's
+  script/log; the old left-aligned-cyan-label `appendVerbatim` helper was its
+  last caller and was deleted. Job windows also gained the missing leading
+  blank line before their script/log section headers.
 - Name: `zfstui`.
 
 ## Initial wishes

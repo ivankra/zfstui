@@ -198,8 +198,9 @@ type Disk struct {
 	Size       int64
 	Transport  string
 	Rotational bool
-	Smart      string            // verbatim smartctl -a output
-	Props      map[string]string // full lsblk -P row
+	Smart      string              // verbatim smartctl -a output
+	Props      map[string]string   // full lsblk -P row
+	Parts      []map[string]string // child partitions' full lsblk -P rows
 }
 
 // HostState is everything discovered on one host in one refresh.

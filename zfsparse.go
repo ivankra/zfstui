@@ -202,12 +202,14 @@ func DiscoverCommand(sudo bool) string {
 		return fmt.Sprintf("echo '%s'; %s%s; echo '%s'$?'==='", mark, pfx, cmd, MarkRC)
 	}
 	// Disks: per pool, vdev properties (OpenZFS ≥ 2.2; tolerated if absent)
-	// + verbatim `zpool status`; then lsblk physical-disk inventory and SMART
-	// for every real disk (smartctl handles SATA and NVMe; skipped if absent).
+	// + verbatim `zpool status`; then lsblk physical-disk inventory (`-O` =
+	// every column lsblk knows, no hardcoded list — all land in Disk.Props;
+	// typed fields derive from the well-known ones) and SMART for every real
+	// disk (smartctl handles SATA and NVMe; skipped if absent).
 	disksProbe := `for p in $(` + pfx + `zpool list -H -o name); do ` +
 		`echo "==P== $p"; ` + pfx + `zpool get -Hp all "$p" all-vdevs 2>/dev/null; ` +
 		`echo "==S=="; ` + pfx + `zpool status "$p" 2>/dev/null; done; ` +
-		`echo "==LSBLK=="; lsblk -b -P -o NAME,KNAME,TYPE,PKNAME,PATH,SIZE,MODEL,SERIAL,WWN,TRAN,ROTA,PARTLABEL,PARTUUID 2>/dev/null; ` +
+		`echo "==LSBLK=="; lsblk -b -P -O 2>/dev/null; ` +
 		`echo "==SMART=="; if command -v smartctl >/dev/null 2>&1; then ` +
 		`for d in $(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 !~ /^zd[0-9]+$/ {print $1}'); do ` +
 		`echo "==D== /dev/$d"; ` + pfx + `smartctl -a "/dev/$d" 2>&1 | head -c 20000; echo; done; ` +
@@ -468,6 +470,12 @@ func diskFromProps(host string, vals map[string]string) Disk {
 	if d.ID == "" {
 		d.ID = stableDiskID(d)
 	}
+	if pj := vals["_parts"]; pj != "" { // re-derived on load from the cache
+		var parts []map[string]string
+		if json.Unmarshal([]byte(pj), &parts) == nil {
+			d.Parts = parts
+		}
+	}
 	return d
 }
 
@@ -535,6 +543,19 @@ func disksFromLSBLK(host string, rows []map[string]string, smartTexts map[string
 		if pl := row["PARTLABEL"]; pl != "" && pl != "-" {
 			addAlias(pl, id)
 			addAlias("/dev/disk/by-partlabel/"+pl, id)
+		}
+		// Hang partitions off their parent disk for the partitions table.
+		if row["TYPE"] == "part" {
+			if idx, ok := indexByID[id]; ok {
+				disks[idx].Parts = append(disks[idx].Parts, row)
+			}
+		}
+	}
+	for i := range disks {
+		if len(disks[i].Parts) > 0 && disks[i].Props != nil {
+			if b, err := json.Marshal(disks[i].Parts); err == nil {
+				disks[i].Props["_parts"] = string(b) // persisted with the disk row
+			}
 		}
 	}
 	for dev, text := range smartTexts {

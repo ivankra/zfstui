@@ -112,10 +112,6 @@ func TestSnapshotDialogFlow(t *testing.T) {
 	if !m.dialog.recursive {
 		t.Fatal("space should toggle the recursive checkbox")
 	}
-	// The form previews the exact command before Create is pressed.
-	if !strings.Contains(m.View(), `sudo -n zfs snapshot -r 'ssd/srv/git@pre-upgrade'`) {
-		t.Errorf("form should preview the command:\n%s", m.View())
-	}
 
 	// Create: dialog closes and a launch command is returned (the tea.Cmd that
 	// would ssh — the test doesn't run it, so nothing actually executes). No
@@ -132,6 +128,11 @@ func TestSnapshotDialogFlow(t *testing.T) {
 	}
 	if !m.refreshing || !strings.Contains(m.status, "creating") {
 		t.Errorf("status after Create: refreshing=%v status=%q", m.refreshing, m.status)
+	}
+	// The job's host must show a spinner while in flight — otherwise the
+	// global refresh guard fires with no visible activity (looked hung).
+	if len(m.refreshingHosts) == 0 {
+		t.Error("job host should be marked busy (spinner) during Create")
 	}
 }
 
@@ -550,6 +551,65 @@ func TestDiskDataFlow(t *testing.T) {
 	}
 	if !winOpen(m) || !strings.Contains(winText(m), "smartctl -a") {
 		t.Fatalf("disk window expected: %q", winTitle(m))
+	}
+}
+
+// Refreshes started on different hosts must run in parallel: a host already
+// in flight is skipped, not a blanket "refresh already running".
+func TestParallelRefresh(t *testing.T) {
+	m := &Model{
+		data:            &Data{},
+		hosts:           []Host{{Name: "a"}, {Name: "b"}},
+		refreshingHosts: map[string]bool{"a": true},
+		refreshing:      true,
+	}
+	// Refresh-all should still launch b even while a is in flight.
+	_, cmd := m.startRefresh(true)
+	if cmd == nil {
+		t.Fatal("refresh-all should start b while a is still refreshing")
+	}
+	if !m.refreshingHosts["b"] {
+		t.Errorf("b should be marked refreshing: %v", m.refreshingHosts)
+	}
+	if !strings.Contains(m.status, "refreshing b") || strings.Contains(m.status, "refreshing a") {
+		t.Errorf("status should target only b: %q", m.status)
+	}
+	// With both in flight, there's genuinely nothing new to start.
+	_, cmd = m.startRefresh(true)
+	if cmd != nil || m.status != "refresh already running" {
+		t.Errorf("expected guard when all busy: cmd=%v status=%q", cmd, m.status)
+	}
+	// Completing a's batch must leave b's spinner up (global flag stays set).
+	delete(m.refreshingHosts, "a")
+	m.syncRefreshing()
+	if !m.refreshingHosts["b"] || !m.refreshing {
+		t.Errorf("b still in flight; refreshing flag should remain set: %v %v", m.refreshingHosts, m.refreshing)
+	}
+	// Once b also finishes, the flag clears.
+	delete(m.refreshingHosts, "b")
+	m.syncRefreshing()
+	if m.refreshing {
+		t.Error("refreshing flag should clear when no host is in flight")
+	}
+}
+
+// Two groups can share a DisplayName (a pool's root dataset and a child named
+// after the pool both render "cml-root"). The Details/group view must resolve
+// the one actually selected — by stable Key, not by colliding name.
+func TestGroupViewResolvesByKeyNotName(t *testing.T) {
+	g1 := &Group{DisplayName: "cml-root", Members: []*Replica{
+		{Dataset: &Dataset{Host: "cml", Name: "cml-root"}, State: StateInSync}}}
+	g2 := &Group{DisplayName: "cml-root", Members: []*Replica{
+		{Dataset: &Dataset{Host: "cml", Name: "cml-root/cml-root"}, State: StateInSync}}}
+	m := &Model{data: &Data{Groups: []*Group{g1, g2}, SnapsByReplica: map[string][]Snapshot{}}}
+
+	_, lines := m.groupView(g2).build(m, false)
+	var body string
+	for _, l := range lines {
+		body += l.text + "\n"
+	}
+	if !strings.Contains(body, "cml:cml-root/cml-root") {
+		t.Errorf("group view for the child should show its own replica, got:\n%s", body)
 	}
 }
 

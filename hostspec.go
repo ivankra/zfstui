@@ -79,6 +79,12 @@ func parseHostSpec(spec string) (Host, error) {
 	if strings.ContainsAny(h.Name, "@:/ ") {
 		return h, fmt.Errorf("host spec %q: invalid hostname %q", spec, h.Name)
 	}
+	if strings.HasPrefix(h.Name, "-") {
+		// A leading dash is never a legal hostname and is almost always a
+		// misplaced flag (`status host -a` leaks `-a` here); reject it so it
+		// can't be remembered as a host or handed to ssh as an option.
+		return h, fmt.Errorf("host spec %q: hostname cannot start with %q (misplaced flag?)", spec, "-")
+	}
 	if h.User == "root" {
 		h.User = "" // root is the default; normalize for SameAccess/storage
 	}

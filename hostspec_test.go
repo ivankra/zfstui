@@ -44,6 +44,8 @@ func TestParseHostSpecErrors(t *testing.T) {
 		"ssh://u;badopt=1@host", // unknown option
 		"ssh://u;noequals@host", // malformed option
 		"a@b@c",                 // junk hostname
+		"-a",                    // misplaced flag, not a host
+		"root@-x",               // leading-dash hostname
 	} {
 		if _, err := parseHostSpec(spec); err == nil {
 			t.Errorf("%q: expected error", spec)

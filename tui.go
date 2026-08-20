@@ -325,6 +325,19 @@ func (m *Model) beginRefresh(hosts []Host) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// markBusy flags the given hosts as in-flight (spinner in their header) and
+// blocks a concurrent refresh while a snapshot/sync job is being launched and
+// polled. Without this the global `refreshing` guard fired ("refresh already
+// running") but no host showed a spinner, looking hung. Cleared by the
+// corresponding done handler.
+func (m *Model) markBusy(hosts ...Host) tea.Cmd {
+	m.refreshing = true
+	for _, h := range hosts {
+		m.refreshingHosts[h.Name] = true
+	}
+	return m.ensureTicker()
+}
+
 // hostSpan returns the [start, end) column range sharing ci's host.
 func (m *Model) hostSpan(ci int) (int, int) {
 	host := m.hostOfCol(ci)
@@ -399,14 +412,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.onJobsPoll(msg)
 
 	case refreshDoneMsg:
-		m.refreshing = false
 		for _, r := range msg.results {
 			delete(m.refreshingHosts, r.Host)
 		}
-		ok, fail := 0, []string{}
+		m.syncRefreshing()
+		ok, fail := []string{}, []string{}
 		for _, r := range msg.results {
 			if r.Err == nil {
-				ok++
+				ok = append(ok, r.Host)
 			} else {
 				fail = append(fail, r.Host)
 			}
@@ -416,10 +429,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if len(fail) > 0 {
-			m.status = fmt.Sprintf("refreshed %d host(s); unreachable: %s", ok, strings.Join(fail, ", "))
+			m.status = "unreachable: " + strings.Join(fail, ", ")
+			if len(ok) > 0 {
+				m.status = "refreshed " + strings.Join(ok, ", ") + "; " + m.status
+			}
 			m.statusErr = true
 		} else {
-			m.status = fmt.Sprintf("refreshed %d host(s) at %s", ok, time.Now().UTC().Format("15:04:05 UTC"))
+			m.status = "refreshed " + strings.Join(ok, ", ")
 			m.statusErr = false
 		}
 		return m, m.ensureTicker()
@@ -584,12 +600,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// startRefresh kicks off discovery for the selected host (all=false) or all hosts.
+// startRefresh kicks off discovery for the selected host (all=false) or all
+// hosts. Hosts already in flight are skipped, so refreshes started on different
+// hosts run in parallel instead of one blocking the others.
 func (m *Model) startRefresh(all bool) (tea.Model, tea.Cmd) {
-	if m.refreshing {
-		m.status = "refresh already running"
-		return m, nil
-	}
 	hosts := m.hosts
 	if !all && m.curCol > 0 && m.curCol <= len(m.cols) {
 		hostName := m.cols[m.curCol-1].Host
@@ -600,13 +614,27 @@ func (m *Model) startRefresh(all bool) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-	names := make([]string, len(hosts))
-	for i, h := range hosts {
+	var todo []Host
+	for _, h := range hosts {
+		if !m.refreshingHosts[h.Name] {
+			todo = append(todo, h)
+		}
+	}
+	if len(todo) == 0 {
+		m.status = "refresh already running"
+		return m, nil
+	}
+	names := make([]string, len(todo))
+	for i, h := range todo {
 		names[i] = h.Name
 	}
 	m.status, m.statusErr = "refreshing "+strings.Join(names, ", ")+"…", false
-	return m, m.beginRefresh(hosts)
+	return m, m.beginRefresh(todo)
 }
+
+// syncRefreshing keeps the global in-flight flag in step with the per-host set,
+// so a completing batch doesn't clear the indicator while another still runs.
+func (m *Model) syncRefreshing() { m.refreshing = len(m.refreshingHosts) > 0 }
 
 // --- view ---
 
@@ -774,7 +802,7 @@ func (m *Model) cellTextLive(c cell) string {
 	txt := c.text()
 	for _, r := range c.replicas {
 		if m.runningJobFor(r) != nil {
-			txt += spinnerFrames[m.spin%len(spinnerFrames)]
+			txt += m.spinnerFrame()
 			break
 		}
 	}
@@ -955,6 +983,18 @@ func centerStr(s string, w int) string {
 	return strings.Repeat(" ", left) + s + strings.Repeat(" ", w-sw-left)
 }
 
+// centerButtons appends a button row centered to the dialog body's widest line,
+// so the box width is set by the form fields and the buttons sit in the middle.
+func centerButtons(body, buttons string) string {
+	w := 0
+	for _, ln := range strings.Split(body, "\n") {
+		if lw := lipgloss.Width(ln); lw > w {
+			w = lw
+		}
+	}
+	return body + centerStr(buttons, w)
+}
+
 func (m *Model) tableView(h int) string {
 	nameW, sizeW, colWs := m.colWidths()
 	end := m.visibleCols(nameW, colWs)
@@ -1032,9 +1072,9 @@ func (m *Model) tableView(h int) string {
 			label = host + " " + info
 		}
 		if m.refreshingHosts[host] {
-			sp := " " + spinnerFrames[m.spin%len(spinnerFrames)]
+			sp := spinnerFrames[m.spin%len(spinnerFrames)]
 			if lipgloss.Width(label)+lipgloss.Width(sp) <= span {
-				label += sp
+				label = sp + label
 			}
 		}
 		hdr := centerStr(label, span)
@@ -1066,8 +1106,6 @@ func (m *Model) tableView(h int) string {
 			b.WriteString(styleErr.Render(hdr))
 		case isCurCol(ci): // column indicator, matching the cyan fill-bar below
 			b.WriteString(styleCyan.Render(hdr))
-		case m.unreach[m.cols[ci].Host]:
-			b.WriteString(styleDim.Render(hdr))
 		default:
 			b.WriteString(styleName.Render(hdr))
 		}
@@ -1132,9 +1170,6 @@ func (m *Model) tableView(h int) string {
 				if len(c.replicas) == 1 {
 					st = cellStyle(c.replicas[0])
 				}
-			}
-			if m.unreach[m.cols[ci].Host] {
-				st = styleDim
 			}
 			if onRow {
 				st = st.Background(rowGuideBG)
@@ -1232,14 +1267,18 @@ func snapList(snaps []Snapshot, n int) string {
 }
 
 func (m *Model) footerView() string {
-	keys := "q quit · ? help · ←↓↑→ move · Tab focus · s snap · y sync · r/R refresh · h hidden"
-	if m.hiddenN > 0 {
-		mark := "+"
-		if m.showHidden {
-			mark = "-"
-		}
-		keys += fmt.Sprintf("(%s%d)", mark, m.hiddenN)
-	}
+	// Each hint highlights its trigger key in cyan inside the word (the obvious
+	// arrow/?-help keys are omitted). Note `y` is mid-word in "sync".
+	key := func(s string) string { return styleCyan.Render(s) }
+	txt := func(s string) string { return styleStatus.Render(s) }
+	keys := strings.Join([]string{
+		key("q") + txt("uit"),
+		key("Tab") + txt(" focus"),
+		key("s") + txt("nap"),
+		txt("s") + key("y") + txt("nc"),
+		key("r") + txt("efresh"),
+		key("h") + txt("idden"),
+	}, txt(" · "))
 	statusStr := m.status
 	if m.refreshing {
 		statusStr = "⟳ " + statusStr
@@ -1254,7 +1293,7 @@ func (m *Model) footerView() string {
 	} else {
 		line = styleStatusMsg.Render(statusStr)
 	}
-	line += strings.Repeat(" ", gap) + styleStatus.Render(keys)
+	line += strings.Repeat(" ", gap) + keys
 	return line
 }
 
@@ -1282,7 +1321,7 @@ states/colors: white synced · green ahead (sole holder of newest snapshot) ·
                yellow modified (holds newest snapshot, has uncommitted writes) ·
                gray stale (missing newest snapshot) · red diverged ·
                cyan resumable · dim clone
-column dim = host unreachable at last refresh
+dim host header = host unreachable at last refresh
 
 (prune actions arrive in the next milestone)
 
@@ -1356,7 +1395,6 @@ func (m *Model) openSnapshotDialog() {
 	in.Prompt = ""
 	in.CharLimit = 64
 	in.Width = 28
-	in.TextStyle = lipgloss.NewStyle().Underline(true)
 	in.SetValue(time.Now().UTC().Format("20060102"))
 	in.CursorEnd()
 	in.Focus()
@@ -1437,10 +1475,9 @@ func (m *Model) submitDialog() tea.Cmd {
 		return nil
 	}
 	m.dialog = nil
-	m.refreshing = true
 	m.status, m.statusErr = fmt.Sprintf("creating %s@%s on %s (job %s)…",
 		d.dataset, name, d.host.Name, spec.ID), false
-	return runSnapshotCmd(d.host, spec)
+	return tea.Batch(m.markBusy(d.host), runSnapshotCmd(d.host, spec))
 }
 
 // --- dialog rendering ---
@@ -1502,25 +1539,22 @@ func checkbox(label string, checked, focused bool) string {
 func (m *Model) dialogView() string {
 	d := m.dialog
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s\n", styleFieldLabel.Render("host    "), d.host.Name+"  ("+d.host.URL()+")")
-	fmt.Fprintf(&b, "%s %s\n\n", styleFieldLabel.Render("dataset "), d.dataset)
+	fmt.Fprintf(&b, "%s %s\n\n", styleFieldLabel.Render("dataset:"), d.host.Name+":"+d.dataset)
 	mark := "  "
 	if d.focus == formFocusName {
 		mark = styleFocusMark.Render("› ")
 	}
-	fmt.Fprintf(&b, "%s%s %s\n\n", mark, styleFieldLabel.Render("name"), d.input.View())
+	b.WriteString(styleFieldLabel.Render("snapshot name:") + "\n")
+	fmt.Fprintf(&b, "%s%s\n\n", mark, d.input.View())
+	b.WriteString(styleFieldLabel.Render("options:") + "\n")
 	b.WriteString(checkbox("recursive (-r)", d.recursive, d.focus == formFocusRecursive) + "\n")
-	if cmd, err := buildSnapshotCmd(d.host.NeedSudo(), d.dataset,
-		strings.TrimSpace(d.input.Value()), d.recursive); err == nil {
-		b.WriteString("\n" + styleFieldLabel.Render("will run ") + styleName.Render(cmd) + "\n")
-	}
 	if d.errMsg != "" {
 		b.WriteString("\n" + styleErr.Render("⚠ "+d.errMsg) + "\n")
 	}
-	b.WriteString("\n" + button("Create", d.focus == formFocusOK) + "   " +
-		button("Cancel", d.focus == formFocusCancel) + "\n")
-	b.WriteString("\n" + styleDim.Render("Tab/↑↓ move · Space toggle · Enter ok · Esc cancel"))
-	return dialogBox("Create snapshot", b.String())
+	b.WriteString("\n")
+	buttons := button("Create", d.focus == formFocusOK) + "   " +
+		button("Cancel", d.focus == formFocusCancel)
+	return dialogBox("Create snapshot", centerButtons(b.String(), buttons))
 }
 
 // --- snapshot execution ---
@@ -1547,7 +1581,8 @@ func runSnapshotCmd(h Host, spec jobSpec) tea.Cmd {
 }
 
 func (m *Model) onSnapDone(msg snapDoneMsg) (tea.Model, tea.Cmd) {
-	m.refreshing = false
+	delete(m.refreshingHosts, msg.host.Name)
+	m.syncRefreshing()
 	switch {
 	case msg.err != nil:
 		m.status, m.statusErr = "snapshot job: "+msg.err.Error(), true
@@ -1629,7 +1664,6 @@ func (m *Model) openSyncDialog() {
 	in.CharLimit = 256
 	in.Width = 44
 	in.Placeholder = "host:pool/dataset, comma-separated"
-	in.TextStyle = lipgloss.NewStyle().Underline(true)
 	d := &syncDialog{
 		src: src, srcHost: srcHost,
 		plans: plans, checked: map[int]bool{}, custom: in, intermediate: true,
@@ -1771,7 +1805,6 @@ func (m *Model) submitSyncDialog() tea.Cmd {
 	}
 	srcLabel := d.srcHost.Name + ":" + d.src.Dataset.Name
 	m.syncDlg = nil
-	m.refreshing = true
 	m.status, m.statusErr = fmt.Sprintf("syncing %s → %d destination(s)…", srcLabel, len(launches)), false
 	srcHost := d.srcHost
 	hostSet := map[string]Host{srcHost.Name: srcHost}
@@ -1786,7 +1819,7 @@ func (m *Model) submitSyncDialog() tea.Cmd {
 	for _, h := range hostSet {
 		affected = append(affected, h)
 	}
-	return runSyncJobs(srcHost, specs, labels, affected)
+	return tea.Batch(m.markBusy(affected...), runSyncJobs(srcHost, specs, labels, affected))
 }
 
 type syncResult struct {
@@ -1836,7 +1869,10 @@ func runSyncJobs(srcHost Host, specs []jobSpec, labels []string, affected []Host
 }
 
 func (m *Model) onSyncDone(msg syncDoneMsg) (tea.Model, tea.Cmd) {
-	m.refreshing = false
+	for _, h := range msg.affected {
+		delete(m.refreshingHosts, h.Name)
+	}
+	m.syncRefreshing()
 	done, running, failed := 0, 0, 0
 	var failLines []string
 	for _, r := range msg.results {
@@ -1893,11 +1929,8 @@ func (m *Model) syncDialogView() string {
 	if len(srcSnaps) > 0 {
 		latest = "  @" + srcSnaps[len(srcSnaps)-1].Name
 	}
-	fmt.Fprintf(&b, "%s %s%s\n", styleFieldLabel.Render("source  "),
+	fmt.Fprintf(&b, "%s %s%s\n", styleFieldLabel.Render("source:"),
 		d.srcHost.Name+":"+d.src.Dataset.Name, latest)
-	if d.src.Dataset.Encrypted() {
-		b.WriteString(styleFieldLabel.Render("        ") + " encrypted — raw send (-w)\n")
-	}
 	b.WriteString("\n" + styleFieldLabel.Render("destinations:") + "\n")
 	sel := 0
 	for i, p := range d.plans {
@@ -1912,29 +1945,37 @@ func (m *Model) syncDialogView() string {
 			if p.Kind == planIncompatible {
 				st = styleDim.Foreground(lipgloss.Color("1"))
 			}
-			b.WriteString("      " + st.Render(fmt.Sprintf("%-28s %s", p.DestLabel(), reason)) + "\n")
+			b.WriteString("  " + st.Render("[ ] "+fmt.Sprintf("%-28s %s", p.DestLabel(), reason)) + "\n")
 		}
 	}
 	mark := "  "
 	if d.focus == len(d.selectable) {
 		mark = styleFocusMark.Render("› ")
 	}
-	b.WriteString("\n" + mark + styleFieldLabel.Render("new dest") + " " + d.custom.View() +
-		styleDim.Render("  (full send)") + "\n")
-	b.WriteString("\n" + checkbox("send intermediate snapshots (-I)", d.intermediate,
+	// Indent the input to the destination-label column (after "  [ ] ").
+	b.WriteString(mark + "    " + d.custom.View() + "\n")
+	b.WriteString("\n" + styleFieldLabel.Render("options:") + "\n")
+	b.WriteString(checkbox("send intermediate snapshots (-I)", d.intermediate,
 		d.focus == len(d.selectable)+1) + "\n")
+	if d.src.Dataset.Encrypted() {
+		b.WriteString("  " + styleDim.Render("[x] raw send (-w)  (required for encrypted source)") + "\n")
+	}
 	if d.errMsg != "" {
 		b.WriteString("\n" + styleErr.Render("⚠ "+d.errMsg) + "\n")
 	}
-	b.WriteString("\n" + button("Sync", d.focus == len(d.selectable)+2) + "   " +
-		button("Cancel", d.focus == len(d.selectable)+3) + "\n")
-	b.WriteString("\n" + styleDim.Render("Tab/↑↓ move · Space toggle · Enter ok · Esc cancel"))
-	return dialogBox("Sync (incremental send)", b.String())
+	b.WriteString("\n")
+	buttons := button("Sync", d.focus == len(d.selectable)+2) + "   " +
+		button("Cancel", d.focus == len(d.selectable)+3)
+	return dialogBox("Sync", centerButtons(b.String(), buttons))
 }
 
 // --- live job progress (spinner + polling) ---
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// spinnerFrame is the current braille spinner glyph (shared by every live
+// indicator: refresh, running jobs, transfers).
+func (m *Model) spinnerFrame() string { return spinnerFrames[m.spin%len(spinnerFrames)] }
 
 type tickMsg time.Time
 

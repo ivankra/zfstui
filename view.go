@@ -55,9 +55,9 @@ func vrow(text string, style lipgloss.Style, open func() *objView) viewLine {
 	return viewLine{text: text, style: style, open: open}
 }
 
-// toViews wraps the []string emitted by propsDump / appendVerbatim into plain
-// viewLines (tabs expanded; any embedded ANSI, e.g. the cyan header/label, is
-// preserved by the no-op styleNormal).
+// toViews wraps the []string emitted by propsDump into plain viewLines (tabs
+// expanded; any embedded ANSI, e.g. the cyan header/label, is preserved by the
+// no-op styleNormal).
 func toViews(ss []string) []viewLine {
 	out := make([]viewLine, 0, len(ss))
 	for _, s := range ss {
@@ -271,9 +271,13 @@ func (m *Model) findPool(host, pool string) *Pool {
 	return nil
 }
 
-func (m *Model) findGroup(name string) *Group {
+// findGroupByKey re-resolves a group across reloads by its stable Key (smallest
+// member host:name). DisplayName can collide (e.g. a pool's root dataset and a
+// child literally named after the pool both render as "cml-root"), so name is
+// NOT safe for lookup — that mixed up which group the Details pane showed.
+func (m *Model) findGroupByKey(key string) *Group {
 	for _, g := range m.data.Groups {
-		if g.DisplayName == name {
+		if g.Key() == key {
 			return g
 		}
 	}
@@ -296,9 +300,9 @@ func (m *Model) findJob(host, id string) *JobInfo {
 // --- group / replica views ---
 
 func (m *Model) groupView(g *Group) *objView {
-	name := g.DisplayName
+	key := g.Key()
 	return &objView{build: func(m *Model, full bool) ([]string, []viewLine) {
-		gg := m.findGroup(name)
+		gg := m.findGroupByKey(key)
 		if gg == nil {
 			gg = g
 		}
@@ -308,7 +312,7 @@ func (m *Model) groupView(g *Group) *objView {
 		if len(lines) > 0 && lines[0].text == "" {
 			lines = lines[1:]
 		}
-		return []string{"group " + name}, lines
+		return []string{"group " + gg.DisplayName}, lines
 	}}
 }
 
@@ -337,7 +341,7 @@ func (m *Model) replicaTable(members []*Replica, full bool) []viewLine {
 			if replicaKeyOf(r) == j.Meta["dest"] {
 				verb = "recv"
 			}
-			latest += "  " + spinnerFrames[m.spin%len(spinnerFrames)] + verb + " " + jobProgressLine(j)
+			latest += "  " + m.spinnerFrame() + verb + " " + jobProgressLine(j)
 		}
 		rows = append(rows, []string{name, replicaStatus(r), used, avail, nsnaps, latest})
 	}
@@ -389,9 +393,6 @@ func (m *Model) datasetContent(d *Dataset, full bool) ([]string, []viewLine) {
 		info += " +" + humanShort(d.Written)
 	}
 	segs = append(segs, info)
-	if d.Encrypted() {
-		segs = append(segs, d.Encryption)
-	}
 
 	var lines []viewLine
 	if full {
@@ -440,7 +441,7 @@ func (m *Model) datasetContent(d *Dataset, full bool) ([]string, []viewLine) {
 		var rows [][]string
 		for i := len(snaps) - 1; i >= 0; i-- {
 			s := snaps[i]
-			rows = append(rows, []string{s.Name, orDash(humanShort(s.Used)), humanShort(s.Refer), orDash(s.GUID), snapCreated(s.Creation)})
+			rows = append(rows, []string{s.Name, orDash(humanShort(s.Used)), humanShort(s.Refer), orDash(s.GUID), strings.TrimSuffix(snapCreated(s.Creation), " UTC")})
 		}
 		open := func(i int) *objView { return snapshotView(snaps[len(snaps)-1-i]) }
 		lines = append(lines, vtable(full, headers, rows, map[int]bool{1: true, 2: true}, nil, open)...)
@@ -928,13 +929,13 @@ func jobContent(j JobInfo, full bool) ([]string, []viewLine) {
 		lines = append(lines, vline(fmt.Sprintf("%-9s %s", k, j.Meta[k]), styleNormal))
 	}
 	if cmd := j.Meta["command"]; cmd != "" {
-		lines = append(lines, vsection("script"))
+		lines = append(lines, vline("", styleNormal), vsection("script"))
 		for _, cl := range strings.Split(strings.TrimRight(cmd, "\n"), "\n") {
 			lines = append(lines, vline(cl, styleNormal))
 		}
 	}
 	if log := strings.TrimRight(j.Log, "\n"); log != "" {
-		lines = append(lines, vsection("log"))
+		lines = append(lines, vline("", styleNormal), vsection("log"))
 		for _, ll := range strings.Split(log, "\n") {
 			lines = append(lines, vline(expandTabs(stripCtrl(ll)), styleNormal))
 		}
@@ -954,10 +955,60 @@ func diskContent(d Disk, full bool) ([]string, []viewLine) {
 	lines := []viewLine{
 		vline(fmt.Sprintf("%s %s, SMART: %s", humanShort(d.Size), strings.ToUpper(diskType(d)), diskHealth(d)), styleNormal),
 	}
+	if len(d.Parts) > 0 {
+		headers := []string{"PARTITION", "SIZE", "FSTYPE", "LABEL", "MOUNTPOINT"}
+		var rows [][]string
+		for _, p := range d.Parts {
+			rows = append(rows, []string{
+				firstNonEmpty(p["NAME"], p["KNAME"]),
+				partSize(p),
+				p["FSTYPE"],
+				firstNonEmpty(p["PARTLABEL"], p["LABEL"]),
+				firstNonEmpty(p["MOUNTPOINT"], p["MOUNTPOINTS"]),
+			})
+		}
+		host, parts := d.Host, d.Parts
+		open := func(i int) *objView { return partitionView(host, parts[i]) }
+		lines = append(lines, vtable(full, headers, rows, map[int]bool{1: true}, nil, open)...)
+	}
 	if full {
 		// model/serial/wwn/dev all live in the lsblk dump; SMART verbatim last.
 		lines = append(lines, toViews(propsDump(nil, d.Props, nil))...)
-		lines = append(lines, toViews(appendVerbatim(nil, "smartctl -a", d.Smart))...)
+		if smart := strings.TrimRight(d.Smart, "\n"); strings.TrimSpace(smart) != "" {
+			lines = append(lines, vline("", styleNormal), vsection("smartctl -a"))
+			for _, ln := range strings.Split(smart, "\n") {
+				lines = append(lines, vline(stripCtrl(ln), styleNormal))
+			}
+		}
+	}
+	return segs, lines
+}
+
+// partSize renders a partition's lsblk SIZE (bytes, from `-b`) human-readably.
+func partSize(p map[string]string) string {
+	if n, err := strconv.ParseInt(p["SIZE"], 10, 64); err == nil {
+		return humanShort(n)
+	}
+	return p["SIZE"]
+}
+
+func partitionView(host string, p map[string]string) *objView {
+	return &objView{build: func(m *Model, full bool) ([]string, []viewLine) { return partitionContent(host, p, full) }}
+}
+
+func partitionContent(host string, p map[string]string, full bool) ([]string, []viewLine) {
+	dev := firstNonEmpty(p["PATH"], "/dev/"+firstNonEmpty(p["NAME"], p["KNAME"]))
+	segs := []string{"partition " + host + ":" + dev}
+	summary := partSize(p)
+	if fs := p["FSTYPE"]; fs != "" {
+		summary += " " + fs
+	}
+	if mnt := firstNonEmpty(p["MOUNTPOINT"], p["MOUNTPOINTS"]); mnt != "" {
+		summary += " → " + mnt
+	}
+	lines := []viewLine{vline(summary, styleNormal)}
+	if full {
+		lines = append(lines, toViews(propsDump(nil, p, nil))...)
 	}
 	return segs, lines
 }
@@ -1177,19 +1228,6 @@ func expandTabs(s string) string {
 	return b.String()
 }
 
-// appendVerbatim adds a verbatim text block under a left-aligned cyan label
-// (e.g. "zpool status", "smartctl -a") — not a centered section header.
-func appendVerbatim(lines []string, title, text string) []string {
-	if strings.TrimSpace(text) == "" {
-		return lines
-	}
-	lines = append(lines, "", styleCyan.Render(title))
-	for _, ln := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
-		lines = append(lines, stripCtrl(ln))
-	}
-	return lines
-}
-
 // propsDump appends the full sorted property map, preceded by a blank line.
 // No centered title — the cyan PROPERTY/VALUE column header labels the block.
 // The SOURCE column is shown only when sources exist (zfs/zpool `get`); maps
@@ -1200,9 +1238,13 @@ func propsDump(lines []string, props, srcs map[string]string) []string {
 	}
 	keys := make([]string, 0, len(props))
 	for k := range props {
-		if !strings.HasPrefix(k, "_") { // synthetic verbatims rendered separately
-			keys = append(keys, k)
+		if strings.HasPrefix(k, "_") { // synthetic verbatims rendered separately
+			continue
 		}
+		if props[k] == "" { // skip empty props (e.g. lsblk's unset FS* columns)
+			continue
+		}
+		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	hasSrc := len(srcs) > 0
