@@ -700,3 +700,48 @@ func TestPropsDumpLayout(t *testing.T) {
 		t.Fatalf("missing guid row: %v", lines)
 	}
 }
+
+// A host whose datasets are all snapshot-less (every group Hidden) must still
+// get its pool columns — field bug: freshly added `iac` was in the db but
+// invisible in the TUI and `status`.
+func TestSnapshotlessHostStillHasColumns(t *testing.T) {
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	states := []HostState{
+		{
+			Host:      "old",
+			Pools:     []Pool{{Host: "old", Name: "tank", Health: "ONLINE"}},
+			Datasets:  []Dataset{{Host: "old", Name: "tank/git", Type: "filesystem", GUID: "d1"}},
+			Snapshots: []Snapshot{{Host: "old", Dataset: "tank/git", Name: "s1", GUID: "g1", Creation: 100}},
+		},
+		{
+			Host:     "new",
+			Pools:    []Pool{{Host: "new", Name: "new-root", Health: "ONLINE"}},
+			Datasets: []Dataset{{Host: "new", Name: "new-root/home", Type: "filesystem", GUID: "d2"}},
+		},
+	}
+	for _, hs := range states {
+		if err := st.PutHostState(hs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m, err := New(st, []Host{{Name: "old"}, {Name: "new"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range m.cols {
+		if c.Host == "new" && c.Pool == "new-root" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("cols %v lack new:new-root", m.cols)
+	}
+	if out := Status(states, nil); !strings.Contains(out, "new:new-root") {
+		t.Errorf("status lacks new:new-root:\n%s", out)
+	}
+}

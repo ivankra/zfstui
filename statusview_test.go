@@ -26,7 +26,7 @@ func TestStatusTable(t *testing.T) {
 			},
 		},
 	}
-	out := Status(Groups(states))
+	out := Status(states, Groups(states))
 	t.Log("\n" + out)
 
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")

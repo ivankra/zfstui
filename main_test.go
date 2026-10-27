@@ -107,7 +107,7 @@ func TestRefreshAndStatusEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := Status(data.Groups)
+	out := Status(data.States, data.Groups)
 	t.Log("\n" + out)
 	if !strings.Contains(out, "git") ||
 		!strings.Contains(out, "srv@20260601") || // unsnapshotted writes (color only)

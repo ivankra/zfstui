@@ -167,7 +167,15 @@ func (m *Model) reload() error {
 		curKey = m.rows[m.curRow].Key()
 	}
 
+	// Columns come from every known pool, not just from visible rows: a host
+	// whose datasets are all snapshot-less (all groups Hidden) must still
+	// show up.
 	colSet := map[colKey]bool{}
+	for _, hs := range data.States {
+		for _, p := range hs.Pools {
+			colSet[colKey{hs.Host, p.Name}] = true
+		}
+	}
 	m.rows = m.rows[:0]
 	m.hiddenN = 0
 	for _, g := range data.Groups {

@@ -856,6 +856,12 @@ TUI is manual for now.
   script/log; the old left-aligned-cyan-label `appendVerbatim` helper was its
   last caller and was deleted. Job windows also gained the missing leading
   blank line before their script/log section headers.
+- 2026-10-27: **columns come from pools, not rows.** TUI and `status` used to
+  build host:pool columns only from members of *visible* groups, so a host
+  with zero snapshots (all groups Hidden — e.g. freshly added `iac`) vanished
+  entirely despite being in the db. Columns are now seeded from every pool in
+  the loaded HostStates (`Status(states, groups)`), plus group members.
+  Regression: TestSnapshotlessHostStillHasColumns.
 - Name: `zfstui`.
 
 ## Initial wishes

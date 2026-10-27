@@ -141,7 +141,7 @@ func cmdStatus(st *Store, showAll bool, specs []string) error {
 		}
 		groups = visible
 	}
-	fmt.Print(Status(groups))
+	fmt.Print(Status(data.States, groups))
 	if hidden > 0 {
 		fmt.Printf("(%d snapshot-less groups hidden; -a shows them)\n", hidden)
 	}

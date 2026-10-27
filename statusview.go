@@ -42,9 +42,16 @@ func CellText(r *Replica) string {
 	return b.String()
 }
 
-// Status renders the groups × host:pool matrix.
-func Status(groups []*Group) string {
+// Status renders the groups × host:pool matrix. Columns cover every pool in
+// states (so hosts whose groups are all hidden still appear) plus any pool
+// referenced by a group member.
+func Status(states []HostState, groups []*Group) string {
 	colSet := map[string]bool{}
+	for _, hs := range states {
+		for _, p := range hs.Pools {
+			colSet[hs.Host+":"+p.Name] = true
+		}
+	}
 	for _, g := range groups {
 		for _, r := range g.Members {
 			colSet[r.Dataset.Host+":"+r.Dataset.Pool()] = true
