@@ -92,8 +92,17 @@ func jobReplicaKeys(j JobInfo) []string {
 
 func indexJobs(states []HostState) map[string][]JobInfo {
 	idx := map[string][]JobInfo{}
+	// One job dir can be seen via two hosts: when zfstui runs ON a fleet host,
+	// the @local probe and that host's ssh probe glob the same /tmp. IDs are
+	// random, so equal ID = same job; first wins (fleet states precede the
+	// appended side hosts, and the fleet copy is the persisted one).
+	seen := map[string]bool{}
 	for _, hs := range states {
 		for _, j := range hs.Jobs {
+			if seen[j.ID] {
+				continue
+			}
+			seen[j.ID] = true
 			for _, k := range jobReplicaKeys(j) {
 				idx[k] = append(idx[k], j)
 			}

@@ -13,13 +13,18 @@ var allowlistRes = []*regexp.Regexp{
 	regexp.MustCompile(`^(sudo -n )?zfs snapshot( -r)? '[^';|&$<>\\]+'$`),
 	regexp.MustCompile(`^(sudo -n )?zfs send (-w|-L -c) -[iI] '[^';|&$<>\\]+@[^';|&$<>\\]+' '[^';|&$<>\\]+@[^';|&$<>\\]+'$`),
 	regexp.MustCompile(`^(sudo -n )?zfs send (-w|-L -c) '[^';|&$<>\\]+@[^';|&$<>\\]+'$`), // full send (new dest)
-	regexp.MustCompile(`^(sudo -n )?zfs send -t '[A-Za-z0-9-]+'$`),
+	regexp.MustCompile(`^(sudo -n )?zfs send -t \$TOKEN$`),                               // TOKEN='…' set by resumeTokenAssignRe
 	// -nP sizing twins are no-op/read-only (never generate stream data):
-	regexp.MustCompile(`^(sudo -n )?zfs send -nP (-w |-L -c )?(-[iI] |-t )?'[^']+'( '[^']+')?$`),
+	regexp.MustCompile(`^(sudo -n )?zfs send -nP (-w |-L -c )?(-[iI] )?'[^']+'( '[^']+')?$`),
+	regexp.MustCompile(`^(sudo -n )?zfs send -nP -t \$TOKEN$`),
 	regexp.MustCompile(`^(sudo -n )?zfs recv -s -u( -o encryption=off)? '[^';|&$<>\\]+'$`),
 	regexp.MustCompile(`^(sudo -n )?zfs receive -A '[^';|&$<>\\]+'$`),
 	regexp.MustCompile(`^(sudo -n )?zfs destroy '[^'@;|&$<>\\]+@[^';|&$<>\\]+'$`),
 }
+
+// resumeTokenAssignRe is the only shape a TOKEN= line (the operand of the
+// `zfs send -t $TOKEN` shapes above) may take in scripts/manual commands.
+var resumeTokenAssignRe = regexp.MustCompile(`^TOKEN='[A-Za-z0-9-]+'$`)
 
 func allowlisted(cmd string) bool {
 	for _, re := range allowlistRes {
@@ -129,12 +134,15 @@ func TestSendRecvCmdShapes(t *testing.T) {
 		t.Errorf("plain full = %q", full)
 	}
 
-	resume, err := buildResumeSendCmd(false, "1-e604ea4bf-e0-789c63a2")
+	assign, resume, err := buildResumeSendCmd(false, "1-e604ea4bf-e0-789c63a2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resume != `zfs send -t '1-e604ea4bf-e0-789c63a2'` || !allowlisted(resume) {
+	if resume != `zfs send -t $TOKEN` || !allowlisted(resume) || !allowlisted(sizeVariant(resume)) {
 		t.Errorf("resume = %q", resume)
+	}
+	if assign != `TOKEN='1-e604ea4bf-e0-789c63a2'` || !resumeTokenAssignRe.MatchString(assign) {
+		t.Errorf("assign = %q", assign)
 	}
 
 	recv, err := buildRecvCmd(true, "tank/bak/git", false)
@@ -157,10 +165,10 @@ func TestSendRecvCmdRejectsBadInput(t *testing.T) {
 	if _, err := buildSendCmd(false, true, true, "tank/x", "a;b", "ok"); err == nil {
 		t.Error("bad base snap accepted")
 	}
-	if _, err := buildResumeSendCmd(false, "short"); err == nil {
+	if _, _, err := buildResumeSendCmd(false, "short"); err == nil {
 		t.Error("short token accepted")
 	}
-	if _, err := buildResumeSendCmd(false, "1-abc'; rm -rf /;'x"); err == nil {
+	if _, _, err := buildResumeSendCmd(false, "1-abc'; rm -rf /;'x"); err == nil {
 		t.Error("evil token accepted")
 	}
 	if _, err := buildRecvCmd(false, "tank/`boom`", false); err == nil {

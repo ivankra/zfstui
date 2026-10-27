@@ -212,7 +212,8 @@ type HostState struct {
 	VDevs     []VDev
 	Disks     []Disk
 	Jobs      []JobInfo
-	BootTime  int64 // unix seconds of last boot (/proc/stat btime); 0 if unknown
+	BootTime  int64  // unix seconds of last boot (/proc/stat btime); 0 if unknown
+	MachineID string // /etc/machine-id; "" if unknown (matches this machine → local twin)
 }
 
 // JobInfo is a zfstui job discovered in /tmp/zfstui-job-* on a host.
@@ -227,6 +228,7 @@ type JobInfo struct {
 	Progress int64             // bytes transferred so far (pv), 0 if unknown
 	Expected int64             // estimated total bytes (zfs send -nP), 0 if unknown
 	Log      string            // tail of ./log (last lines), refreshed each poll
+	Pending  bool              // TUI placeholder for a just-launched job, not yet discovered (never persisted)
 }
 
 // ReplicaState classifies one replica within its group.

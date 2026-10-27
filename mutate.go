@@ -110,16 +110,20 @@ func buildFullSendCmd(sudo, raw bool, dataset, targetSnap string) (string, error
 // Resume tokens are opaque dash-separated alphanumerics.
 var resumeTokenRe = regexp.MustCompile(`^[A-Za-z0-9-]{8,}$`)
 
-// buildResumeSendCmd resumes an interrupted receive (zfs send -t).
-func buildResumeSendCmd(sudo bool, token string) (string, error) {
+// buildResumeSendCmd resumes an interrupted receive (zfs send -t). Tokens
+// run to hundreds of chars, so cmd references $TOKEN and assign is the
+// `TOKEN='…'` line to emit before it (once per shell that runs cmd). $TOKEN
+// is deliberately unquoted: it then expands the same locally and inside the
+// "…" of a remote ssh leg, and the charset check leaves nothing to split/glob.
+func buildResumeSendCmd(sudo bool, token string) (assign, cmd string, err error) {
 	if !resumeTokenRe.MatchString(token) {
-		return "", fmt.Errorf("refusing suspicious resume token %q", token)
+		return "", "", fmt.Errorf("refusing suspicious resume token %q", token)
 	}
-	cmd := "zfs send -t " + shellQuote(token)
+	cmd = "zfs send -t $TOKEN"
 	if sudo {
 		cmd = "sudo -n " + cmd
 	}
-	return cmd, nil
+	return "TOKEN=" + shellQuote(token), cmd, nil
 }
 
 // buildRecvCmd returns the receive side: resumable (-s), never auto-mounted

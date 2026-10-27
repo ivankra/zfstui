@@ -285,6 +285,8 @@ func (m *Model) findGroupByKey(key string) *Group {
 }
 
 func (m *Model) findJob(host, id string) *JobInfo {
+	// (side job hosts — this machine, ad-hoc relays — are merged into
+	// data.States too, see mergeSideJobs)
 	hs := m.findHostState(host)
 	if hs == nil {
 		return nil
@@ -901,16 +903,16 @@ func (m *Model) jobView(host, id string) *objView {
 	return &objView{build: func(m *Model, full bool) ([]string, []viewLine) {
 		j := m.findJob(host, id)
 		if j == nil {
-			return []string{"job " + host + ":" + id}, []viewLine{vline("job not found (finished and pruned?)", styleNormal)}
+			return []string{"job " + displayHost(host) + ":" + id}, []viewLine{vline("job not found (finished and pruned?)", styleNormal)}
 		}
 		return jobContent(*j, full)
 	}}
 }
 
 func jobContent(j JobInfo, full bool) ([]string, []viewLine) {
-	segs := []string{"job " + j.Host + ":" + j.ID}
+	segs := []string{"job " + displayHost(j.Host) + ":" + j.ID}
 	lines := []viewLine{
-		vline("host      "+j.Host, styleNormal),
+		vline("host      "+displayHost(j.Host), styleNormal),
 		vline("kind      "+j.Kind, styleNormal),
 		vline("state     "+j.State+"   ("+j.Status+")", styleNormal),
 		vline("dir       "+j.Dir, styleNormal),
@@ -920,13 +922,25 @@ func jobContent(j JobInfo, full bool) ([]string, []viewLine) {
 	}
 	var keys []string
 	for k := range j.Meta {
-		if k != "command" && k != "id" && k != "kind" && k != "host" {
+		if k != "command" && k != "manual" && k != "id" && k != "kind" && k != "host" {
 			keys = append(keys, k)
 		}
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		lines = append(lines, vline(fmt.Sprintf("%-9s %s", k, j.Meta[k]), styleNormal))
+		v := j.Meta[k]
+		if k == "runner" {
+			v = displayHost(v)
+		}
+		lines = append(lines, vline(fmt.Sprintf("%-9s %s", k, v), styleNormal))
+	}
+	// manual: the essence of the job in plain shell (no buffering/progress/
+	// defensive plumbing) — for comprehension and for running it by hand.
+	if man := j.Meta["manual"]; man != "" {
+		lines = append(lines, vline("", styleNormal), vsection("manual"))
+		for _, ml := range strings.Split(man, "\n") {
+			lines = append(lines, vline(ml, styleNormal))
+		}
 	}
 	if cmd := j.Meta["command"]; cmd != "" {
 		lines = append(lines, vline("", styleNormal), vsection("script"))

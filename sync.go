@@ -112,78 +112,193 @@ func customDestPlan(src *Replica, snapsBy map[string][]Snapshot, destHost, destD
 
 var destSpecRe = regexp.MustCompile(`^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$`)
 
-// syncJob builds the job that runs DETACHED ON THE SOURCE HOST: zfs send
-// piped (through mbuffer when available) to zfs recv — over ssh for remote
-// destinations, a plain pipe for pool-to-pool on the same host.
+// syncJob builds the job that runs DETACHED ON runHost: zfs send piped
+// (through mbuffer when available) to zfs recv. Each end runs directly when
+// it IS runHost, otherwise over ssh from runHost:
 //
-// Remote destinations use a per-job ssh ControlMaster: the master
-// authenticates while the control node's forwarded agent (-A at launch) is
-// still alive, then `touch ssh-ok` tells the launcher it may disconnect;
-// the pipeline rides the master afterwards, no agent needed.
-func syncJob(srcHost, destHost Host, src *Replica, p syncPlan, intermediate bool) (jobSpec, error) {
+//	runHost = source       push:  send | ssh dst recv          (the default)
+//	runHost = destination  pull:  ssh src send | recv
+//	anything else          relay: ssh src send | ssh dst recv  (incl. @local)
+//
+// Remote ends use per-job ssh ControlMasters (cm-src, cm-dst): they
+// authenticate while the launcher's forwarded agent (-A at launch; a local
+// runner simply has the user's agent) is still alive, then `touch ssh-ok`
+// tells the launcher it may disconnect; the pipeline rides the masters.
+func syncJob(srcHost, destHost, runHost Host, src *Replica, p syncPlan, intermediate bool) (jobSpec, error) {
 	if !p.Selectable() {
 		return jobSpec{}, fmt.Errorf("plan for %s is not executable: %s", p.DestLabel(), p.Reason)
 	}
-	var sendCmd string
-	var err error
+	prelude, sendCmd, recvCmd, err := syncCmds(srcHost, destHost, src, p, intermediate)
+	if err != nil {
+		return jobSpec{}, err
+	}
+	sendRemote := runHost.Name != srcHost.Name
+	recvRemote := runHost.Name != destHost.Name
+	var sssh, dssh string
+	if sendRemote {
+		if sssh, err = jobSSH(srcHost, "cm-src"); err != nil {
+			return jobSpec{}, err
+		}
+	}
+	if recvRemote {
+		if dssh, err = jobSSH(destHost, "cm-dst"); err != nil {
+			return jobSpec{}, err
+		}
+	}
+	sendPart, sizePart, recvPart := sendCmd, sizeVariant(sendCmd), recvCmd
+	if sendRemote {
+		sendPart = `$SSSH "` + sendCmd + `"`
+		sizePart = `$SSSH "` + sizeVariant(sendCmd) + `"`
+	}
+	if recvRemote {
+		recvPart = `$DSSH "` + recvCmd + `"`
+	}
+
+	// The script is shown in the job window: keep lines short (wrapped
+	// blocks, `\`-continued pipes, shared $SSHO, long tokens in $TOKEN).
+	var b strings.Builder
+	if prelude != "" {
+		b.WriteString(prelude + "\n")
+	}
+	b.WriteString("if command -v mbuffer >/dev/null 2>&1; then\n" +
+		"  ZBUF=\"mbuffer -q -s 128k -m 128M\"\n" +
+		"else\n" +
+		"  echo \"note: mbuffer not found, sending unbuffered\"\n" +
+		"  ZBUF=\"cat\"\n" +
+		"fi\n")
+	if sendRemote || recvRemote {
+		fmt.Fprintf(&b, "SSHO=%q\n", jobSSHOpts)
+	}
+	// ssh checks first: their stderr (the real reason: DNS/timeout/auth)
+	// lands in ./log, the echo says which leg failed and from where.
+	sshCheck := func(v, what, dest string, rc int) {
+		fmt.Fprintf(&b, "$%s true || {\n"+
+			"  echo \"cannot reach %s %s over ssh from $(hostname)\"\n"+
+			"  echo \"(no agent/keys? DNS? down?) SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-unset}\"\n"+
+			"  exit %d\n"+
+			"}\n", v, what, dest, rc)
+	}
+	if sendRemote {
+		fmt.Fprintf(&b, "SSSH=%q\n", sssh)
+		sshCheck("SSSH", "source", srcHost.Dest(), 80)
+	}
+	if recvRemote {
+		fmt.Fprintf(&b, "DSSH=%q\n", dssh)
+		sshCheck("DSSH", "destination", destHost.Dest(), 81)
+	}
+	if sendRemote || recvRemote {
+		b.WriteString("touch ssh-ok\n")
+	}
+	// Progress instrumentation: expected stream size via a no-op send (-nP),
+	// live byte counts via pv into ./progress (2s interval). Optional both.
+	fmt.Fprintf(&b, "%s 2>/dev/null \\\n  | awk '$1==\"size\"{s=$2} END{if(s)print s}' > expected\n", sizePart)
+	b.WriteString("if command -v pv >/dev/null 2>&1; then\n" +
+		"  PROG=\"pv -nb -i 2\"\n" +
+		"else\n" +
+		"  PROG=\"cat\"\n" +
+		"fi\n")
+	fmt.Fprintf(&b, "%s \\\n  | $ZBUF | $PROG 2>>progress \\\n  | %s\n", sendPart, recvPart)
+	b.WriteString("rc=$?\n")
+	if sendRemote {
+		b.WriteString("$SSSH -O exit >/dev/null 2>&1 || true\n")
+	}
+	if recvRemote {
+		b.WriteString("$DSSH -O exit >/dev/null 2>&1 || true\n")
+	}
+	b.WriteString("exit $rc")
+
+	return jobSpec{
+		ID: newJobID(), Kind: "sync", Host: runHost.Name,
+		Command:   b.String(),
+		WaitStart: sendRemote || recvRemote,
+		Meta: map[string]string{
+			"src":          srcHost.Name + ":" + src.Dataset.Name,
+			"dest":         p.DestLabel(),
+			"runner":       runHost.Name,
+			"base":         p.BaseName,
+			"target":       p.TargetName,
+			"resume":       fmt.Sprint(p.Kind == planResume),
+			"full":         fmt.Sprint(p.Kind == planFull),
+			"intermediate": fmt.Sprint(intermediate),
+			"manual":       manualSyncCmd(srcHost, destHost, runHost, prelude, sendCmd, recvCmd),
+		},
+	}, nil
+}
+
+// syncCmds builds the bare send and recv command lines (mutate.go) for a
+// plan. prelude (resume only: `TOKEN='…'`) must precede them in the shell
+// that runs the pipeline.
+func syncCmds(srcHost, destHost Host, src *Replica, p syncPlan, intermediate bool) (prelude, sendCmd, recvCmd string, err error) {
 	raw := src.Dataset.Encrypted()
 	switch p.Kind {
 	case planResume:
-		sendCmd, err = buildResumeSendCmd(srcHost.NeedSudo(), p.Dest.Dataset.ResumeToken)
+		prelude, sendCmd, err = buildResumeSendCmd(srcHost.NeedSudo(), p.Dest.Dataset.ResumeToken)
 	case planFull:
 		sendCmd, err = buildFullSendCmd(srcHost.NeedSudo(), raw, src.Dataset.Name, p.TargetName)
 	default:
 		sendCmd, err = buildSendCmd(srcHost.NeedSudo(), raw, intermediate, src.Dataset.Name, p.BaseName, p.TargetName)
 	}
 	if err != nil {
-		return jobSpec{}, err
+		return "", "", "", err
 	}
 	// Full send of an unencrypted source: create the new dataset unencrypted
 	// (see buildRecvCmd) — otherwise an encrypted destination parent would
 	// demand its key loaded just to create the child.
 	plainNew := p.Kind == planFull && !raw
-	recvCmd, err := buildRecvCmd(destHost.NeedSudo(), p.Dest.Dataset.Name, plainNew)
-	if err != nil {
-		return jobSpec{}, err
-	}
+	recvCmd, err = buildRecvCmd(destHost.NeedSudo(), p.Dest.Dataset.Name, plainNew)
+	return prelude, sendCmd, recvCmd, err
+}
 
-	local := srcHost.Name == destHost.Name
-	var b strings.Builder
-	b.WriteString(`if command -v mbuffer >/dev/null 2>&1; then ZBUF="mbuffer -q -s 128k -m 128M"; else echo "note: mbuffer not found, sending unbuffered"; ZBUF="cat"; fi` + "\n")
-	// Progress instrumentation: expected stream size via a no-op send (-nP),
-	// live byte counts via pv into ./progress (2s interval). Optional both.
-	fmt.Fprintf(&b, "%s 2>/dev/null | awk '$1==\"size\"{s=$2} END{if(s)print s}' > expected\n", sizeVariant(sendCmd))
-	b.WriteString(`if command -v pv >/dev/null 2>&1; then PROG="pv -nb -i 2"; else PROG="cat"; fi` + "\n")
-	if local {
-		fmt.Fprintf(&b, "%s | $ZBUF | $PROG 2>>progress | %s", sendCmd, recvCmd)
-	} else {
-		if !destSpecRe.MatchString(destHost.Dest()) {
-			return jobSpec{}, fmt.Errorf("refusing suspicious ssh destination %q", destHost.Dest())
-		}
-		dssh := "ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30" +
-			" -o ControlMaster=auto -o ControlPath=$PWD/cm -o ControlPersist=600"
-		if destHost.Port != 0 {
-			dssh += fmt.Sprintf(" -p %d", destHost.Port)
-		}
-		dssh += " " + destHost.Dest()
-		fmt.Fprintf(&b, "DSSH=%q\n", dssh)
-		b.WriteString(`$DSSH true || { echo "cannot reach destination over ssh (no agent/keys? dest down?); SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-unset}"; exit 80; }` + "\n")
-		b.WriteString("touch ssh-ok\n")
-		fmt.Fprintf(&b, "%s | $ZBUF | $PROG 2>>progress | $DSSH \"%s\"\n", sendCmd, recvCmd)
-		b.WriteString("rc=$?\n$DSSH -O exit >/dev/null 2>&1 || true\nexit $rc")
-	}
+// jobSSHOpts are the ssh options shared by a job's remote legs; the script
+// holds them in $SSHO (expanded when SSSH/DSSH are assigned).
+const jobSSHOpts = "-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30" +
+	" -o ControlMaster=auto -o ControlPersist=600"
 
-	return jobSpec{
-		ID: newJobID(), Kind: "sync", Host: srcHost.Name,
-		Command:   b.String(),
-		WaitStart: !local,
-		Meta: map[string]string{
-			"src":    srcHost.Name + ":" + src.Dataset.Name,
-			"dest":   p.DestLabel(),
-			"base":   p.BaseName,
-			"target": p.TargetName,
-			"resume": fmt.Sprint(p.Kind == planResume),
-			"full":   fmt.Sprint(p.Kind == planFull),
-		},
-	}, nil
+// jobSSH is the ssh command a job uses to reach h, multiplexed over a
+// per-job ControlMaster socket in the job dir. Needs $SSHO set first.
+func jobSSH(h Host, socket string) (string, error) {
+	if !destSpecRe.MatchString(h.Dest()) {
+		return "", fmt.Errorf("refusing suspicious ssh destination %q", h.Dest())
+	}
+	s := "ssh $SSHO -o ControlPath=$PWD/" + socket
+	if h.Port != 0 {
+		s += fmt.Sprintf(" -p %d", h.Port)
+	}
+	return s + " " + h.Dest(), nil
+}
+
+// plainSSH is the human-readable ssh prefix for the manual command.
+func plainSSH(h Host) string {
+	if h.Port != 0 {
+		return fmt.Sprintf("ssh -p %d %s", h.Port, h.Dest())
+	}
+	return "ssh " + h.Dest()
+}
+
+// manualSyncCmd renders the essence of the job for humans: the bare
+// send | recv pipeline as run on runHost (no buffering/progress/defensive
+// plumbing), plus — unless that already IS it — the same transfer relayed
+// from the user's own terminal, which works whenever zfstui reaches both.
+// Display only (job window "manual" section); never executed by zfstui.
+// prelude (`TOKEN='…'`, may be empty) heads each block: each runs in its own
+// shell.
+func manualSyncCmd(srcHost, destHost, runHost Host, prelude, sendCmd, recvCmd string) string {
+	leg := func(h Host, cmd string, remote bool) string {
+		if !remote {
+			return cmd
+		}
+		return plainSSH(h) + ` "` + cmd + `"`
+	}
+	pipe := func(run string) string {
+		out := leg(srcHost, sendCmd, run != srcHost.Name) + " \\\n  | " + leg(destHost, recvCmd, run != destHost.Name)
+		if prelude != "" {
+			out = prelude + "\n" + out
+		}
+		return out
+	}
+	out := "# on " + displayHost(runHost.Name) + ":\n" + pipe(runHost.Name)
+	if runHost.Name != localHostName {
+		out += "\n# or relayed from your own terminal:\n" + pipe(localHostName)
+	}
+	return out
 }

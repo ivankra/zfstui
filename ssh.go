@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // Runner abstracts remote execution so refresh/job logic is testable offline.
@@ -82,4 +83,61 @@ func (s *SSH) RunInput(ctx context.Context, host Host, cmd string, stdin []byte,
 		return stdout.Bytes(), fmt.Errorf("ssh %s: %w: %s", host.Name, err, msg)
 	}
 	return stdout.Bytes(), nil
+}
+
+// localHostName is the pseudo-host for jobs run on THIS machine (sync relay
+// through the control node). Not a valid hostname, so it can never collide
+// with a fleet host; its Runner is plain local bash, no ssh.
+const localHostName = "@local"
+
+// displayHost is how a job host is shown: the local pseudo-host reads as
+// plain "localhost" (it can't BE that name internally — a fleet host may be
+// called localhost, e.g. via ssh to itself).
+func displayHost(name string) string {
+	if name == localHostName {
+		return "localhost"
+	}
+	return name
+}
+
+// bashRunner runs commands locally through bash (the local job runner).
+type bashRunner struct{}
+
+func (bashRunner) Run(ctx context.Context, host Host, cmd string) ([]byte, error) {
+	return bashRunner{}.RunInput(ctx, host, cmd, nil)
+}
+
+func (bashRunner) RunInput(ctx context.Context, _ Host, cmd string, stdin []byte, _ ...string) ([]byte, error) {
+	c := exec.CommandContext(ctx, "bash", "-c", cmd)
+	if stdin != nil {
+		c.Stdin = bytes.NewReader(stdin)
+	}
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+	if err := c.Run(); err != nil {
+		return stdout.Bytes(), fmt.Errorf("local bash: %w: %s", err, bytes.TrimSpace(stderr.Bytes()))
+	}
+	return stdout.Bytes(), nil
+}
+
+// localExec is the Runner for localHostName (a var so tests can stub it —
+// they must never see this machine's real /tmp job dirs).
+var localExec Runner = bashRunner{}
+
+// localMachineID reads THIS machine's /etc/machine-id ("" if unreadable); a
+// var so tests can stub it. Matching a fleet host's discovered id means
+// zfstui runs ON that host (see Model.localTwin).
+var localMachineID = func() string {
+	b, _ := os.ReadFile("/etc/machine-id")
+	return strings.TrimSpace(string(b))
+}
+
+// runnerFor picks the Runner that reaches h: local bash for localHostName,
+// system ssh for everything else.
+func runnerFor(h Host) Runner {
+	if h.Name == localHostName {
+		return localExec
+	}
+	return newSSH()
 }

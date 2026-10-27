@@ -20,7 +20,7 @@ type Store struct {
 
 // Bump whenever the schema changes: the db is a disposable cache, so on
 // mismatch we just drop everything and start over (no migrations).
-const schemaVersion = 7
+const schemaVersion = 8
 
 const schema = `
 CREATE TABLE IF NOT EXISTS hosts (
@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS hosts (
   last_refresh INTEGER NOT NULL DEFAULT 0,  -- unix seconds; 0 = never
   reachable INTEGER NOT NULL DEFAULT 0,
   last_error TEXT NOT NULL DEFAULT '',
-  boot_time INTEGER NOT NULL DEFAULT 0  -- unix seconds of host's last boot; 0 = unknown
+  boot_time INTEGER NOT NULL DEFAULT 0,  -- unix seconds of host's last boot; 0 = unknown
+  machine_id TEXT NOT NULL DEFAULT ''    -- /etc/machine-id; '' = unknown
 );
 -- Inventory objects are stored as their full property maps (JSON, from
 -- "zpool/zfs get -Hp all"); typed fields are re-derived on load via the
@@ -195,11 +196,37 @@ func (s *Store) PutHostState(st HostState) error {
 		exec(`INSERT INTO jobs (host,id,dir,kind,state,status,meta,progress,expected,log) VALUES (?,?,?,?,?,?,?,?,?,?)`,
 			j.Host, j.ID, j.Dir, j.Kind, j.State, j.Status, string(meta), j.Progress, j.Expected, j.Log)
 	}
-	exec(`INSERT INTO hosts (name, last_refresh, reachable, last_error, boot_time) VALUES (?,?,1,'',?)
-		 ON CONFLICT(name) DO UPDATE SET last_refresh=excluded.last_refresh, reachable=1, last_error='', boot_time=excluded.boot_time`,
-		st.Host, time.Now().Unix(), st.BootTime)
+	exec(`INSERT INTO hosts (name, last_refresh, reachable, last_error, boot_time, machine_id) VALUES (?,?,1,'',?,?)
+		 ON CONFLICT(name) DO UPDATE SET last_refresh=excluded.last_refresh, reachable=1, last_error='',
+		   boot_time=excluded.boot_time, machine_id=excluded.machine_id`,
+		st.Host, time.Now().Unix(), st.BootTime, st.MachineID)
 	if execErr != nil {
 		return execErr
+	}
+	return tx.Commit()
+}
+
+// PutJobs replaces one host's cached jobs (live job polls), so a later reload
+// from the cache can't resurrect a stale state — e.g. a finished job on a
+// runner that the completion refresh doesn't cover flipping back to running.
+func (s *Store) PutJobs(host string, jobs []JobInfo) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM jobs WHERE host = ?", host); err != nil {
+		return err
+	}
+	for _, j := range jobs {
+		if j.Pending {
+			continue // TUI placeholders are never persisted
+		}
+		meta, _ := json.Marshal(j.Meta)
+		if _, err := tx.Exec(`INSERT INTO jobs (host,id,dir,kind,state,status,meta,progress,expected,log) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			j.Host, j.ID, j.Dir, j.Kind, j.State, j.Status, string(meta), j.Progress, j.Expected, j.Log); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -219,11 +246,12 @@ type HostInfo struct {
 	LastRefresh time.Time
 	Reachable   bool
 	LastError   string
-	BootTime    int64 // unix seconds of host's last boot; 0 if unknown
+	BootTime    int64  // unix seconds of host's last boot; 0 if unknown
+	MachineID   string // /etc/machine-id; "" if unknown
 }
 
 func (s *Store) Hosts() ([]HostInfo, error) {
-	rows, err := s.db.Query(`SELECT name, last_refresh, reachable, last_error, boot_time FROM hosts ORDER BY name`)
+	rows, err := s.db.Query(`SELECT name, last_refresh, reachable, last_error, boot_time, machine_id FROM hosts ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +261,7 @@ func (s *Store) Hosts() ([]HostInfo, error) {
 		var h HostInfo
 		var ts int64
 		var reach int
-		if err := rows.Scan(&h.Name, &ts, &reach, &h.LastError, &h.BootTime); err != nil {
+		if err := rows.Scan(&h.Name, &ts, &reach, &h.LastError, &h.BootTime, &h.MachineID); err != nil {
 			return nil, err
 		}
 		h.LastRefresh = time.Unix(ts, 0)

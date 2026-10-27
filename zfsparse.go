@@ -166,7 +166,7 @@ const (
 	MarkDatasets  = "===ZFSTUI:datasets==="
 	MarkSnapshots = "===ZFSTUI:snapshots==="
 	MarkJobs      = "===ZFSTUI:jobs==="
-	MarkHost      = "===ZFSTUI:host===" // host-level scalars (boot time)
+	MarkHost      = "===ZFSTUI:host===" // host-level scalars (boot time, machine id)
 	MarkRC        = "===ZFSTUI:rc="     // followed by "<n>==="
 )
 
@@ -221,9 +221,10 @@ func DiscoverCommand(sudo bool) string {
 		section(MarkSnapshots, "zfs get -Hp -t snapshot all"),
 		// Jobs need no sudo: dirs are owned by the ssh user that made them.
 		fmt.Sprintf("echo '%s'; %s; echo '%s'$?'==='", MarkJobs, jobsProbe, MarkRC),
-		// Host scalars (boot time from /proc/stat btime); no sudo, never fatal.
+		// Host scalars as `key value` lines (boot time from /proc/stat btime,
+		// /etc/machine-id); no sudo, never fatal.
 		fmt.Sprintf("echo '%s'; %s; echo '%s'$?'==='", MarkHost,
-			`awk '/^btime/{print $2}' /proc/stat 2>/dev/null; true`, MarkRC),
+			`awk '/^btime/' /proc/stat 2>/dev/null; echo "machine-id $(cat /etc/machine-id 2>/dev/null)"; true`, MarkRC),
 	}, "; ")
 }
 
@@ -268,8 +269,16 @@ func ParseDiscovery(host, out string) (HostState, error) {
 	}
 	st.Jobs = ParseJobs(host, sections[MarkJobs].String())
 	if sec := sections[MarkHost]; sec != nil { // non-required: tolerate absence
-		if n, e := strconv.ParseInt(strings.TrimSpace(sec.String()), 10, 64); e == nil {
-			st.BootTime = n
+		for _, line := range strings.Split(sec.String(), "\n") {
+			k, v, _ := strings.Cut(strings.TrimSpace(line), " ")
+			switch v = strings.TrimSpace(v); k {
+			case "btime":
+				if n, e := strconv.ParseInt(v, 10, 64); e == nil {
+					st.BootTime = n
+				}
+			case "machine-id":
+				st.MachineID = v
+			}
 		}
 	}
 	var statusTexts map[string]string

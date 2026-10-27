@@ -71,30 +71,84 @@ func TestJobScriptIsValidBash(t *testing.T) {
 // pipelines (send | $ZBUF | [$DSSH] recv). Nothing else may invoke zfs/zpool.
 func assertScriptAllowlisted(t *testing.T, script string) {
 	t.Helper()
-	for _, line := range strings.Split(script, "\n") {
+	inMeta := false
+	for _, line := range strings.Split(strings.ReplaceAll(script, "\\\n", " "), "\n") {
 		trimmed := strings.TrimSpace(line)
+		// meta.json heredoc (command/manual text): data, not executed.
+		if strings.HasPrefix(trimmed, "cat > meta.json <<'ZFSTUI_META'") {
+			inMeta = true
+			continue
+		}
+		if inMeta {
+			inMeta = trimmed != "ZFSTUI_META"
+			continue
+		}
+		trimmed = strings.TrimSuffix(strings.TrimPrefix(trimmed, "( "), " ) >> log 2>&1")
+		if strings.HasPrefix(trimmed, "TOKEN=") && !resumeTokenAssignRe.MatchString(trimmed) {
+			t.Errorf("job script contains bad token assignment %q", line)
+		}
 		if !strings.Contains(trimmed, "zfs ") && !strings.Contains(trimmed, "zpool ") {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "\"command\":") {
-			continue // meta.json content, not executed
-		}
-		trimmed = strings.TrimSuffix(strings.TrimPrefix(trimmed, "( "), " ) >> log 2>&1")
 		for _, seg := range strings.Split(trimmed, "|") {
 			seg = strings.TrimSpace(seg)
 			if !strings.Contains(seg, "zfs ") {
 				continue
 			}
-			// Unwrap the remote-recv form: $DSSH "recv..." and strip
-			// shell redirections (progress/size plumbing).
+			// Unwrap the remote forms: $SSSH "send..." / $DSSH "recv..."
+			// and strip shell redirections (progress/size plumbing).
+			seg = strings.TrimSuffix(seg, " 2>/dev/null")
+			seg = strings.TrimPrefix(seg, "$SSSH ")
 			seg = strings.TrimPrefix(seg, "$DSSH ")
 			seg = strings.Trim(seg, "\"")
-			seg = strings.TrimSuffix(seg, " 2>/dev/null")
 			if !allowlisted(seg) {
 				t.Errorf("job script contains non-allowlisted mutation: %q (line %q)", seg, line)
 			}
 		}
 	}
+	if inMeta {
+		t.Error("unterminated meta heredoc")
+	}
+}
+
+// assertManualAllowlisted checks the human "manual" command the same way:
+// every zfs segment (after unwrapping `ssh [-p N] user@host "…"` and the
+// `\` line continuations) must be allowlisted.
+func assertManualAllowlisted(t *testing.T, manual string) {
+	t.Helper()
+	sshRe := regexp.MustCompile(`^ssh (-p \d+ )?[A-Za-z0-9._-]+@[A-Za-z0-9._-]+ "(.*)"$`)
+	joined := strings.ReplaceAll(manual, "\\\n", " ")
+	for _, line := range strings.Split(joined, "\n") {
+		if strings.HasPrefix(line, "TOKEN=") && !resumeTokenAssignRe.MatchString(line) {
+			t.Errorf("manual command contains bad token assignment %q", line)
+		}
+		if strings.HasPrefix(line, "#") || !strings.Contains(line, "zfs ") {
+			continue
+		}
+		for _, seg := range strings.Split(line, "|") {
+			seg = strings.TrimSpace(seg)
+			if m := sshRe.FindStringSubmatch(seg); m != nil {
+				seg = m[2]
+			}
+			if !allowlisted(seg) {
+				t.Errorf("manual command contains non-allowlisted segment %q:\n%s", seg, manual)
+			}
+		}
+	}
+}
+
+// Tests must never run against this machine's real /tmp job dirs.
+func TestMain(m *testing.M) {
+	localExec = fakeLocal{}
+	localMachineID = func() string { return "" }
+	os.Exit(m.Run())
+}
+
+type fakeLocal struct{}
+
+func (fakeLocal) Run(context.Context, Host, string) ([]byte, error) { return nil, nil }
+func (fakeLocal) RunInput(context.Context, Host, string, []byte, ...string) ([]byte, error) {
+	return nil, nil
 }
 
 func TestJobScriptMutationsAllowlisted(t *testing.T) {

@@ -152,10 +152,14 @@ func TestParseDiscovery(t *testing.T) {
 		MarkDisks + "\n" + disksOut + MarkRC + "0===\n" +
 		MarkDatasets + "\n" + datasetsOut + MarkRC + "0===\n" +
 		MarkSnapshots + "\n" + snapsOut + MarkRC + "0===\n" +
-		MarkJobs + "\n" + MarkRC + "0===\n"
+		MarkJobs + "\n" + MarkRC + "0===\n" +
+		MarkHost + "\nbtime 1700000000\nmachine-id 4c0ffee\n" + MarkRC + "0===\n"
 	st, err := ParseDiscovery("dev1", out)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if st.BootTime != 1700000000 || st.MachineID != "4c0ffee" {
+		t.Errorf("host scalars: boot %d machine-id %q", st.BootTime, st.MachineID)
 	}
 	if len(st.Pools) != 2 || len(st.Datasets) != 2 || len(st.Snapshots) != 2 {
 		t.Fatalf("bad counts: %d pools %d datasets %d snapshots",

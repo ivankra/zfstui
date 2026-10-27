@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"github.com/charmbracelet/lipgloss"
 	"strings"
 	"testing"
 	"time"
@@ -744,4 +747,369 @@ func TestSnapshotlessHostStillHasColumns(t *testing.T) {
 	if out := Status(states, nil); !strings.Contains(out, "new:new-root") {
 		t.Errorf("status lacks new:new-root:\n%s", out)
 	}
+}
+
+func TestSyncDialogRunOn(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	d := m.syncDlg
+	if d.runMode != runOnSource {
+		t.Fatal("default must be push from the source")
+	}
+	m.Update(key("tab")) // → custom editbox
+	m.Update(key("tab")) // → run on
+	if !d.at(sfRunOn) {
+		t.Fatalf("focus %d, want run-on", d.focus)
+	}
+	m.Update(key("right"))
+	if d.runMode != runOnDest {
+		t.Fatalf("runMode %d after →", d.runMode)
+	}
+	view := m.View()
+	for _, want := range []string{"run on:", " ws  [cml]  localhost"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("dialog view missing %q", want)
+		}
+	}
+	ls, err := m.syncLaunches(d)
+	if err != nil || len(ls) != 1 || ls[0].run.Name != "cml" || ls[0].run.User != "ivan" {
+		t.Fatalf("pull launch: %+v err=%v", ls, err)
+	}
+
+	m.Update(key("right")) // this machine
+	if ls, _ := m.syncLaunches(d); ls[0].run.Name != localHostName {
+		t.Errorf("local launch runs on %q", ls[0].run.Name)
+	}
+
+	m.Update(key("right")) // relay: the editbox is part of the line
+	for _, r := range "ops@jump" {
+		m.Update(key(string(r)))
+	}
+	if d.runMode != runOnRelay || d.relay.Value() != "ops@jump" || !d.at(sfRunOn) {
+		t.Fatalf("relay: mode %d value %q focus %d", d.runMode, d.relay.Value(), d.focus)
+	}
+	// ←/→ edit inside the box, and leave it past either end (field bug:
+	// focus got stuck in the editbox, arrows never left it).
+	m.Update(key("left"))
+	if d.runMode != runOnRelay || d.relay.Position() != len("ops@jump")-1 {
+		t.Fatalf("← inside text should move the cursor: mode %d pos %d", d.runMode, d.relay.Position())
+	}
+	m.Update(key("right")) // back to the end
+	m.Update(key("right")) // past the end: wraps to source
+	if d.runMode != runOnSource || d.relay.Focused() {
+		t.Fatalf("→ at end should leave relay: mode %d focused %v", d.runMode, d.relay.Focused())
+	}
+	m.Update(key("left")) // back into relay (cursor at end)
+	for range "ops@jump" {
+		m.Update(key("left"))
+	}
+	m.Update(key("left")) // at position 0: on to localhost
+	if d.runMode != runOnLocal {
+		t.Fatalf("← at start should leave relay: mode %d", d.runMode)
+	}
+	m.Update(key("right"))
+	if d.runMode != runOnRelay || d.relay.Value() != "ops@jump" {
+		t.Fatalf("relay value lost: mode %d %q", d.runMode, d.relay.Value())
+	}
+	ls, err = m.syncLaunches(d)
+	if err != nil || ls[0].run.Name != "jump" || ls[0].run.User != "ops" {
+		t.Fatalf("relay launch: %+v err=%v", ls, err)
+	}
+	if _, cmd := m.Update(key("enter")); cmd == nil || m.syncDlg != nil {
+		t.Fatal("submit should close the dialog and return a launch cmd")
+	}
+	if _, ok := m.sideJobs["jump"]; !ok || m.findHostState("jump") == nil {
+		t.Error("ad-hoc relay should be tracked as a side job host")
+	}
+	if m.hostByName("jump").User != "ops" {
+		t.Error("side host access info lost")
+	}
+	for _, c := range m.cols {
+		if c.Host == "jump" {
+			t.Error("side hosts must not get table columns")
+		}
+	}
+}
+
+func TestSyncDialogRelayRequiresHost(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	m.syncDlg.runMode = runOnRelay
+	m.Update(key("enter")) // focus on the checkbox: Enter submits
+	if m.syncDlg == nil || !strings.Contains(m.syncDlg.errMsg, "relay") {
+		t.Fatalf("want relay error, dlg=%v", m.syncDlg)
+	}
+}
+
+// The failures window and a failed sync's job window show the real error
+// (control chars stripped) and the manual command above the script.
+func TestSyncFailureWindows(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	d := m.syncDlg
+	d.runMode = runOnRelay
+	d.relay.SetValue("jump")
+	ls, err := m.syncLaunches(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.syncDlg = nil
+	l := ls[0]
+	m.onSyncDone(syncDoneMsg{results: []syncResult{{
+		label: l.label, id: l.spec.ID, state: "failed", command: l.spec.Command,
+		run: l.run, meta: l.spec.Meta, logTail: "ssh: connect to host cml port 22: Connection timed out\r",
+	}}})
+	if !winOpen(m) {
+		t.Fatal("failures window should open")
+	}
+	txt := winText(m)
+	for _, want := range []string{"manual:", "# on jump:", "Connection timed out", "script:"} {
+		if !strings.Contains(txt, want) {
+			t.Errorf("failures window missing %q:\n%s", want, txt)
+		}
+	}
+	if strings.Contains(txt, "\r") {
+		t.Error("control chars must be stripped")
+	}
+	m.popWindow()
+
+	j := JobInfo{Host: "ws", ID: "ABC123", Kind: "sync", State: "failed", Status: "failed 80 t", Meta: l.spec.Meta}
+	j.Meta["command"] = l.spec.Command
+	m.findHostState("ws").Jobs = []JobInfo{j}
+	m.pushView(m.jobView("ws", "ABC123"))
+	txt = winText(m)
+	iMan, iScript := strings.Index(txt, "manual"), strings.Index(txt, "script")
+	if iMan < 0 || iScript < 0 || iMan > iScript {
+		t.Errorf("job window order manual(%d) < script(%d):\n%s", iMan, iScript, txt)
+	}
+}
+
+// Cycling "run on" must not resize the dialog (field annoyance: the box
+// jumped width with the per-mode command preview).
+func TestSyncDialogStableWidth(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	w0 := lipgloss.Width(m.syncDialogView())
+	for mode := 1; mode < runOnCount; mode++ {
+		m.syncDlg.runMode = mode
+		if w := lipgloss.Width(m.syncDialogView()); w != w0 {
+			t.Errorf("mode %d: dialog width %d, want %d", mode, w, w0)
+		}
+	}
+}
+
+// The local pseudo-host reads as "localhost" everywhere it's shown.
+func TestLocalJobShownAsLocalhost(t *testing.T) {
+	m := syncTestModel(t)
+	j := JobInfo{Host: localHostName, ID: "NDwJzx", Kind: "sync", State: "failed", Status: "failed 80 t",
+		Meta: map[string]string{"runner": localHostName, "src": "ws:tank/srv/git", "dest": "cml:root/bak/git"}}
+	m.sideJobs[localHostName] = []JobInfo{j}
+	m.mergeSideJobs()
+	m.pushView(m.jobView(localHostName, "NDwJzx"))
+	if got := winTitle(m); !strings.Contains(got, "job localhost:NDwJzx") {
+		t.Errorf("title %q", got)
+	}
+	if txt := winText(m); strings.Contains(txt, "@local") {
+		t.Errorf("@local leaked into the job window:\n%s", txt)
+	}
+}
+
+// Typing a custom destination shows it checked; clearing it unchecks.
+func TestSyncDialogCustomCheckmark(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	m.Update(key("tab")) // → custom editbox
+	customLine := func() string {
+		for _, l := range strings.Split(m.syncDialogView(), "\n") {
+			if strings.Contains(l, "foo:bar") || strings.Contains(l, "host:pool/dataset") || strings.Contains(l, "foo:ba") {
+				return l
+			}
+		}
+		return ""
+	}
+	if strings.Contains(customLine(), "[x]") {
+		t.Fatalf("empty custom box must not look checked: %q", customLine())
+	}
+	for _, r := range "foo:bar" {
+		m.Update(key(string(r)))
+	}
+	if !strings.Contains(customLine(), "[x] foo:bar") {
+		t.Errorf("typed custom dest should be checked: %q", customLine())
+	}
+	for range "foo:bar" {
+		m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	if strings.Contains(customLine(), "[x]") {
+		t.Errorf("cleared custom box should uncheck: %q", customLine())
+	}
+}
+
+// A submitted sync shows up immediately (placeholder) instead of after the
+// ~12s launch wait + refresh; polls/refreshes then swap in the real job.
+func TestSyncJobAppearsImmediately(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	ls, err := m.syncLaunches(m.syncDlg)
+	if err != nil || len(ls) != 1 {
+		t.Fatal(err)
+	}
+	m.submitSyncDialog()
+	var id string
+	for k := range m.pendingJobs {
+		id = k
+	}
+	if id == "" {
+		t.Fatal("no pending job registered")
+	}
+	for _, key := range []string{"ws:tank/srv/git", "cml:root/bak/git"} {
+		js := m.data.JobsByReplica[key]
+		if len(js) == 0 || js[0].ID != id || js[0].State != "running" {
+			t.Errorf("%s: job not shown right away: %+v", key, js)
+		}
+	}
+	if !m.ticking {
+		t.Error("ticker should start for the pending job")
+	}
+
+	// A poll that doesn't see the job dir yet keeps the placeholder.
+	m.onJobsPoll(jobsPollMsg{host: "ws", jobs: nil})
+	if js := m.data.JobsByReplica["cml:root/bak/git"]; len(js) != 1 || !js[0].Pending {
+		t.Fatalf("placeholder lost on an early poll: %+v", js)
+	}
+	// The real job supersedes it (exactly once, not pending).
+	real := JobInfo{Host: "ws", ID: id, Kind: "sync", State: "running", Status: "running 1 t",
+		Meta: map[string]string{"src": "ws:tank/srv/git", "dest": "cml:root/bak/git"}}
+	m.onJobsPoll(jobsPollMsg{host: "ws", jobs: []JobInfo{real}})
+	if js := m.data.JobsByReplica["cml:root/bak/git"]; len(js) != 1 || js[0].Pending {
+		t.Fatalf("real job should replace the placeholder: %+v", js)
+	}
+	if len(m.pendingJobs) != 0 {
+		t.Error("pending entry should be dropped once discovered")
+	}
+}
+
+func TestSyncLaunchFailureDropsPlaceholder(t *testing.T) {
+	m := syncTestModel(t)
+	m.moveCursorToCol(t, "ws:tank")
+	m.openSyncDialog()
+	m.submitSyncDialog()
+	var pj JobInfo
+	for _, j := range m.pendingJobs {
+		pj = j
+	}
+	m.onSyncDone(syncDoneMsg{results: []syncResult{{
+		label: "cml:root/bak/git", id: pj.ID, state: "launch-failed", run: Host{Name: "ws"},
+		meta: pj.Meta, err: fmt.Errorf("ssh ws: boom"),
+	}}})
+	if len(m.pendingJobs) != 0 || len(m.data.JobsByReplica["cml:root/bak/git"]) != 0 {
+		t.Errorf("launch failure must not leave a phantom job: %+v", m.data.JobsByReplica["cml:root/bak/git"])
+	}
+}
+
+// Field bug: a sync relayed through fleet host "dev" (src ws → dest cml)
+// flickered done/running forever: polls saw it done, but the completion
+// refresh only covered ws+cml, and every reload resurrected dev's cached
+// "running" state. Polls now persist, and the runner is refreshed too.
+func TestRelayJobDoesNotFlickerAfterFinish(t *testing.T) {
+	m := syncTestModel(t)
+	job := func(state, status string) JobInfo {
+		return JobInfo{Host: "dev", ID: "vneU4c", Kind: "sync", State: state, Status: status,
+			Meta: map[string]string{"src": "ws:tank/srv/git", "dest": "cml:root/bak/git", "runner": "dev"}}
+	}
+	if err := m.st.PutJobs("dev", []JobInfo{job("running", "running 1 t")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.reload(); err != nil {
+		t.Fatal(err)
+	}
+	if j := m.findJob("dev", "vneU4c"); j == nil || j.State != "running" {
+		t.Fatalf("setup: %+v", j)
+	}
+	m.onJobsPoll(jobsPollMsg{host: "dev", jobs: []JobInfo{job("done", "done t")}})
+	if !m.refreshingHosts["dev"] {
+		t.Error("the runner must be refreshed when its job finishes")
+	}
+	// Some other host's refresh completes → reload from cache.
+	if err := m.reload(); err != nil {
+		t.Fatal(err)
+	}
+	if j := m.findJob("dev", "vneU4c"); j == nil || j.State != "done" {
+		t.Fatalf("reload resurrected a stale job state: %+v", j)
+	}
+	for _, j := range m.data.JobsByReplica["cml:root/bak/git"] {
+		if j.State == "running" {
+			t.Errorf("finished relay job still shows running: %+v", j)
+		}
+	}
+}
+
+// Running zfstui ON a fleet host (localhost == iac): the @local probe and
+// iac's ssh probe glob the same /tmp, so a locally-run job arrives twice.
+// It must be listed once per replica (the fleet copy).
+func TestJobSeenViaLocalAndFleetHostListedOnce(t *testing.T) {
+	meta := map[string]string{"src": "cml:tank/x", "dest": "iac:tank/x", "runner": localHostName}
+	states := []HostState{
+		{Host: "iac", Jobs: []JobInfo{{Host: "iac", ID: "2wm4vg", Kind: "sync", Meta: meta}}},
+		{Host: localHostName, Jobs: []JobInfo{{Host: localHostName, ID: "2wm4vg", Kind: "sync", Meta: meta}}},
+	}
+	idx := indexJobs(states)
+	for _, k := range []string{"cml:tank/x", "iac:tank/x"} {
+		if got := idx[k]; len(got) != 1 || got[0].Host != "iac" {
+			t.Errorf("%s: %+v", k, got)
+		}
+	}
+}
+
+// zfstui running ON a fleet host (same /etc/machine-id): "localhost" IS that
+// host — no separate @local job scan (it would list every local job twice)
+// and run-on-localhost launches as the fleet host.
+func TestLocalTwinByMachineID(t *testing.T) {
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.PutHostState(HostState{Host: "iac", MachineID: "mid-iac"}); err != nil {
+		t.Fatal(err)
+	}
+	defer func(f func() string) { localMachineID = f }(localMachineID)
+	localMachineID = func() string { return "mid-iac" }
+	calls := 0
+	localExec = countingLocal{&calls}
+	defer func() { localExec = fakeLocal{} }()
+
+	m, err := New(st, []Host{{Name: "iac"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.localTwin(); got != "iac" {
+		t.Fatalf("localTwin = %q", got)
+	}
+	if calls != 0 {
+		t.Errorf("local job scan ran %d times; the twin's probe covers it", calls)
+	}
+	h, err := m.runHostFor(&syncDialog{runMode: runOnLocal}, Host{Name: "sta"})
+	if err != nil || h.Name != "iac" {
+		t.Errorf("run on localhost → %q, %v; want the twin iac", h.Name, err)
+	}
+
+	localMachineID = func() string { return "other" }
+	m2, _ := New(st, []Host{{Name: "iac"}})
+	if got := m2.localTwin(); got != "" {
+		t.Errorf("different machine-id must not match: %q", got)
+	}
+}
+
+type countingLocal struct{ n *int }
+
+func (c countingLocal) Run(context.Context, Host, string) ([]byte, error) { *c.n++; return nil, nil }
+func (c countingLocal) RunInput(context.Context, Host, string, []byte, ...string) ([]byte, error) {
+	*c.n++
+	return nil, nil
 }

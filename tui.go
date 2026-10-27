@@ -113,6 +113,19 @@ type Model struct {
 	dialog  *snapDialog // snapshot dialog when non-nil
 	syncDlg *syncDialog // sync dialog when non-nil
 	windows []*window   // stack of interactive object windows (Esc pops)
+
+	// Side job hosts: sync runners that are not refreshed fleet hosts (this
+	// machine = localHostName, ad-hoc relays). Their jobs ride along in
+	// data.States as pool-less HostStates (no columns), see mergeSideJobs.
+	sideJobs  map[string][]JobInfo
+	sideHosts map[string]Host
+	// localID is this machine's /etc/machine-id (see localTwin).
+	localID string
+
+	// pendingJobs: jobs we just launched (by ID), shown immediately as
+	// running until a poll/refresh of their host sees the real job dir —
+	// otherwise a sync only appeared after the ~12s launch wait + refresh.
+	pendingJobs map[string]JobInfo
 }
 
 // snapDialog is the state of the snapshot dialog (TUI `s`): a modal form
@@ -136,14 +149,28 @@ const (
 )
 
 func New(st *Store, hosts []Host) (*Model, error) {
-	m := &Model{st: st, hosts: hosts, refreshingHosts: map[string]bool{}}
+	m := &Model{st: st, hosts: hosts, refreshingHosts: map[string]bool{},
+		sideJobs:    map[string][]JobInfo{localHostName: nil},
+		sideHosts:   map[string]Host{localHostName: {Name: localHostName}},
+		pendingJobs: map[string]JobInfo{}, localID: localMachineID()}
 	if err := m.reload(); err != nil {
 		return nil, err
 	}
-	if len(m.data.States) == 0 {
+	if !m.hasInventory() {
 		m.status = "cache is empty — press R to refresh"
 	}
 	return m, nil
+}
+
+// hasInventory reports whether any host has discovered data (side job
+// hosts are pool-less HostStates and don't count).
+func (m *Model) hasInventory() bool {
+	for _, hs := range m.data.States {
+		if len(hs.Pools) > 0 || len(hs.Datasets) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // reload re-derives everything from the cache, preserving cursor best-effort.
@@ -153,6 +180,8 @@ func (m *Model) reload() error {
 		return err
 	}
 	m.data = data
+	m.scanLocalJobs()
+	m.mergeSideJobs()
 	m.unreach = map[string]bool{}
 	for _, h := range data.Hosts {
 		if !h.Reachable {
@@ -1544,18 +1573,31 @@ func checkbox(label string, checked, focused bool) string {
 	return "  " + s
 }
 
+// flushCheckbox is checkbox without the "› " focus-mark gutter, for
+// flush-left option rows; focus shows via the cursor style alone.
+func flushCheckbox(label string, checked, focused bool) string {
+	box := "[ ]"
+	if checked {
+		box = "[x]"
+	}
+	if focused {
+		return styleCursor.Render(box + " " + label)
+	}
+	return box + " " + label
+}
+
 func (m *Model) dialogView() string {
 	d := m.dialog
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s\n\n", styleFieldLabel.Render("dataset:"), d.host.Name+":"+d.dataset)
-	mark := "  "
+	// Label column padded so the values line up; focus on the name editbox
+	// shows as the focus color on its label (no "› " gutter, flush layout).
+	fmt.Fprintf(&b, "%s  %s\n", styleFieldLabel.Render("dataset:"), d.host.Name+":"+d.dataset)
+	label := styleFieldLabel.Render("snapshot:")
 	if d.focus == formFocusName {
-		mark = styleFocusMark.Render("› ")
+		label = styleFocusMark.Render("snapshot:")
 	}
-	b.WriteString(styleFieldLabel.Render("snapshot name:") + "\n")
-	fmt.Fprintf(&b, "%s%s\n\n", mark, d.input.View())
-	b.WriteString(styleFieldLabel.Render("options:") + "\n")
-	b.WriteString(checkbox("recursive (-r)", d.recursive, d.focus == formFocusRecursive) + "\n")
+	fmt.Fprintf(&b, "%s %s\n\n", label, d.input.View())
+	b.WriteString(flushCheckbox("recursive (-r)", d.recursive, d.focus == formFocusRecursive) + "\n")
 	if d.errMsg != "" {
 		b.WriteString("\n" + styleErr.Render("⚠ "+d.errMsg) + "\n")
 	}
@@ -1629,20 +1671,135 @@ type syncDialog struct {
 	selectable   []int // indices into plans that can be (de)selected
 	checked      map[int]bool
 	custom       textinput.Model // free-form extra destinations (full send)
+	runMode      int             // runOnSource / runOnDest / runOnLocal / runOnRelay
+	relay        textinput.Model // relay host spec for runOnRelay
 	intermediate bool            // -I (default) vs -i
-	focus        int             // 0..len(selectable)-1, custom, intermediate, OK, Cancel
+	focus        int             // see the sf* offsets below
 	errMsg       string
 }
 
-func (d *syncDialog) focusCount() int { return len(d.selectable) + 4 }
+// Where sync jobs execute (see syncJob): push from the source (default),
+// pull from each destination, relay through this machine or another host.
+const (
+	runOnSource = iota
+	runOnDest
+	runOnLocal
+	runOnRelay
+	runOnCount
+)
+
+// Focus stops after the destination checkboxes (offsets from len(selectable)).
+const (
+	sfCustom = iota
+	sfRunOn  // the whole "run on:" line, relay editbox included
+	sfIntermediate
+	sfOK
+	sfCancel
+	sfCount
+)
+
+func (d *syncDialog) focusCount() int { return len(d.selectable) + sfCount }
+
+// at reports whether the focus is on the given stop.
+func (d *syncDialog) at(stop int) bool { return d.focus == len(d.selectable)+stop }
 
 func (d *syncDialog) setFocus(f int) {
 	d.focus = f
-	if f == len(d.selectable) { // the custom editbox
+	d.custom.Blur()
+	d.relay.Blur()
+	switch {
+	case d.at(sfCustom):
 		d.custom.Focus()
-	} else {
-		d.custom.Blur()
 	}
+	d.syncRelayFocus()
+}
+
+// syncRelayFocus gives the relay editbox the text cursor iff the run-on line
+// is focused with relay selected (it is part of that line, not a stop).
+func (d *syncDialog) syncRelayFocus() {
+	if d.at(sfRunOn) && d.runMode == runOnRelay {
+		d.relay.Focus()
+	} else {
+		d.relay.Blur()
+	}
+}
+
+// cycleRunOn moves the run-on selection by delta (wrapping).
+func (d *syncDialog) cycleRunOn(delta int) {
+	d.runMode = (d.runMode + runOnCount + delta) % runOnCount
+	if d.runMode == runOnRelay {
+		d.relay.CursorEnd()
+	}
+	d.syncRelayFocus()
+}
+
+// syncDestHosts names the "run on destination" choice by the checked
+// destinations' hosts (each job then runs on its own destination).
+func (m *Model) syncDestHosts(d *syncDialog) string {
+	var hosts []string
+	seen := map[string]bool{}
+	add := func(h string) {
+		if h != "" && !seen[h] {
+			seen[h] = true
+			hosts = append(hosts, h)
+		}
+	}
+	for _, pi := range d.selectable {
+		if d.checked[pi] {
+			add(d.plans[pi].Dest.Dataset.Host)
+		}
+	}
+	for _, ent := range strings.Split(d.custom.Value(), ",") {
+		h, _, _ := strings.Cut(strings.TrimSpace(ent), ":")
+		add(h)
+	}
+	if len(hosts) == 0 {
+		return "dest"
+	}
+	return strings.Join(hosts, ",")
+}
+
+// runHostFor resolves the job's executing host for one destination.
+func (m *Model) runHostFor(d *syncDialog, destHost Host) (Host, error) {
+	switch d.runMode {
+	case runOnDest:
+		return destHost, nil
+	case runOnLocal:
+		if twin := m.localTwin(); twin != "" {
+			return m.hostByName(twin), nil
+		}
+		return Host{Name: localHostName}, nil
+	case runOnRelay:
+		spec := strings.TrimSpace(d.relay.Value())
+		if spec == "" {
+			return Host{}, fmt.Errorf("relay: enter a host (host or user@host[:port])")
+		}
+		h, err := parseHostSpec(spec)
+		if err != nil {
+			return Host{}, fmt.Errorf("relay: %v", err)
+		}
+		if spec == h.Name { // bare name: use remembered access info if any
+			h = m.hostByName(h.Name)
+		}
+		return h, nil
+	}
+	return d.srcHost, nil
+}
+
+// localTwin is the fleet host this machine IS (same /etc/machine-id), or "".
+// Then "localhost" means that host: local jobs live in its /tmp and are
+// discovered, polled and persisted as its jobs — a separate @local scan would
+// list each of them twice.
+func (m *Model) localTwin() string {
+	if m.localID == "" || m.data == nil {
+		return ""
+	}
+	for _, h := range m.data.Hosts {
+		if h.MachineID == m.localID {
+			return h.Name
+		}
+	}
+	return ""
 }
 
 func (m *Model) hostByName(name string) Host {
@@ -1651,7 +1808,63 @@ func (m *Model) hostByName(name string) Host {
 			return h
 		}
 	}
+	if h, ok := m.sideHosts[name]; ok {
+		return h
+	}
 	return Host{Name: name}
+}
+
+// scanLocalJobs rediscovers jobs this machine ran (local relays) — a quick
+// local glob, no ssh. Errors leave the previous list.
+func (m *Model) scanLocalJobs() {
+	if m.localTwin() != "" {
+		m.sideJobs[localHostName] = nil // the twin's own probe sees them
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if out, err := localExec.Run(ctx, Host{Name: localHostName}, jobsProbe); err == nil {
+		m.sideJobs[localHostName] = ParseJobs(localHostName, string(out))
+	}
+}
+
+// mergeSideJobs appends side hosts' jobs to data.States (pool-less, so no
+// columns) unless the host is a fleet host, and re-indexes jobs.
+func (m *Model) mergeSideJobs() {
+	for name, jobs := range m.sideJobs {
+		if hs := m.findHostState(name); hs != nil {
+			if hs.Pools == nil && hs.Datasets == nil {
+				hs.Jobs = jobs // our own side entry from an earlier merge
+			}
+			continue
+		}
+		m.data.States = append(m.data.States, HostState{Host: name, Jobs: jobs})
+	}
+	m.reindexJobs()
+}
+
+// reindexJobs overlays pending (just-launched, not yet discovered) jobs onto
+// their hosts' job lists and rebuilds JobsByReplica. A pending job is dropped
+// once its host's real job list contains it.
+func (m *Model) reindexJobs() {
+	for i := range m.data.States {
+		hs := &m.data.States[i]
+		real := hs.Jobs[:0:0]
+		for _, j := range hs.Jobs {
+			if !j.Pending { // drop stale placeholder copies; re-added below
+				real = append(real, j)
+				delete(m.pendingJobs, j.ID) // discovered for real
+			}
+		}
+		hs.Jobs = real
+	}
+	for _, pj := range m.pendingJobs {
+		if hs := m.findHostState(pj.Host); hs != nil {
+			pj.Pending = true
+			hs.Jobs = append([]JobInfo{pj}, hs.Jobs...)
+		}
+	}
+	m.data.JobsByReplica = indexJobs(m.data.States)
 }
 
 // openSyncDialog picks the sync source from the cursor (cell replica, or the
@@ -1672,9 +1885,14 @@ func (m *Model) openSyncDialog() {
 	in.CharLimit = 256
 	in.Width = 44
 	in.Placeholder = "host:pool/dataset, comma-separated"
+	relay := textinput.New()
+	relay.Prompt = ""
+	relay.CharLimit = 128
+	relay.Width = 18
+	relay.Placeholder = "relay host…"
 	d := &syncDialog{
 		src: src, srcHost: srcHost,
-		plans: plans, checked: map[int]bool{}, custom: in, intermediate: true,
+		plans: plans, checked: map[int]bool{}, custom: in, relay: relay, intermediate: true,
 	}
 	for i, p := range plans {
 		if p.Selectable() {
@@ -1691,7 +1909,7 @@ func (m *Model) openSyncDialog() {
 func (m *Model) updateSyncDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	d := m.syncDlg
 	n := len(d.selectable)
-	iCustom, iIntermediate, iOK, iCancel := n, n+1, n+2, n+3
+	iCustom, iOK, iCancel := n+sfCustom, n+sfOK, n+sfCancel
 	switch msg.String() {
 	case "esc", "ctrl+c":
 		m.syncDlg = nil
@@ -1715,6 +1933,27 @@ func (m *Model) updateSyncDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		d.custom, cmd = d.custom.Update(msg)
 		return m, cmd
 	}
+	if d.at(sfRunOn) && d.runMode == runOnRelay {
+		// Relay selected: keys edit the box, but ←/→ past its ends keep
+		// moving between the run-on choices (the box is part of the line).
+		switch msg.String() {
+		case "left":
+			if d.relay.Position() == 0 {
+				d.cycleRunOn(-1)
+				return m, nil
+			}
+		case "right":
+			if d.relay.Position() >= len([]rune(d.relay.Value())) {
+				d.cycleRunOn(1)
+				return m, nil
+			}
+		case " ":
+			return m, nil // no spaces in host specs
+		}
+		var cmd tea.Cmd
+		d.relay, cmd = d.relay.Update(msg)
+		return m, cmd
+	}
 	switch msg.String() {
 	case "j":
 		d.setFocus((d.focus + 1) % d.focusCount())
@@ -1724,16 +1963,24 @@ func (m *Model) updateSyncDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if d.focus == iCancel {
 			d.setFocus(iOK)
 		}
+		if d.at(sfRunOn) {
+			d.cycleRunOn(-1)
+		}
 	case "right":
 		if d.focus == iOK {
 			d.setFocus(iCancel)
+		}
+		if d.at(sfRunOn) {
+			d.cycleRunOn(1)
 		}
 	case " ":
 		switch {
 		case d.focus < n:
 			pi := d.selectable[d.focus]
 			d.checked[pi] = !d.checked[pi]
-		case d.focus == iIntermediate:
+		case d.at(sfRunOn):
+			d.cycleRunOn(1)
+		case d.at(sfIntermediate):
 			d.intermediate = !d.intermediate
 		case d.focus == iOK:
 			return m, m.submitSyncDialog()
@@ -1759,26 +2006,30 @@ func (m *Model) datasetExists(host, ds string) bool {
 	return false
 }
 
-// submitSyncDialog builds one job per checked destination and launches them.
-func (m *Model) submitSyncDialog() tea.Cmd {
-	d := m.syncDlg
-	type launch struct {
-		spec  jobSpec
-		label string
+// syncLaunches builds one job per checked destination plus the custom
+// (full-send) ones, each routed per the dialog's run-on choice.
+func (m *Model) syncLaunches(d *syncDialog) ([]syncLaunch, error) {
+	var launches []syncLaunch
+	add := func(destHost Host, p syncPlan, label string) error {
+		runHost, err := m.runHostFor(d, destHost)
+		if err != nil {
+			return err
+		}
+		spec, err := syncJob(d.srcHost, destHost, runHost, d.src, p, d.intermediate)
+		if err != nil {
+			return err
+		}
+		launches = append(launches, syncLaunch{spec: spec, label: label, run: runHost, dest: destHost})
+		return nil
 	}
-	var launches []launch
 	for _, pi := range d.selectable {
 		if !d.checked[pi] {
 			continue
 		}
 		p := d.plans[pi]
-		destHost := m.hostByName(p.Dest.Dataset.Host)
-		spec, err := syncJob(d.srcHost, destHost, d.src, p, d.intermediate)
-		if err != nil {
-			d.errMsg = err.Error()
-			return nil
+		if err := add(m.hostByName(p.Dest.Dataset.Host), p, p.DestLabel()); err != nil {
+			return nil, err
 		}
-		launches = append(launches, launch{spec: spec, label: p.DestLabel()})
 	}
 	// Custom destinations from the editbox: full sends to new datasets.
 	for _, ent := range strings.Split(d.custom.Value(), ",") {
@@ -1788,24 +2039,35 @@ func (m *Model) submitSyncDialog() tea.Cmd {
 		}
 		hostName, ds, ok := strings.Cut(ent, ":")
 		if !ok || hostName == "" || ds == "" {
-			d.errMsg = fmt.Sprintf("custom destination %q: want host:pool/dataset", ent)
-			return nil
+			return nil, fmt.Errorf("custom destination %q: want host:pool/dataset", ent)
 		}
 		if m.datasetExists(hostName, ds) {
-			d.errMsg = fmt.Sprintf("%s already exists — full send only targets new datasets", ent)
-			return nil
+			return nil, fmt.Errorf("%s already exists — full send only targets new datasets", ent)
 		}
 		p, err := customDestPlan(d.src, m.data.SnapsByReplica, hostName, ds)
 		if err != nil {
-			d.errMsg = err.Error()
-			return nil
+			return nil, err
 		}
-		spec, err := syncJob(d.srcHost, m.hostByName(hostName), d.src, p, d.intermediate)
-		if err != nil {
-			d.errMsg = err.Error()
-			return nil
+		if err := add(m.hostByName(hostName), p, ent+" (full send)"); err != nil {
+			return nil, err
 		}
-		launches = append(launches, launch{spec: spec, label: ent + " (full send)"})
+	}
+	return launches, nil
+}
+
+type syncLaunch struct {
+	spec      jobSpec
+	label     string
+	run, dest Host
+}
+
+// submitSyncDialog launches the dialog's jobs.
+func (m *Model) submitSyncDialog() tea.Cmd {
+	d := m.syncDlg
+	launches, err := m.syncLaunches(d)
+	if err != nil {
+		d.errMsg = err.Error()
+		return nil
 	}
 	if len(launches) == 0 {
 		d.errMsg = "no destinations selected"
@@ -1814,25 +2076,49 @@ func (m *Model) submitSyncDialog() tea.Cmd {
 	srcLabel := d.srcHost.Name + ":" + d.src.Dataset.Name
 	m.syncDlg = nil
 	m.status, m.statusErr = fmt.Sprintf("syncing %s → %d destination(s)…", srcLabel, len(launches)), false
-	srcHost := d.srcHost
-	hostSet := map[string]Host{srcHost.Name: srcHost}
-	specs := make([]jobSpec, len(launches))
-	labels := make([]string, len(launches))
-	for i, l := range launches {
-		specs[i], labels[i] = l.spec, l.label
-		dh := m.hostByName(strings.SplitN(l.label, ":", 2)[0])
-		hostSet[dh.Name] = dh
+	hostSet := map[string]Host{d.srcHost.Name: d.srcHost}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, l := range launches {
+		hostSet[l.dest.Name] = l.dest
+		m.trackJobHost(l.run)
+		meta := map[string]string{"command": l.spec.Command, "created": now}
+		for k, v := range l.spec.Meta {
+			meta[k] = v
+		}
+		m.pendingJobs[l.spec.ID] = JobInfo{
+			Host: l.run.Name, ID: l.spec.ID, Dir: l.spec.Dir(), Kind: "sync",
+			State: "running", Status: "running 0 " + now, Meta: meta,
+		}
 	}
+	m.reindexJobs() // show the jobs (spinner, JOBS rows) right away
 	var affected []Host
 	for _, h := range hostSet {
 		affected = append(affected, h)
 	}
-	return tea.Batch(m.markBusy(affected...), runSyncJobs(srcHost, specs, labels, affected))
+	return tea.Batch(m.markBusy(affected...), runSyncJobs(launches, affected), m.ensureTicker())
+}
+
+// trackJobHost makes a job runner that is not a refreshed fleet host (this
+// machine, an ad-hoc relay) a "side" host: its jobs are polled and indexed
+// like fleet jobs for the rest of the session (local ones are also
+// rediscovered on every reload).
+func (m *Model) trackJobHost(h Host) {
+	if _, ok := m.sideJobs[h.Name]; ok {
+		return
+	}
+	if m.findHostState(h.Name) != nil {
+		return // fleet host: refresh discovers its jobs
+	}
+	m.sideJobs[h.Name] = []JobInfo{}
+	m.sideHosts[h.Name] = h
+	m.mergeSideJobs()
 }
 
 type syncResult struct {
 	label, id, state, logTail string
 	command                   string
+	run                       Host
+	meta                      map[string]string
 	err                       error
 }
 
@@ -1841,20 +2127,24 @@ type syncDoneMsg struct {
 	affected []Host
 }
 
-// runSyncJobs launches all jobs (agent forwarded for src→dest auth), then
-// polls briefly so fast failures surface immediately; long transfers keep
-// running detached.
-func runSyncJobs(srcHost Host, specs []jobSpec, labels []string, affected []Host) tea.Cmd {
+// runSyncJobs launches all jobs (agent forwarded for the runner's ssh legs),
+// then polls briefly so fast failures surface immediately; long transfers
+// keep running detached.
+func runSyncJobs(launches []syncLaunch, affected []Host) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
-		r := newSSH()
-		results := make([]syncResult, len(specs))
-		for i, spec := range specs {
-			results[i] = syncResult{label: labels[i], id: spec.ID, state: "running", command: spec.Command}
-			// -A forwards the agent; ControlPath=none forces a FRESH
-			// connection — a reused ControlMaster would silently drop -A.
-			if err := launchJob(ctx, r, srcHost, spec, "-A", "-o", "ControlPath=none"); err != nil {
+		results := make([]syncResult, len(launches))
+		for i, l := range launches {
+			results[i] = syncResult{label: l.label, id: l.spec.ID, state: "running",
+				command: l.spec.Command, run: l.run, meta: l.spec.Meta}
+			var extra []string
+			if l.run.Name != localHostName {
+				// -A forwards the agent; ControlPath=none forces a FRESH
+				// connection — a reused ControlMaster would silently drop -A.
+				extra = []string{"-A", "-o", "ControlPath=none"}
+			}
+			if err := launchJob(ctx, runnerFor(l.run), l.run, l.spec, extra...); err != nil {
 				results[i].err = err
 				results[i].state = "launch-failed"
 			}
@@ -1868,7 +2158,8 @@ func runSyncJobs(srcHost Host, specs []jobSpec, labels []string, affected []Host
 			if remain < 2*time.Second {
 				remain = 2 * time.Second
 			}
-			if st, logTail, err := waitJob(ctx, r, srcHost, results[i].id, remain); err == nil {
+			run := results[i].run
+			if st, logTail, err := waitJob(ctx, runnerFor(run), run, results[i].id, remain); err == nil {
 				results[i].state, results[i].logTail = st, logTail
 			}
 		}
@@ -1882,8 +2173,24 @@ func (m *Model) onSyncDone(msg syncDoneMsg) (tea.Model, tea.Cmd) {
 	}
 	m.syncRefreshing()
 	done, running, failed := 0, 0, 0
-	var failLines []string
+	var failLines []viewLine
+	polled := map[string]bool{}
+	var cmds []tea.Cmd
 	for _, r := range msg.results {
+		if pj, ok := m.pendingJobs[r.id]; ok {
+			if r.state == "launch-failed" {
+				delete(m.pendingJobs, r.id) // never got a job dir
+			} else if r.state != "running" {
+				pj.State, pj.Status = r.state, r.state
+				m.pendingJobs[r.id] = pj
+			}
+		}
+		// Pick up the job dirs on the runner so job windows/tables show
+		// them (fleet runners not otherwise refreshed, side hosts).
+		if !polled[r.run.Name] {
+			polled[r.run.Name] = true
+			cmds = append(cmds, m.pollJobsCmd(r.run))
+		}
 		switch r.state {
 		case "done":
 			done++
@@ -1891,23 +2198,10 @@ func (m *Model) onSyncDone(msg syncDoneMsg) (tea.Model, tea.Cmd) {
 			running++
 		default:
 			failed++
-			failLines = append(failLines, "✗ "+r.label+" (job "+r.id+")")
-			if r.err != nil {
-				failLines = append(failLines, "    "+r.err.Error())
-			}
-			failLines = append(failLines, "  command:")
-			for _, cl := range strings.Split(strings.TrimRight(r.command, "\n"), "\n") {
-				failLines = append(failLines, "    "+cl)
-			}
-			failLines = append(failLines, "  log:")
-			for _, l := range strings.Split(strings.TrimRight(r.logTail, "\n"), "\n") {
-				if l != "" {
-					failLines = append(failLines, "    "+l)
-				}
-			}
-			failLines = append(failLines, "")
+			failLines = append(failLines, m.syncFailureLines(r)...)
 		}
 	}
+	m.reindexJobs() // pending placeholders: drop launch failures, settle states
 	parts := []string{}
 	if done > 0 {
 		parts = append(parts, fmt.Sprintf("%d done", done))
@@ -1921,12 +2215,47 @@ func (m *Model) onSyncDone(msg syncDoneMsg) (tea.Model, tea.Cmd) {
 	m.status = "sync: " + strings.Join(parts, ", ")
 	m.statusErr = failed > 0
 	if failed > 0 {
-		m.pushView(textView("sync job failures", failLines))
+		lines := failLines
+		m.pushView(&objView{build: func(*Model, bool) ([]string, []viewLine) {
+			return []string{"sync job failures"}, lines
+		}})
 	}
 	if done > 0 || running > 0 {
-		return m, m.beginRefresh(msg.affected)
+		cmds = append(cmds, m.beginRefresh(msg.affected))
 	}
-	return m, m.ensureTicker()
+	cmds = append(cmds, m.ensureTicker())
+	return m, tea.Batch(cmds...)
+}
+
+// syncFailureLines renders one failed job for the failures window: the log
+// (the real ssh/zfs error) first, then the manual command, the full script last.
+func (m *Model) syncFailureLines(r syncResult) []viewLine {
+	meta := r.meta
+	lines := []viewLine{
+		vline("✗ "+r.label+" (job "+r.id+" on "+displayHost(r.run.Name)+")", styleErr),
+	}
+	if r.err != nil {
+		lines = append(lines, vline("    "+r.err.Error(), styleNormal))
+	}
+	lines = append(lines, vline("  log:", styleCyan))
+	for _, l := range strings.Split(strings.TrimRight(r.logTail, "\n"), "\n") {
+		// ssh errors end in \r: unstripped, the terminal cursor jumps and
+		// the actual reason (timeout/DNS/auth) is overwritten.
+		if l = expandTabs(stripCtrl(l)); l != "" {
+			lines = append(lines, vline("    "+l, styleNormal))
+		}
+	}
+	if man := meta["manual"]; man != "" {
+		lines = append(lines, vline("  manual:", styleCyan))
+		for _, l := range strings.Split(man, "\n") {
+			lines = append(lines, vline("    "+l, styleNormal))
+		}
+	}
+	lines = append(lines, vline("  script:", styleCyan))
+	for _, cl := range strings.Split(strings.TrimRight(r.command, "\n"), "\n") {
+		lines = append(lines, vline("    "+cl, styleNormal))
+	}
+	return append(lines, vline("", styleNormal))
 }
 
 func (m *Model) syncDialogView() string {
@@ -1940,13 +2269,11 @@ func (m *Model) syncDialogView() string {
 	fmt.Fprintf(&b, "%s %s%s\n", styleFieldLabel.Render("source:"),
 		d.srcHost.Name+":"+d.src.Dataset.Name, latest)
 	b.WriteString("\n" + styleFieldLabel.Render("destinations:") + "\n")
-	sel := 0
 	for i, p := range d.plans {
 		if p.Selectable() {
 			focused := d.focus < len(d.selectable) && d.selectable[d.focus] == i
 			b.WriteString(checkbox(fmt.Sprintf("%-28s %s", p.DestLabel(), p.Reason),
 				d.checked[i], focused) + "\n")
-			sel++
 		} else {
 			reason := p.Reason
 			st := styleDim
@@ -1956,24 +2283,54 @@ func (m *Model) syncDialogView() string {
 			b.WriteString("  " + st.Render("[ ] "+fmt.Sprintf("%-28s %s", p.DestLabel(), reason)) + "\n")
 		}
 	}
-	mark := "  "
-	if d.focus == len(d.selectable) {
-		mark = styleFocusMark.Render("› ")
+	mark := func(stop int) string {
+		if d.at(stop) {
+			return styleFocusMark.Render("› ")
+		}
+		return "  "
 	}
 	// Indent the input to the destination-label column (after "  [ ] ").
-	b.WriteString(mark + "    " + d.custom.View() + "\n")
-	b.WriteString("\n" + styleFieldLabel.Render("options:") + "\n")
-	b.WriteString(checkbox("send intermediate snapshots (-I)", d.intermediate,
-		d.focus == len(d.selectable)+1) + "\n")
+	// A typed custom destination is a selected destination like the others:
+	// [x] appears as soon as there is text, disappears when it's cleared.
+	customBox := "    "
+	if strings.TrimSpace(d.custom.Value()) != "" {
+		customBox = "[x] "
+	}
+	b.WriteString(mark(sfCustom) + customBox + d.custom.View() + "\n")
+
+	b.WriteString("\n")
+	// run on: one line of choices named by their actual hosts, the selected
+	// one in [brackets] (others padded by the same width, so ←→ never shifts
+	// anything); the relay editbox is the last choice.
+	choices := []string{d.srcHost.Name, m.syncDestHosts(d), "localhost", d.relay.View()}
+	var row strings.Builder
+	for i, c := range choices {
+		if i == d.runMode {
+			c = "[" + c + "]"
+			if d.at(sfRunOn) {
+				c = styleFocusMark.Render(c)
+			}
+		} else {
+			c = " " + c + " "
+		}
+		row.WriteString(" " + c)
+	}
+	// Flush-left label like source:/destinations: (no options: header);
+	// focus shows as the focus color on the label + the bracketed choice.
+	label := styleFieldLabel.Render("run on:")
+	if d.at(sfRunOn) {
+		label = styleFocusMark.Render("run on:")
+	}
+	b.WriteString(label + row.String() + "\n\n")
+	b.WriteString(flushCheckbox("send intermediate snapshots (-I)", d.intermediate, d.at(sfIntermediate)) + "\n")
 	if d.src.Dataset.Encrypted() {
-		b.WriteString("  " + styleDim.Render("[x] raw send (-w)  (required for encrypted source)") + "\n")
+		b.WriteString(styleDim.Render("[x] raw send (-w)  (required for encrypted source)") + "\n")
 	}
 	if d.errMsg != "" {
 		b.WriteString("\n" + styleErr.Render("⚠ "+d.errMsg) + "\n")
 	}
 	b.WriteString("\n")
-	buttons := button("Sync", d.focus == len(d.selectable)+2) + "   " +
-		button("Cancel", d.focus == len(d.selectable)+3)
+	buttons := button("Sync", d.at(sfOK)) + "   " + button("Cancel", d.at(sfCancel))
 	return dialogBox("Sync", centerButtons(b.String(), buttons))
 }
 
@@ -2042,7 +2399,7 @@ func (m *Model) pollJobsCmd(h Host) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		out, err := newSSH().Run(ctx, h, jobsProbe)
+		out, err := runnerFor(h).Run(ctx, h, jobsProbe)
 		if err != nil {
 			return jobsPollMsg{host: h.Name, err: err}
 		}
@@ -2069,14 +2426,30 @@ func (m *Model) onJobsPoll(msg jobsPollMsg) (tea.Model, tea.Cmd) {
 				for _, k := range jobReplicaKeys(j) {
 					finished[strings.SplitN(k, ":", 2)[0]] = true
 				}
+				if _, side := m.sideJobs[j.Host]; !side {
+					finished[j.Host] = true // the runner (relay/pull) too
+				}
 				if j.State == "failed" {
-					m.status, m.statusErr = fmt.Sprintf("job %s FAILED on %s — see details / job log", j.ID, j.Host), true
+					m.status, m.statusErr = fmt.Sprintf("job %s FAILED on %s — see details / job log", j.ID, displayHost(j.Host)), true
 				}
 			}
 		}
 		hs.Jobs = msg.jobs
 	}
-	m.data.JobsByReplica = indexJobs(m.data.States)
+	if _, side := m.sideJobs[msg.host]; !side {
+		// Persist so a reload (any host's refresh finishing) can't bring
+		// back this host's stale cached job states (field bug: a relay
+		// job flickered done/running forever).
+		if err := m.st.PutJobs(msg.host, msg.jobs); err != nil {
+			m.status, m.statusErr = "caching job states: "+err.Error(), true
+		}
+	}
+	if _, side := m.sideJobs[msg.host]; side {
+		m.sideJobs[msg.host] = msg.jobs
+		m.mergeSideJobs() // first poll of a new side host adds its entry
+	} else {
+		m.reindexJobs()
+	}
 	if len(finished) > 0 {
 		var hosts []Host
 		for hn := range finished {
@@ -2163,7 +2536,7 @@ func jobProgressLine(j *JobInfo) string {
 	case j.Expected > 0:
 		parts = append(parts, "~"+humanShort(j.Expected)+" to transfer")
 	default:
-		return "progress unknown (pv not installed on source?)"
+		return "progress unknown (pv not installed on the job host?)"
 	}
 	if j.Progress > 0 {
 		start := jobStartTime(j)

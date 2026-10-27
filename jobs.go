@@ -122,10 +122,10 @@ func (j jobSpec) bootstrap() string {
 func launchJob(ctx context.Context, r Runner, h Host, j jobSpec, sshExtra ...string) error {
 	out, err := r.RunInput(ctx, h, j.bootstrap(), []byte(j.script()), sshExtra...)
 	if err != nil {
-		return fmt.Errorf("launch job %s on %s: %w", j.ID, h.Name, err)
+		return fmt.Errorf("launch job %s on %s: %w", j.ID, displayHost(h.Name), err)
 	}
 	if !strings.Contains(string(out), "launched "+j.Dir()) {
-		return fmt.Errorf("launch job %s on %s: unexpected output %q", j.ID, h.Name, out)
+		return fmt.Errorf("launch job %s on %s: unexpected output %q", j.ID, displayHost(h.Name), out)
 	}
 	return nil
 }

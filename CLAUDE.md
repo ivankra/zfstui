@@ -71,6 +71,13 @@ every emitted shape — extend regexes and constructors together.
    `-o encryption=off` (child matches source; raw sends carry their own keys
    and don't need this).
 
+5. **Job polls are in-memory unless persisted; reloads read the cache.**
+   A relayed job's runner isn't among the hosts it touches, so its
+   completion refresh skipped the runner and every reload resurrected the
+   cached "running" → done/running flicker forever. onJobsPoll persists via
+   Store.PutJobs and the runner joins the finished-refresh set.
+   Regression: TestRelayJobDoesNotFlickerAfterFinish.
+
 ## Code map (flat package main, one dir — user explicitly wants no subdirs)
 
 - `model.go` — types: Host (identity=Name + access spec; EffUser/NeedSudo/
@@ -91,7 +98,8 @@ every emitted shape — extend regexes and constructors together.
   `zpool status`; then `lsblk -b -P` physical disks and `smartctl -a` per
   disk, 20K cap),
   datasets, snapshots, jobs (`jobsProbe`, also used for live polling), host
-  (`===ZFSTUI:host===`: `awk '/^btime/' /proc/stat` boot epoch → BootTime;
+  (`===ZFSTUI:host===`: `key value` lines — `btime` from /proc/stat →
+  BootTime, `machine-id` from /etc/machine-id → MachineID;
   NON-required + `; true` so it never aborts a refresh on non-Linux/old
   caches — parse only if the section is present).
   Verbatim zpool status rides on Pool.Props["_zpool-status"] (underscore =
@@ -112,8 +120,8 @@ every emitted shape — extend regexes and constructors together.
   full property maps as JSON (props+srcs); typed fields are re-derived on
   load via the same fromProps mappings. `db.SetMaxOpenConns(1)` is
   load-bearing (SQLITE_BUSY under parallel refresh; `:memory:` per-conn DBs).
-  schemaVersion (currently 7) mismatch drops ALL tables — disposable cache,
-  no migrations ever. hosts table carries `boot_time`; jobs table carries
+  schemaVersion (currently 8) mismatch drops ALL tables — disposable cache,
+  no migrations ever. hosts table carries `boot_time` + `machine_id`; jobs table carries
   `log`. TRAP: adding a column mid-development can leave existing rows with
   NULL in it (a build wrote rows before the INSERT listed the column) →
   `Scan ... converting NULL to string` on load. Read with `COALESCE(col,'')`
@@ -136,18 +144,27 @@ every emitted shape — extend regexes and constructors together.
   - Group.Hidden = no member has any snapshot (plumbing datasets).
 - `mutate.go` — THE ONLY place mutation command lines are built:
   buildSnapshotCmd, buildSendCmd / buildFullSendCmd (flags per trap #3),
-  buildResumeSendCmd (send -t), buildRecvCmd (-s -u; `-o encryption=off`
+  buildResumeSendCmd (`TOKEN='…'` assign + `send -t $TOKEN` — long tokens
+  live in one variable line of script/manual), buildRecvCmd (-s -u; `-o encryption=off`
   per trap #4), sizeVariant (-nP read-only sizing twin).
 - `sync.go` — planSync (pure compatibility gate: resume token → resume; no
   shared latest GUID → diverged; dest written>0 → dirty; latest==target →
   up-to-date; else incremental with the base resolved BY GUID to the
   source-side snapshot NAME — names can differ across replicas!) +
-  customDestPlan (full send to a not-yet-existing dataset) + syncJob (the
-  pipeline job: send | mbuffer-if-available | pv-if-available | [ssh] recv;
-  remote dests get a per-job ssh ControlMaster authed under the launcher's
-  forwarded agent, `touch ssh-ok` releases the launcher (WaitStart), the
-  pipeline rides the master; `zfs send -nP` estimate → ./expected, pv bytes
-  → ./progress).
+  customDestPlan (full send to a not-yet-existing dataset) + syncJob(src,
+  dest, RUN host, …) (the pipeline job: [$SSSH] send | mbuffer-if-available |
+  pv-if-available | [$DSSH] recv — each leg direct iff it IS the runner, else
+  over its own per-job ControlMaster cm-src/cm-dst authed under the
+  launcher's forwarded agent; `touch ssh-ok` releases the launcher
+  (WaitStart); `zfs send -nP` estimate → ./expected, pv bytes → ./progress).
+  Meta "manual" = manualSyncCmd: plain human pipeline (display only, still
+  allowlist-tested by assertManualAllowlisted). Runner `@local`
+  (localHostName, ssh.go) = this machine via bashRunner/`runnerFor`, SHOWN as "localhost" via displayHost (internal name must stay non-hostname: a fleet host may be called localhost); tests
+  stub `localExec` + `localMachineID` in TestMain (jobs_test.go) — never scan
+  the real /tmp. **Local twin**: if this machine's /etc/machine-id equals a
+  fleet host's (zfstui running ON it), Model.localTwin names it; @local is
+  then unused (no local scan, run-on-localhost = the twin) — otherwise both
+  probes see the same /tmp and every local job is listed twice.
 - `jobs.go` — job protocol: /tmp/zfstui-job-<id>/ (job.sh; meta.json written
   by job.sh itself via heredoc = single file transfer; status
   `running pid ts|done ts|failed rc ts`; log; progress; expected; ssh-ok).
@@ -254,16 +271,35 @@ every emitted shape — extend regexes and constructors together.
     focus cycle, Space toggles, Enter = default action, NO separate confirm
     screen — the form previews the exact command live, then Create/Sync acts
     immediately (no -dry-run; that flag was removed 2026-06-16).
+    Dialog style (user-tuned): flush-left, NO "options:" header; `label:
+    value` on one line with values aligned (snapshot: `dataset:  …` /
+    `snapshot: <editbox>`); focus on a flush row = focus color on its label
+    or cursor style on the checkbox (flushCheckbox), not a "› " gutter.
     Sync dialog: members pre-checked iff they need syncing, disabled rows
     show reasons, free-form "new dest" editbox (host:pool/dataset, comma-
     separated → full send, must not exist); editbox focus passes ALL keys to
-    textinput. Submit launches one job per dest, polls ~12s, leaves long
-    transfers detached.
+    textinput. ONE flush-left "run on:" line (no options: header; blank line, then flush-left flushCheckbox options): `[cml]  sta  localhost  relay…`
+    — choices named by real hosts (source, syncDestHosts, localhost =
+    @local, relay editbox), selected in [brackets] (←→/space). The relay editbox is PART of
+    the run-on focus stop (an own stop trapped ←→): relay selected ⇒ keys
+    edit it, ← at pos 0 / → at end move on (cycleRunOn). Focus stops
+    are len(selectable)+sf* constants. No command/route preview in the
+    dialog (user: keep it compact; width must not change on ←→ —
+    TestSyncDialogStableWidth).
+    Submit launches one job per dest, polls ~12s, leaves long transfers
+    detached (no retry button — added then dropped by user request). Side job hosts (`@local`, ad-hoc relays): Model.sideJobs merged
+    into data.States as pool-less HostStates (mergeSideJobs) so findJob/
+    polling/JobsByReplica just work; no columns (columns come from pools).
   - live progress: ensureTicker starts a 150ms tick while runningJobHosts()
     is non-empty; every 20th tick re-polls jobsProbe per host (jobsPollMsg)
     updating Jobs/JobsByReplica in place; running→done/failed transitions
     auto-refresh affected hosts. Cells with running jobs get a braille
     spinner (cellTextLive); details show jobProgressLine "X / Y (Z%)".
+    Just-submitted syncs show INSTANTLY: submit registers Model.pendingJobs
+    placeholders (JobInfo.Pending) that reindexJobs overlays onto their
+    host's job list until a poll/refresh discovers the real dir (then the
+    placeholder is dropped); launch failures drop it. ALWAYS rebuild the job
+    index via reindexJobs (not indexJobs directly) in the TUI.
   - `h` toggles hidden groups — NOT vim-left (user decision).
 - `main.go` — global flags BEFORE the command; first positional arg is the
   command iff it matches one, the rest are host specs. `status` works from

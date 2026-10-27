@@ -47,11 +47,22 @@ batch `snap`/`sync` CLI, prune, jobs pane, `doctor`, job-dir cleanup.
   snapshots (`-I`) default-on, resume of interrupted receives offered when a
   token is present, plus a free-form editbox for new/custom destinations
   (`host:pool/dataset` → full send; works for seeding a first backup of a
-  single-replica dataset). One detached job per destination runs on the source
-  host (`zfs send … | mbuffer | pv | ssh dest zfs recv -s -u …`; `-w` raw
-  for encrypted sources, `-L -c` for plain ones), using the
-  control node's forwarded agent only to authenticate a per-job ssh
-  ControlMaster — transfers survive the laptop disconnecting. Running
+  single-replica dataset). One detached job per destination, by default on the
+  source host (`zfs send … | mbuffer | pv | ssh dest zfs recv -s -u …`; `-w`
+  raw for encrypted sources, `-L -c` for plain ones), using the
+  control node's forwarded agent only to authenticate per-job ssh
+  ControlMasters — transfers survive the laptop disconnecting. A **run on**
+  radio row picks the executing host when src↛dest ssh is broken: source
+  (push), destination (pull: `ssh src send | recv`), this machine
+  (`@local`, relay through the control node) or a typed relay host
+  (`ssh src send | ssh dst recv`). It is ONE flush-left `run on:` line (no options: header; checkboxes follow flush-left after a blank, flushCheckbox), choices named by
+  their actual hosts, the selected one bracketed (`run on: [cml]  sta
+  localhost  relay host…` — source, destination(s), this machine, relay
+  editbox; unselected padded so ←→ shifts nothing; the relay editbox is part
+  of that line's single focus stop — ←/→ past its text ends move on, since an
+  own stop trapped the arrows); the user rejected a
+  multi-line block and a per-mode command preview — the preview resized the
+  dialog on ←→, and the full command is in the job window anyway). Running
   transfers show a spinner on the affected cells and live progress
   ("1.2G / 3.4G (29%)", via pv + `zfs send -nP` estimate) in the details
   pane, polled every ~3s; completion auto-refreshes.
@@ -280,7 +291,9 @@ Given a compatible (group, source replica, dest replica):
 
 1. Latest source snapshot = max by `creation`.
 2. Common base = newest snapshot whose GUID exists on both sides.
-3. If dest has `receive_resume_token` → resume: `zfs send -t <token>`.
+3. If dest has `receive_resume_token` → resume: `TOKEN='<token>'` then
+   `zfs send -t $TOKEN` (tokens are hundreds of chars; script + manual
+   hold them in one variable line).
 4. Else incremental `zfs send -I <common> <latest>` (`-I` so dest receives
    intermediate snapshots too; flag to use `-i` instead).
 5. Dest doesn't exist → full send (with confirmation, since it can be huge).
@@ -330,7 +343,8 @@ generated job scripts match the allowlist regex (mutate_test.go,
 jobs_test.go).
 
 **ssh agent-forwarding trust window.** Sync jobs are launched with `ssh -A`
-(agent forwarding) so the source host can open its own src→dest connection
+(agent forwarding) so the executing host (source by default; destination or a
+relay per the dialog's "run on") can open its own ssh legs
 without provisioned keys (see the job protocol). This is intentional and
 necessary for pull-through replication, but it means that while a sync job is
 authenticating its destination ControlMaster, the *source host* can reach any
@@ -339,8 +353,9 @@ bounded: the forward is only needed at the destination handshake, the job
 `touch ssh-ok`s and the launcher disconnects as soon as the master is up, and
 the launch bypasses the control node's own ControlMaster
 (`-o ControlPath=none`) so the agent isn't shared with unrelated sessions.
-Trust assumption: you trust the source hosts you replicate *from* for the
-duration of a sync. If that's not acceptable for a given host, provision a
+Trust assumption: you trust the hosts that RUN a sync (the source by default,
+or the chosen destination/relay) for the duration of its handshake. Running
+on "this machine" forwards nothing — the local job uses your agent directly. If that's not acceptable for a given host, provision a
 dedicated key on it instead of relying on the forwarded agent.
 
 ## Snapshot pruning
@@ -373,8 +388,10 @@ differ per host. (`zfs allow` delegation is a documented alternative.)
 
 ## Remote job protocol (the keystone)
 
-A job = a directory on the **executing host** (the source host for syncs; or
-the control node itself when the user overrides "run from"):
+A job = a directory on the **executing host** (for syncs: the source by
+default, or the destination / a relay / the control node itself per the sync
+dialog's "run on"; the control node is the pseudo-host `@local`, launched and
+polled with plain local bash instead of ssh):
 `/tmp/zfstui-job-<job-id>/` — deliberately /tmp rather than a user dir, so we
 aren't tied to account layouts and discovery of active/finished jobs is one
 glob (`/tmp/zfstui-job-*`) away. Contents:
@@ -387,8 +404,20 @@ progress    pv -nb byte counts (2s interval) when pv is available
 expected    estimated stream size from a no-op `zfs send -nP`
 status      one line: running <pid> | done | failed <exitcode>  (+ rfc3339 time)
 log         stdout+stderr of the pipeline
-progress    pv machine-readable output (bytes done / total), if pv available
+ssh-ok      touched once the job's ssh ControlMasters (cm-src / cm-dst, one
+            per leg that isn't on the executing host) are authenticated
 ```
+
+- meta.json for syncs also carries `runner` (executing host), `intermediate`
+  and `manual`: the job's essence as plain shell for humans — the bare
+  `send | [ssh …] recv` pipeline as run on the runner, plus the same transfer
+  relayed from your own terminal. Display-only (job window `manual` section
+  above `script`); never executed, but tests still
+  allowlist its zfs segments (assertManualAllowlisted).
+- Side job hosts: runners that are not refreshed fleet hosts (`@local`, ad-hoc
+  relays) are tracked by the TUI as pool-less HostStates merged into
+  data.States (no columns): `@local` is re-scanned on every reload, ad-hoc
+  relays only for the session that launched on them (polled while running).
 
 - Job IDs are 6 random base62 chars (e.g. `kF3x9Q`); time ordering comes
   from meta.json's "created" field, not the ID.
@@ -862,6 +891,46 @@ TUI is manual for now.
   entirely despite being in the db. Columns are now seeded from every pool in
   the loaded HostStates (`Status(states, groups)`), plus group members.
   Regression: TestSnapshotlessHostStillHasColumns.
+- 2026-10-27: **sync "run on" + manual command.** Field failure:
+  `cannot reach destination over ssh` from cml→sta while the laptop reached
+  both. syncJob now takes a runHost; each leg is direct when it IS the runner,
+  else `$SSSH "send"` / `$DSSH "recv"` over its own per-job ControlMaster
+  (ssh checks run first, exit 80 = source leg, 81 = dest leg, message names
+  the leg and `$(hostname)`). Modes: source (default, unchanged behavior),
+  destination (pull), this machine (`@local`: local bash runner, no -A), relay
+  (typed host spec; bare names reuse remembered access). Also fixed: the
+  failures window didn't stripCtrl the log, so ssh's `\r`-terminated error —
+  the one line saying WHY — was overwritten on screen. (A `[ Retry sync… ]`
+  button that reopened the dialog preloaded from job meta was added and then
+  dropped the same day at the user's request — just reopen the dialog with y.)
+- 2026-10-27: **relay jobs flickered done↔running.** Completion refreshes
+  covered only the hosts a job touches (src/dest), not its runner; any reload
+  then re-read the runner's cached "running" row, the poll saw "done" again,
+  re-triggered the refresh — forever. Fix: live polls persist (Store.PutJobs)
+  and the runner (when a fleet host) joins the refresh set.
+- 2026-10-27: **submitted syncs appear instantly.** Before, a job only showed
+  after runSyncJobs' ~12s fast-failure wait (+ ssh-ok wait) and the following
+  poll/refresh. Submit now inserts a pending placeholder per job (running,
+  spinner, JOBS row, ETA clock from submit time); reindexJobs overlays them
+  until the real job dir is discovered, launch failures remove them.
+- 2026-10-27: **readable job scripts.** The job window showed the sync
+  script/manual as a few 300+-char lines (resume tokens repeated 2-3×, the
+  full ssh option list per leg, one-line if/else). Now: buildResumeSendCmd
+  returns a `TOKEN='…'` assignment + `zfs send -t $TOKEN` ($TOKEN unquoted
+  on purpose — expands the same locally and inside a remote leg's "…", and
+  the token charset check leaves nothing to split/glob; allowlist has a
+  `TOKEN=` shape too); ssh options live once in `$SSHO`; if/else and
+  `|| { … }` blocks are multi-line; pipelines are `\`-continued. The test
+  scanner joins continuations before checking segments.
+- 2026-10-27: **jobs listed twice when zfstui runs on a fleet host.** With
+  localhost == iac, the @local probe and iac's ssh probe glob the same /tmp,
+  so locally-run jobs appeared twice in JOBS tables. Fix: discovery's host
+  section now also reports `/etc/machine-id` (hosts.machine_id, schema 8);
+  when it equals this machine's, that fleet host is the **local twin**
+  (Model.localTwin): the @local job scan is skipped and "run on localhost"
+  launches as the twin, so local jobs are discovered/polled/persisted as the
+  twin's. Backstop: indexJobs also dedupes by job ID (random → equal ID =
+  same dir; first = fleet copy wins).
 - Name: `zfstui`.
 
 ## Initial wishes
